@@ -1,0 +1,7 @@
+[package]
+name = "archiadb"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+crossbeam = { version = "0.8.4", features = ["crossbeam-deque", "crossbeam-queue"] }
