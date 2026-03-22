@@ -1,10 +1,8 @@
 use std::{
-    cell::UnsafeCell,
-    ptr,
-    sync::{
+    cell::UnsafeCell, pin::Pin, ptr, sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
-    },
+    }, task::{Context, Poll, Waker}
 };
 
 use crossbeam::utils::Backoff;
@@ -172,25 +170,64 @@ struct Lock {
     ptr: Arc<SpinLock<LockInternal>>,
 }
 
+impl Lock {
+    fn acquire(&self, lock_type: LockType) -> LockFuture<'_> {
+        LockFuture { lock: &self, lock_type }
+    }
+}
+
+struct LockGuard<'a> {
+    lock: &'a Lock
+}
+
+impl Drop for LockGuard<'_> {
+    fn drop(&mut self) {
+        let mut gaurd = self.lock.ptr.lock();
+        gaurd.release();
+    }
+}
+
+struct LockFuture<'a> {
+    lock: &'a Lock,
+    lock_type: LockType
+}
+
+impl <'a> Future for LockFuture<'a> {
+    type Output = LockGuard<'a>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut gaurd = self.lock.ptr.lock();
+        if gaurd.acquire(self.lock_type, &cx.waker()) {
+            Poll::Ready(LockGuard { lock: &self.lock })
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
 struct LockInternal {
     lock_type: LockType,
     locked: u32,
-    queue: SimpleQueue<LockType>,
+    queue: SimpleQueue<(LockType, Waker)>,
 }
 
 impl LockInternal {
-    fn acquire(&mut self, acq_lock_type: LockType) {
+    fn acquire(&mut self, acq_lock_type: LockType, waker: &Waker) -> bool {
         if !self.queue.is_empty() {
-            self.queue.push(acq_lock_type);
+            self.queue.push((acq_lock_type, waker.clone()));
+            false
         } else {
             if self.locked == 0 {
                 self.lock_type = acq_lock_type;
                 self.locked += 1;
+                true
             } else if let Some(lock_type) = self.lock_type.is_compatible(&acq_lock_type) {
                 self.lock_type = lock_type;
                 self.locked += 1;
+                true
             } else {
-                self.queue.push(acq_lock_type)
+                self.queue.push((acq_lock_type, waker.clone()));
+                false
             }
         }
     }
@@ -200,15 +237,16 @@ impl LockInternal {
 
         if !self.queue.is_empty() {
             self.lock_type = if self.locked == 0 {
-                // TODO: wakey wakey
                 self.locked += 1;
-                self.queue.pop().unwrap()
+                let (lock_type, waker) = self.queue.pop().unwrap();
+                waker.wake();
+                lock_type
             } else {
                 self.lock_type.clone()
             };
 
             while !self.queue.is_empty() {
-                if let Some(lock_type) = self.lock_type.is_compatible(self.queue.peek().unwrap()) {
+                if let Some(lock_type) = self.lock_type.is_compatible(&self.queue.peek().unwrap().0) {
                     self.lock_type = lock_type;
                     self.locked += 1
                 } else {
