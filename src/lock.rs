@@ -70,10 +70,10 @@ impl<T> std::ops::DerefMut for SpinLockGaurd<'_, T> {
 #[derive(Debug, Clone, Copy)]
 #[repr(u16)]
 enum LockType {
-    Read = 0,
-    ReadChildWrite,
-    ReadRecursive,
-    Write,
+    Read = 0, // acquire node for reading
+    ReadChildWrite, // acquire node for reading, intent to modify skip level child nodes
+    ReadRecursive, // acquire exclusively for reading and prevent any write or child write aquisitions
+    Write, // acquire node for writing
 }
 
 impl LockType {
@@ -172,7 +172,7 @@ struct Lock {
 
 impl Lock {
     fn acquire(&self, lock_type: LockType) -> LockFuture<'_> {
-        LockFuture { lock: &self, lock_type }
+        LockFuture { lock: &self, lock_type, was_queued: false }
     }
 }
 
@@ -189,18 +189,24 @@ impl Drop for LockGuard<'_> {
 
 struct LockFuture<'a> {
     lock: &'a Lock,
-    lock_type: LockType
+    lock_type: LockType,
+    was_queued: bool
 }
 
 impl <'a> Future for LockFuture<'a> {
     type Output = LockGuard<'a>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut gaurd = self.lock.ptr.lock();
-        if gaurd.acquire(self.lock_type, &cx.waker()) {
-            Poll::Ready(LockGuard { lock: &self.lock })
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if self.was_queued {
+            Poll::Ready(LockGuard { lock: &self.lock }) 
         } else {
-            Poll::Pending
+            let mut gaurd = self.lock.ptr.lock();
+            if gaurd.acquire(self.lock_type, &cx.waker()) {
+                Poll::Ready(LockGuard { lock: &self.lock })
+            } else {
+                self.was_queued = true;
+                Poll::Pending
+            }
         }
     }
 }
