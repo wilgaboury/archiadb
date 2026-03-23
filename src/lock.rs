@@ -1,8 +1,13 @@
 use std::{
-    cell::UnsafeCell, marker::PhantomData, pin::Pin, ptr, sync::{
+    cell::UnsafeCell,
+    marker::PhantomData,
+    pin::Pin,
+    ptr,
+    sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
-    }, task::{Context, Poll, Waker}
+    },
+    task::{Context, Poll, Waker},
 };
 
 use crossbeam::utils::Backoff;
@@ -185,7 +190,7 @@ impl Lock {
             lock: self.clone(),
             lock_type,
             was_queued: false,
-            is_aquired: Arc::new(UnsafeCell::new(false))
+            is_aquired: Arc::new(UnsafeCell::new(false)),
         }
     }
 }
@@ -202,7 +207,9 @@ impl Drop for LockGuard {
     fn drop(&mut self) {
         let mut gaurd = self.lock.ptr.lock();
         if unsafe { *self.is_aquired.get() } {
-            unsafe { *self.is_aquired.get() = false; }
+            unsafe {
+                *self.is_aquired.get() = false;
+            }
             gaurd.release();
         }
     }
@@ -224,8 +231,8 @@ impl<'a> Future for LockFuture {
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if self.was_queued {
             Poll::Ready(LockGuard {
-               lock: self.lock.clone(),
-               is_aquired: self.is_aquired.clone()
+                lock: self.lock.clone(),
+                is_aquired: self.is_aquired.clone(),
             })
         } else {
             let lock = self.lock.clone();
@@ -234,7 +241,7 @@ impl<'a> Future for LockFuture {
                 unsafe { *self.is_aquired.get() = true };
                 Poll::Ready(LockGuard {
                     lock: self.lock.clone(),
-                    is_aquired: self.is_aquired.clone()
+                    is_aquired: self.is_aquired.clone(),
                 })
             } else {
                 self.was_queued = true;
