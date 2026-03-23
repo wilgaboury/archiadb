@@ -1,12 +1,8 @@
 use std::{
-    cell::UnsafeCell,
-    pin::Pin,
-    ptr,
-    sync::{
+    cell::UnsafeCell, marker::PhantomData, pin::Pin, ptr, sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
-    },
-    task::{Context, Poll, Waker},
+    }, task::{Context, Poll, Waker}
 };
 
 use crossbeam::utils::Backoff;
@@ -184,54 +180,61 @@ impl Lock {
         }
     }
 
-    pub fn acquire(&self, lock_type: LockType) -> LockFuture<'_> {
+    pub fn acquire(&self, lock_type: LockType) -> LockFuture {
         LockFuture {
-            lock: &self,
+            lock: self.clone(),
             lock_type,
             was_queued: false,
-            is_aquired: Arc::new(AtomicBool::new(false)),
+            is_aquired: Arc::new(UnsafeCell::new(false))
         }
     }
 }
 
-struct LockGuard<'a> {
-    lock: &'a Lock,
-    is_aquired: Arc<AtomicBool>,
+struct LockGuard {
+    lock: Lock,
+    is_aquired: Arc<UnsafeCell<bool>>, // protected by spin lock
 }
 
-impl Drop for LockGuard<'_> {
+unsafe impl Send for LockGuard {}
+unsafe impl Sync for LockGuard {}
+
+impl Drop for LockGuard {
     fn drop(&mut self) {
         let mut gaurd = self.lock.ptr.lock();
-        if self.is_aquired.load(Ordering::Acquire) {
-            self.is_aquired.store(false, Ordering::Release);
+        if unsafe { *self.is_aquired.get() } {
+            unsafe { *self.is_aquired.get() = false; }
             gaurd.release();
         }
     }
 }
 
-struct LockFuture<'a> {
-    lock: &'a Lock,
+struct LockFuture {
+    lock: Lock,
     lock_type: LockType,
     was_queued: bool,
-    is_aquired: Arc<AtomicBool>, //TODO: atomic is not neccessary since protected by spin lock
+    is_aquired: Arc<UnsafeCell<bool>>, // protected by spin lock
 }
 
-impl<'a> Future for LockFuture<'a> {
-    type Output = LockGuard<'a>;
+unsafe impl Send for LockFuture {}
+unsafe impl Sync for LockFuture {}
+
+impl<'a> Future for LockFuture {
+    type Output = LockGuard;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if self.was_queued {
             Poll::Ready(LockGuard {
-                lock: &self.lock,
-                is_aquired: self.is_aquired.clone(),
+               lock: self.lock.clone(),
+               is_aquired: self.is_aquired.clone()
             })
         } else {
-            let mut gaurd = self.lock.ptr.lock();
+            let lock = self.lock.clone();
+            let mut gaurd = lock.ptr.lock();
             if gaurd.acquire(self.lock_type, &cx.waker(), &self.is_aquired) {
-                self.is_aquired.store(true, Ordering::Release);
+                unsafe { *self.is_aquired.get() = true };
                 Poll::Ready(LockGuard {
-                    lock: &self.lock,
-                    is_aquired: self.is_aquired.clone(),
+                    lock: self.lock.clone(),
+                    is_aquired: self.is_aquired.clone()
                 })
             } else {
                 self.was_queued = true;
@@ -241,11 +244,11 @@ impl<'a> Future for LockFuture<'a> {
     }
 }
 
-impl<'a> Drop for LockFuture<'a> {
+impl Drop for LockFuture {
     fn drop(&mut self) {
         let mut gaurd = self.lock.ptr.lock();
-        if self.is_aquired.load(Ordering::Acquire) {
-            self.is_aquired.store(false, Ordering::Release);
+        if unsafe { *self.is_aquired.get() } {
+            unsafe { *self.is_aquired.get() = false }
             gaurd.release();
         }
     }
@@ -254,7 +257,7 @@ impl<'a> Drop for LockFuture<'a> {
 struct LockInternal {
     lock_type: LockType,
     locked: u32,
-    queue: SimpleQueue<(LockType, Waker, Arc<AtomicBool>)>,
+    queue: SimpleQueue<(LockType, Waker, Arc<UnsafeCell<bool>>)>,
 }
 
 impl LockInternal {
@@ -270,7 +273,7 @@ impl LockInternal {
         &mut self,
         acq_lock_type: LockType,
         waker: &Waker,
-        is_aquired: &Arc<AtomicBool>,
+        is_aquired: &Arc<UnsafeCell<bool>>,
     ) -> bool {
         if !self.queue.is_empty() {
             self.queue
@@ -300,7 +303,7 @@ impl LockInternal {
             self.lock_type = if self.locked == 0 {
                 self.locked += 1;
                 let (lock_type, waker, is_acquired) = self.queue.pop().unwrap();
-                is_acquired.store(true, Ordering::Release);
+                unsafe { *is_acquired.get() = true }
                 waker.wake();
                 lock_type
             } else {
@@ -386,13 +389,13 @@ mod tests {
 
         let t2 = spawn(timeout(Duration::from_secs(1), async move {
             write_barrier_before1.wait().await;
-            let _gaurd: LockGuard<'_> = lock2.acquire(LockType::Write).await;
+            let _gaurd = lock2.acquire(LockType::Write).await;
             write_barrier_after1.wait().await;
         }));
 
         let t3 = spawn(timeout(Duration::from_secs(1), async move {
             read2_barrier1.wait().await;
-            let _gaurd: LockGuard<'_> = lock3.acquire(LockType::Read).await;
+            let _gaurd = lock3.acquire(LockType::Read).await;
         }));
 
         write_barrier_before2.wait().await;
