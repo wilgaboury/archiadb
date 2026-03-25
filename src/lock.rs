@@ -1,13 +1,8 @@
 use std::{
-    cell::UnsafeCell,
-    marker::PhantomData,
-    pin::Pin,
-    ptr,
-    sync::{
+    cell::UnsafeCell, collections::VecDeque, marker::PhantomData, pin::Pin, ptr, sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
-    },
-    task::{Context, Poll, Waker},
+    }, task::{Context, Poll, Waker}
 };
 
 use crossbeam::utils::Backoff;
@@ -29,18 +24,18 @@ impl<T> SpinLock<T> {
     }
 
     fn lock(&self) -> SpinLockGaurd<'_, T> {
-        // let backoff = Backoff::new();
+        let backoff = Backoff::new();
         loop {
             let lock = self.locked.load(Ordering::Acquire);
             if !lock
                 && self
                     .locked
-                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
                     .is_ok()
             {
                 break;
             } else {
-                // backoff.snooze();
+                backoff.snooze();
             }
         }
 
@@ -291,6 +286,7 @@ impl Drop for LockGuard {
 struct LockInternal {
     lock_type: LockType,
     locked: u32,
+    // TODO: opt for intrusive list inside the LockFuture struct. This would hold head/tail and LockFuture would have next. This would avoid need for dynamic allocations.
     queue: SimpleQueue<(LockType, Waker, Arc<UnsafeCell<AcquireState>>)>,
 }
 
@@ -518,9 +514,8 @@ mod tests {
             let lock_clone = lock.clone();
             threads.push(std::thread::spawn(move || {
                 let mut gaurd = lock_clone.lock().unwrap();
-                for i in 0..INC_COUNT {
+                for _ in 0..INC_COUNT {
                     let val = *gaurd;
-                    // std::thread::sleep(Duration::from_nanos(10));
                     std::thread::yield_now();
                     *gaurd = val + 1;
                 }
