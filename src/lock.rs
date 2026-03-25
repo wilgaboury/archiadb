@@ -189,37 +189,23 @@ impl Lock {
         LockFuture {
             lock: self.clone(),
             lock_type,
-            was_queued: false,
-            is_aquired: Arc::new(UnsafeCell::new(false)),
+            acquire_state: Arc::new(UnsafeCell::new(AcquireState::Init)),
         }
     }
 }
 
-struct LockGuard {
-    lock: Lock,
-    is_aquired: Arc<UnsafeCell<bool>>, // protected by spin lock
-}
-
-unsafe impl Send for LockGuard {}
-unsafe impl Sync for LockGuard {}
-
-impl Drop for LockGuard {
-    fn drop(&mut self) {
-        let mut gaurd = self.lock.ptr.lock();
-        if unsafe { *self.is_aquired.get() } {
-            unsafe {
-                *self.is_aquired.get() = false;
-            }
-            gaurd.release();
-        }
-    }
+enum AcquireState {
+    Init,
+    Queued,
+    Acquired,
+    Gaurded,
+    Dropped,
 }
 
 struct LockFuture {
     lock: Lock,
     lock_type: LockType,
-    was_queued: bool,
-    is_aquired: Arc<UnsafeCell<bool>>, // protected by spin lock
+    acquire_state: Arc<UnsafeCell<AcquireState>>, // protected by spin lock
 }
 
 unsafe impl Send for LockFuture {}
@@ -228,43 +214,84 @@ unsafe impl Sync for LockFuture {}
 impl<'a> Future for LockFuture {
     type Output = LockGuard;
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if self.was_queued {
-            Poll::Ready(LockGuard {
-                lock: self.lock.clone(),
-                is_aquired: self.is_aquired.clone(),
-            })
-        } else {
-            let lock = self.lock.clone();
-            let mut gaurd = lock.ptr.lock();
-            if gaurd.acquire(self.lock_type, &cx.waker(), &self.is_aquired) {
-                unsafe { *self.is_aquired.get() = true };
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut gaurd = self.lock.ptr.lock();
+        let acquire_state = unsafe { &mut *self.acquire_state.get() };
+        match acquire_state {
+            AcquireState::Init => {
+                *acquire_state = gaurd.acquire(self.lock_type, &cx.waker(), &self.acquire_state);
+                if let AcquireState::Acquired = *acquire_state {
+                    *acquire_state = AcquireState::Gaurded;
+                    Poll::Ready(LockGuard {
+                        lock: self.lock.clone(),
+                        acquire_state: self.acquire_state.clone(),
+                    })
+                } else {
+                    Poll::Pending
+                }
+            }
+            AcquireState::Acquired => {
+                *acquire_state = AcquireState::Gaurded;
                 Poll::Ready(LockGuard {
                     lock: self.lock.clone(),
-                    is_aquired: self.is_aquired.clone(),
+                    acquire_state: self.acquire_state.clone(),
                 })
-            } else {
-                self.was_queued = true;
+            },
+            AcquireState::Queued | AcquireState::Gaurded | AcquireState::Dropped => {
+                // this should never actually be reached
                 Poll::Pending
             }
         }
     }
 }
 
+
 impl Drop for LockFuture {
     fn drop(&mut self) {
+        // println!("future dropped");
         let mut gaurd = self.lock.ptr.lock();
-        if unsafe { *self.is_aquired.get() } {
-            unsafe { *self.is_aquired.get() = false }
-            gaurd.release();
+        let acquire_state = unsafe { &mut *self.acquire_state.get() };
+        match acquire_state {
+            AcquireState::Init | AcquireState::Queued => {
+                // println!("is this happening");
+                *acquire_state = AcquireState::Dropped
+            }
+            AcquireState::Acquired => {
+                *acquire_state = AcquireState::Dropped;
+                gaurd.release();
+            }
+            AcquireState::Gaurded | AcquireState::Dropped => {
+                // no_op
+            }
         }
     }
 }
 
+struct LockGuard {
+    lock: Lock,
+    acquire_state: Arc<UnsafeCell<AcquireState>>, // TODO: this field can probably be removed
+}
+
+unsafe impl Send for LockGuard {}
+unsafe impl Sync for LockGuard {}
+
+impl Drop for LockGuard {
+    fn drop(&mut self) {
+        let mut gaurd = self.lock.ptr.lock();
+        let acquire_state = unsafe { &mut *self.acquire_state.get() };
+        if !matches!(*acquire_state, AcquireState::Gaurded) {
+            panic!("should be gaurded");
+        }
+        // state should always be gaurded
+        *acquire_state = AcquireState::Dropped;
+        // println!("lock gaurd releasing");
+        gaurd.release();
+    }
+}
 struct LockInternal {
     lock_type: LockType,
     locked: u32,
-    queue: SimpleQueue<(LockType, Waker, Arc<UnsafeCell<bool>>)>,
+    queue: SimpleQueue<(LockType, Waker, Arc<UnsafeCell<AcquireState>>)>,
 }
 
 impl LockInternal {
@@ -280,39 +307,65 @@ impl LockInternal {
         &mut self,
         acq_lock_type: LockType,
         waker: &Waker,
-        is_aquired: &Arc<UnsafeCell<bool>>,
-    ) -> bool {
+        acquire_state: &Arc<UnsafeCell<AcquireState>>,
+    ) -> AcquireState {
         if !self.queue.is_empty() {
             self.queue
-                .push((acq_lock_type, waker.clone(), is_aquired.clone()));
-            false
+                .push((acq_lock_type, waker.clone(), acquire_state.clone()));
+            // println!("queued gotta wait");
+            AcquireState::Queued
         } else {
             if self.locked == 0 {
+                // println!("acquired immediately, locked = 0");
                 self.lock_type = acq_lock_type;
                 self.locked += 1;
-                true
+                // println!("locked: {}", self.locked);
+                AcquireState::Acquired
             } else if let Some(lock_type) = self.lock_type.is_compatible(&acq_lock_type) {
+                // println!("acquired immediately, compatible");
                 self.lock_type = lock_type;
                 self.locked += 1;
-                true
+                // println!("locked: {}", self.locked);
+                AcquireState::Acquired
             } else {
+                // println!("queued not compat");
                 self.queue
-                    .push((acq_lock_type, waker.clone(), is_aquired.clone()));
-                false
+                    .push((acq_lock_type, waker.clone(), acquire_state.clone()));
+                AcquireState::Queued
             }
         }
     }
 
+    fn remove_non_queued(&mut self) {
+        while !self.queue.is_empty() {
+            let acquire_state = unsafe { &*self.queue.peek().unwrap().2.get() };
+            if matches!(acquire_state, AcquireState::Queued) {
+                break;
+            } else {
+                self.queue.pop();
+            }
+        }
+    }
+
+    fn wake_next(&mut self) -> LockType {
+        let (lock_type, waker, acquire_state) = self.queue.pop().unwrap();
+        let acquire_state = unsafe { &mut *acquire_state.get() };
+        *acquire_state = AcquireState::Acquired;
+        self.locked += 1;
+        waker.wake();
+        lock_type
+    }
+
     fn release(&mut self) {
+        // println!("releasing: {}", self.locked);
         self.locked -= 1;
+
+        self.remove_non_queued();
 
         if !self.queue.is_empty() {
             self.lock_type = if self.locked == 0 {
-                self.locked += 1;
-                let (lock_type, waker, is_acquired) = self.queue.pop().unwrap();
-                unsafe { *is_acquired.get() = true }
-                waker.wake();
-                lock_type
+                // println!("waking next");
+                self.wake_next()
             } else {
                 self.lock_type.clone()
             };
@@ -320,13 +373,15 @@ impl LockInternal {
             while !self.queue.is_empty() {
                 if let Some(lock_type) = self.lock_type.is_compatible(&self.queue.peek().unwrap().0)
                 {
+                    // println!("should never wake next here");
+                    self.wake_next();
                     self.lock_type = lock_type;
-                    self.locked += 1
                 } else {
                     break;
                 }
             }
         }
+
         // else if self.locked == 0 {
         //     // TODO: remove from lock cache
         // }
@@ -337,10 +392,12 @@ impl LockInternal {
 mod tests {
     use std::time::Duration;
 
-    use anyhow::Result;
-    use tokio::{spawn, sync::Barrier, time::timeout};
-
-    use crate::lock;
+    use anyhow::{Context, Result, anyhow};
+    use tokio::{
+        spawn,
+        sync::Barrier,
+        time::{sleep, timeout},
+    };
 
     use super::*;
 
@@ -413,6 +470,77 @@ mod tests {
         t1.await??;
         t2.await??;
         t3.await??;
+
+        Ok(())
+    }
+
+    #[test]
+    fn check_for_spin_lock_overlap() -> Result<()> {
+        let lock = Arc::new(SpinLock::new(Box::new(0)));
+        let mut threads = Vec::new();
+
+        const THREAD_COUNT: i32 = 50;
+        const INC_COUNT: i32 = 1000;
+
+        for _ in 0..THREAD_COUNT {
+            let lock_clone = lock.clone();
+            threads.push(std::thread::spawn(move || {
+                let mut gaurd = lock_clone.lock();
+                for i in 0..INC_COUNT {
+                    let val = **gaurd;
+                    std::thread::sleep(Duration::from_nanos(10));
+                    **gaurd = val + 1;
+                }
+            }));
+        }
+
+        for thread in threads {
+            thread
+                .join()
+                .map_err(|e| anyhow!("Thread panicked: {:?}", e))?;
+        }
+
+        let gaurd = lock.lock();
+        assert_eq!(THREAD_COUNT * INC_COUNT, **gaurd);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn check_for_concurrent_overlap() -> Result<()> {
+        let ptr_usize = Box::into_raw(Box::new(0)) as usize;
+        let lock = Lock::new();
+        let mut futures = Vec::new();
+
+        const THREAD_COUNT: i32 = 50;
+        const INC_COUNT: i32 = 1000;
+
+        for _ in 0..THREAD_COUNT {
+            let lock_clone = lock.clone();
+            futures.push(spawn(timeout(Duration::from_secs(100), async move {
+                let _gaurd = lock_clone.acquire(LockType::Write).await;
+                for i in 0..INC_COUNT {
+                    // println!("{}", i);
+                    unsafe {
+                        let ptr = ptr_usize as *mut i32;
+                        let val = *ptr;
+                        sleep(Duration::from_nanos(1)).await;
+                        let ptr = ptr_usize as *mut i32;
+                        *ptr = val + 1;
+                    }
+                }
+            })));
+        }
+
+        for future in futures {
+            future.await??;
+        }
+
+        unsafe {
+            let ptr = ptr_usize as *mut i32;
+            assert_eq!(THREAD_COUNT * INC_COUNT, *ptr);
+            drop(Box::from_raw(ptr));
+        }
 
         Ok(())
     }
