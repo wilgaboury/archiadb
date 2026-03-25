@@ -287,6 +287,7 @@ struct LockInternal {
     lock_type: LockType,
     locked: u32,
     // TODO: opt for intrusive list inside the LockFuture struct. This would hold head/tail and LockFuture would have next. This would avoid need for dynamic allocations.
+    // can use Option<NonNull<LockFuture>> which is ganurteed to be the same as a raw pointer
     queue: SimpleQueue<(LockType, Waker, Arc<UnsafeCell<AcquireState>>)>,
 }
 
