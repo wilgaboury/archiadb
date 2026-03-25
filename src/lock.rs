@@ -29,7 +29,7 @@ impl<T> SpinLock<T> {
     }
 
     fn lock(&self) -> SpinLockGaurd<'_, T> {
-        let backoff = Backoff::new();
+        // let backoff = Backoff::new();
         loop {
             let lock = self.locked.load(Ordering::Acquire);
             if !lock
@@ -40,7 +40,7 @@ impl<T> SpinLock<T> {
             {
                 break;
             } else {
-                backoff.snooze();
+                // backoff.snooze();
             }
         }
 
@@ -390,7 +390,7 @@ impl LockInternal {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{sync::Mutex, time::{Duration, Instant}};
 
     use anyhow::{Context, Result, anyhow};
     use tokio::{
@@ -476,7 +476,7 @@ mod tests {
 
     #[test]
     fn check_for_spin_lock_overlap() -> Result<()> {
-        let lock = Arc::new(SpinLock::new(Box::new(0)));
+        let lock = Arc::new(SpinLock::new(0));
         let mut threads = Vec::new();
 
         const THREAD_COUNT: i32 = 50;
@@ -486,10 +486,10 @@ mod tests {
             let lock_clone = lock.clone();
             threads.push(std::thread::spawn(move || {
                 let mut gaurd = lock_clone.lock();
-                for i in 0..INC_COUNT {
-                    let val = **gaurd;
+                for _ in 0..INC_COUNT {
+                    let val = *gaurd;
                     std::thread::sleep(Duration::from_nanos(10));
-                    **gaurd = val + 1;
+                    *gaurd = val + 1;
                 }
             }));
         }
@@ -501,34 +501,75 @@ mod tests {
         }
 
         let gaurd = lock.lock();
-        assert_eq!(THREAD_COUNT * INC_COUNT, **gaurd);
+        assert_eq!(THREAD_COUNT * INC_COUNT, *gaurd);
 
         Ok(())
     }
 
-    #[tokio::test]
+    #[test]
+    fn contentious_mutex_test() -> Result<()> {
+        let lock = Arc::new(Mutex::new(0));
+        let mut threads = Vec::new();
+
+        const THREAD_COUNT: i32 = 100;
+        const INC_COUNT: i32 = 10000;
+
+        for _ in 0..THREAD_COUNT {
+            let lock_clone = lock.clone();
+            threads.push(std::thread::spawn(move || {
+                let mut gaurd = lock_clone.lock().unwrap();
+                for i in 0..INC_COUNT {
+                    let val = *gaurd;
+                    // std::thread::sleep(Duration::from_nanos(10));
+                    std::thread::yield_now();
+                    *gaurd = val + 1;
+                }
+            }));
+        }
+
+        for thread in threads {
+            thread
+                .join()
+                .map_err(|e| anyhow!("Thread panicked: {:?}", e))?;
+        }
+
+        let gaurd = lock.lock().unwrap();
+        assert_eq!(THREAD_COUNT * INC_COUNT, *gaurd);
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn check_for_concurrent_overlap() -> Result<()> {
         let ptr_usize = Box::into_raw(Box::new(0)) as usize;
         let lock = Lock::new();
         let mut futures = Vec::new();
 
-        const THREAD_COUNT: i32 = 50;
-        const INC_COUNT: i32 = 1000;
+        const THREAD_COUNT: i32 = 100;
+        const INC_COUNT: i32 = 10000;
 
         for _ in 0..THREAD_COUNT {
             let lock_clone = lock.clone();
             futures.push(spawn(timeout(Duration::from_secs(100), async move {
+                // let guard_start = Instant::now();
                 let _gaurd = lock_clone.acquire(LockType::Write).await;
+                // let acquire_time = guard_start.elapsed();
+                // println!("Acquire took: {:?}", acquire_time);
+
+                // let loop_start = Instant::now();
                 for i in 0..INC_COUNT {
                     // println!("{}", i);
                     unsafe {
                         let ptr = ptr_usize as *mut i32;
                         let val = *ptr;
-                        sleep(Duration::from_nanos(1)).await;
+                        // sleep(Duration::from_nanos(1)).await; // cannot handle short sleeps minimum of 1ms
+                        tokio::task::yield_now().await;
                         let ptr = ptr_usize as *mut i32;
                         *ptr = val + 1;
                     }
                 }
+                // let loop_time = loop_start.elapsed();
+                // println!("Loop took: {:?}", loop_time);
             })));
         }
 
