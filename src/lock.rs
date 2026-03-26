@@ -141,12 +141,12 @@ impl<'a> Future for LockFuture {
                     }
                     this.state = LockFutureState::Queued(cx.waker().clone());
                     Poll::Pending
-                } else if !inner.locked {
-                    inner.locked = true;
+                } else if inner.locked == 0 {
+                    inner.locked += 1;
                     this.state = LockFutureState::Gaurded;
                     Poll::Ready(LockGuard { lock: this.lock.clone() })
                 } else if let Some(lock_type) = this.lock_type.is_compatible(&this.lock_type) {
-                    inner.locked = true;
+                    inner.locked += 1;
                     inner.lock_type = lock_type;
                     this.state = LockFutureState::Gaurded;
                     Poll::Ready(LockGuard { lock: this.lock.clone() })
@@ -162,7 +162,7 @@ impl<'a> Future for LockFuture {
             },
             LockFutureState::Queued(_) => Poll::Pending,
             LockFutureState::Acquired => {
-                inner.locked = true;
+                inner.locked += 1;
                 this.state = LockFutureState::Gaurded;
                 Poll::Ready(LockGuard { lock: this.lock.clone() })
             },
@@ -200,14 +200,41 @@ unsafe impl Sync for LockGuard {}
 
 impl Drop for LockGuard {
     fn drop(&mut self) {
-        // TODO!
-        panic!("implement")
+        {
+            let mut inner = self.lock.inner.lock();
+            inner.locked -= 1;
+        }
+
+        loop {
+            let waker: Option<Waker> = {
+                let mut inner = self.lock.inner.lock();
+                if let Some(mut head) = inner.head {
+                    inner.head = unsafe { head.as_ref() }.next;
+                    if let Some (mut next) = inner.head {
+                        unsafe { next.as_mut() }.prev = None;
+                    }
+                    if let LockFutureState::Queued(waker) = std::mem::replace(&mut unsafe { head.as_mut() }.state, LockFutureState::Acquired) {
+                        Some(waker)
+                    } else {
+                        panic!("Queued lock futures should always be in queue state")
+                    }
+                } else {
+                    None
+                }
+            };
+
+            if let Some(waker) = waker {
+                waker.wake();
+            } else {
+                break;
+            }
+        }
     }
 }
 
 struct LockInner {
     lock_type: LockType,
-    locked: bool,
+    locked: u32,
     
     head: Option<NonNull<LockFuture>>,
     tail: Option<NonNull<LockFuture>>
@@ -217,7 +244,7 @@ impl LockInner {
     fn new() -> Self {
         Self {
             lock_type: LockType::Read,
-            locked: false,
+            locked: 0,
             head: None,
             tail: None
         }
@@ -385,14 +412,14 @@ mod tests {
 
         for _ in 0..THREAD_COUNT {
             let lock_clone = lock.clone();
-            futures.push(spawn(timeout(Duration::from_secs(100), async move {
+            futures.push(spawn(timeout(Duration::from_secs(10), async move {
                 // let guard_start = Instant::now();
                 let _gaurd = lock_clone.acquire(LockType::Write).await;
                 // let acquire_time = guard_start.elapsed();
                 // println!("Acquire took: {:?}", acquire_time);
 
                 // let loop_start = Instant::now();
-                for i in 0..INC_COUNT {
+                for _ in 0..INC_COUNT {
                     // println!("{}", i);
                     unsafe {
                         let ptr = ptr_usize as *mut i32;
