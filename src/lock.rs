@@ -231,13 +231,13 @@ impl Drop for LockGuard {
                 if let Some(mut head) = inner.head {
                     // println!("something in queue, might unqueue, checking conditions");
                     let head = unsafe { head.as_mut() };
-                    let maybe_lock_type = if inner.locked == 0 {
+                    let next_lock_type = if inner.locked == 0 {
                         Some(head.lock_type)
                     } else {
                         inner.lock_type.is_compatible(&head.lock_type)
                     };
 
-                    if let Some(lock_type) = maybe_lock_type {
+                    if let Some(lock_type) = next_lock_type {
                         // println!("can acquire lock, unqueuing");
                         inner.locked += 1;
                         inner.lock_type = lock_type;
@@ -248,7 +248,7 @@ impl Drop for LockGuard {
                         if let LockFutureState::Queued(waker) = std::mem::replace(&mut head.state, LockFutureState::Acquired) {
                             Some(waker)
                         } else {
-                            panic!("Queued lock futures should always be in queue state")
+                            panic!("a queued lock future should always be in queue state")
                         }
                     } else {
                         // println!("cannot acquire lock, not unqueuing");
@@ -444,14 +444,61 @@ mod tests {
         let lock = Lock::new();
         let mut futures = Vec::new();
 
-        const THREAD_COUNT: i32 = 100;
-        const INC_COUNT: i32 = 10000;
+        const THREAD_COUNT: i32 = 10000;
+        const INC_COUNT: i32 = 100;
 
         for _ in 0..THREAD_COUNT {
             let lock_clone = lock.clone();
             futures.push(spawn(timeout(Duration::from_secs(10), async move {
                 // let guard_start = Instant::now();
                 let _gaurd = lock_clone.acquire(LockType::Write).await;
+                // let acquire_time = guard_start.elapsed();
+                // println!("Acquire took: {:?}", acquire_time);
+
+                // let loop_start = Instant::now();
+                for _ in 0..INC_COUNT {
+                    // println!("{}", i);
+                    unsafe {
+                        let ptr = ptr_usize as *mut i32;
+                        let val = *ptr;
+                        // sleep(Duration::from_nanos(1)).await; // cannot handle short sleeps minimum of 1ms
+                        tokio::task::yield_now().await;
+                        let ptr = ptr_usize as *mut i32;
+                        *ptr = val + 1;
+                    }
+                }
+                // let loop_time = loop_start.elapsed();
+                // println!("Loop took: {:?}", loop_time);
+            })));
+        }
+
+        for future in futures {
+            future.await??;
+        }
+
+        unsafe {
+            let ptr = ptr_usize as *mut i32;
+            assert_eq!(THREAD_COUNT * INC_COUNT, *ptr);
+            drop(Box::from_raw(ptr));
+        }
+
+        Ok(())
+    }
+
+        #[tokio::test(flavor = "multi_thread")]
+    async fn check_for_concurrent_overlap_tokio_mutex() -> Result<()> {
+        let ptr_usize = Box::into_raw(Box::new(0)) as usize;
+        let lock = Arc::new(tokio::sync::Mutex::new(0));
+        let mut futures = Vec::new();
+
+        const THREAD_COUNT: i32 = 10000;
+        const INC_COUNT: i32 = 100;
+
+        for _ in 0..THREAD_COUNT {
+            let lock_clone = lock.clone();
+            futures.push(spawn(timeout(Duration::from_secs(10), async move {
+                // let guard_start = Instant::now();
+                let _gaurd = lock_clone.lock().await;
                 // let acquire_time = guard_start.elapsed();
                 // println!("Acquire took: {:?}", acquire_time);
 
