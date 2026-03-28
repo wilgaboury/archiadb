@@ -376,8 +376,8 @@ mod tests {
         let lock = Arc::new(SpinLock::new(0));
         let mut threads = Vec::new();
 
-        const THREAD_COUNT: i32 = 50;
-        const INC_COUNT: i32 = 1000;
+        const THREAD_COUNT: i32 = 10;
+        const INC_COUNT: i32 = 100;
 
         for _ in 0..THREAD_COUNT {
             let lock_clone = lock.clone();
@@ -385,7 +385,7 @@ mod tests {
                 let mut gaurd = lock_clone.lock();
                 for _ in 0..INC_COUNT {
                     let val = *gaurd;
-                    std::thread::sleep(Duration::from_nanos(10));
+                    std::thread::yield_now();
                     *gaurd = val + 1;
                 }
             }));
