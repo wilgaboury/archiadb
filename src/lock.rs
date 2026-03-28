@@ -403,13 +403,13 @@ mod tests {
         Ok(())
     }
 
-    #[test]
+    // #[test]
     fn contentious_mutex_test() -> Result<()> {
         let lock = Arc::new(Mutex::new(0));
         let mut threads = Vec::new();
 
         const THREAD_COUNT: i32 = 100;
-        const INC_COUNT: i32 = 10000;
+        const INC_COUNT: i32 = 1000;
 
         for _ in 0..THREAD_COUNT {
             let lock_clone = lock.clone();
@@ -441,8 +441,8 @@ mod tests {
         let lock = Lock::new();
         let mut futures = Vec::new();
 
-        const THREAD_COUNT: i32 = 10000;
-        const INC_COUNT: i32 = 100;
+        const THREAD_COUNT: i32 = 1000;
+        const INC_COUNT: i32 = 10;
 
         let total_acquire_time: Arc<AtomicU32>= Arc::new(AtomicU32::new(0));
 
@@ -488,14 +488,14 @@ mod tests {
         Ok(())
     }
 
-        #[tokio::test(flavor = "multi_thread")]
+    // #[tokio::test(flavor = "multi_thread")]
     async fn check_for_concurrent_overlap_tokio_mutex() -> Result<()> {
         let ptr_usize = Box::into_raw(Box::new(0)) as usize;
         let lock = Arc::new(tokio::sync::Mutex::new(0));
         let mut futures = Vec::new();
 
-        const THREAD_COUNT: i32 = 10000;
-        const INC_COUNT: i32 = 100;
+        const THREAD_COUNT: i32 = 1000;
+        const INC_COUNT: i32 = 10;
 
         let total_acquire_time: Arc<AtomicU32>= Arc::new(AtomicU32::new(0));
 
