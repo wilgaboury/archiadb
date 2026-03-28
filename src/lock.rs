@@ -1,8 +1,15 @@
 use std::{
-    cell::UnsafeCell, collections::VecDeque, future::Ready, marker::PhantomData, pin::Pin, ptr::{self, NonNull}, sync::{
+    cell::UnsafeCell,
+    collections::VecDeque,
+    future::Ready,
+    marker::PhantomData,
+    pin::Pin,
+    ptr::{self, NonNull},
+    sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
-    }, task::{Context, Poll, Waker}
+    },
+    task::{Context, Poll, Waker},
 };
 
 use crate::lock;
@@ -23,12 +30,19 @@ pub struct SpinLockGaurd<'a, T> {
 /// be very fast: at worst they are a bounded number of comparisons, math operations, and pointer manipulations.
 impl<T> SpinLock<T> {
     pub const fn new(val: T) -> Self {
-        Self { locked: AtomicBool::new(false), data: UnsafeCell::new(val) }
+        Self {
+            locked: AtomicBool::new(false),
+            data: UnsafeCell::new(val),
+        }
     }
 
     #[must_use]
     pub fn lock(&self) -> SpinLockGaurd<'_, T> {
-        while self.locked.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        while self
+            .locked
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
             // perform relaxed read in loop to avoid thrashing cache lines with compare_exchange
             while self.locked.load(Ordering::Relaxed) {
                 core::hint::spin_loop();
@@ -40,15 +54,21 @@ impl<T> SpinLock<T> {
 
 impl<T> core::ops::Deref for SpinLockGaurd<'_, T> {
     type Target = T;
-    fn deref(&self) -> &T { unsafe { &*self.lock.data.get() } }
+    fn deref(&self) -> &T {
+        unsafe { &*self.lock.data.get() }
+    }
 }
 
 impl<T> core::ops::DerefMut for SpinLockGaurd<'_, T> {
-    fn deref_mut(&mut self) -> &mut T { unsafe { &mut *self.lock.data.get() } }
+    fn deref_mut(&mut self) -> &mut T {
+        unsafe { &mut *self.lock.data.get() }
+    }
 }
 
 impl<T> Drop for SpinLockGaurd<'_, T> {
-    fn drop(&mut self) { self.lock.locked.store(false, Ordering::Release); }
+    fn drop(&mut self) {
+        self.lock.locked.store(false, Ordering::Release);
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -104,10 +124,10 @@ impl Lock {
 }
 
 enum LockFutureState {
-     Init,
-     Queued(Waker),
-     Acquired,
-     Gaurded
+    Init,
+    Queued(Waker),
+    Acquired,
+    Gaurded,
 }
 
 struct LockFuture {
@@ -117,7 +137,7 @@ struct LockFuture {
     // protected by spin lock
     state: LockFutureState,
     prev: Option<NonNull<LockFuture>>,
-    next: Option<NonNull<LockFuture>>
+    next: Option<NonNull<LockFuture>>,
 }
 
 unsafe impl Send for LockFuture {}
@@ -130,7 +150,7 @@ impl LockFuture {
             lock_type,
             state: LockFutureState::Init,
             prev: None,
-            next: None
+            next: None,
         }
     }
 }
@@ -140,16 +160,13 @@ impl<'a> Future for LockFuture {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this_ptr = unsafe { self.get_unchecked_mut() } as *mut Self;
-        let mut inner = unsafe { &*this_ptr }.lock.inner.lock(); 
+        let mut inner = unsafe { &*this_ptr }.lock.inner.lock();
         let this = unsafe { &mut *this_ptr };
         match &this.state {
             LockFutureState::Init => {
                 if !inner.head.is_none() {
                     this.prev = inner.tail;
                     inner.tail = Some(unsafe { NonNull::new_unchecked(this_ptr) });
-                    if inner.head.is_none() {
-                        inner.head = inner.tail;
-                    }
                     if let Some(mut prev) = this.prev {
                         unsafe { prev.as_mut() }.next = inner.tail;
                     }
@@ -158,41 +175,42 @@ impl<'a> Future for LockFuture {
                 } else if inner.locked == 0 {
                     inner.locked += 1;
                     this.state = LockFutureState::Gaurded;
-                    Poll::Ready(LockGuard { lock: this.lock.clone() })
+                    Poll::Ready(LockGuard {
+                        lock: this.lock.clone(),
+                    })
                 } else if let Some(lock_type) = this.lock_type.is_compatible(&this.lock_type) {
                     inner.locked += 1;
                     inner.lock_type = lock_type;
                     this.state = LockFutureState::Gaurded;
-                    Poll::Ready(LockGuard { lock: this.lock.clone() })
+                    Poll::Ready(LockGuard {
+                        lock: this.lock.clone(),
+                    })
                 } else {
                     this.prev = inner.tail;
                     inner.tail = Some(unsafe { NonNull::new_unchecked(this_ptr) });
                     if inner.head.is_none() {
                         inner.head = inner.tail;
                     }
-                    if let Some(mut prev) = this.prev {
-                        unsafe { prev.as_mut() }.next = inner.tail;
-                    }
                     this.state = LockFutureState::Queued(cx.waker().clone());
                     Poll::Pending
                 }
-            },
+            }
             LockFutureState::Queued(_) => Poll::Pending,
             LockFutureState::Acquired => {
                 this.state = LockFutureState::Gaurded;
-                Poll::Ready(LockGuard { lock: this.lock.clone() })
-            },
+                Poll::Ready(LockGuard {
+                    lock: this.lock.clone(),
+                })
+            }
             LockFutureState::Gaurded => panic!("LockFuture polled after returning ready"),
         }
     }
 }
 
-
 impl Drop for LockFuture {
     fn drop(&mut self) {
-        // println!("dropping future");
         let ptr = Some(unsafe { NonNull::new_unchecked(self as *mut Self) });
-        let mut inner = unsafe { &*(self as *mut Self) }.lock.inner.lock(); 
+        let mut inner = unsafe { &*(self as *mut Self) }.lock.inner.lock();
         if let Some(mut prev) = self.prev {
             unsafe { prev.as_mut() }.next = self.next;
         }
@@ -213,7 +231,7 @@ impl Drop for LockFuture {
 }
 
 struct LockGuard {
-    lock: Lock
+    lock: Lock,
 }
 
 unsafe impl Send for LockGuard {}
@@ -240,15 +258,19 @@ impl Drop for LockGuard {
                     };
 
                     if let Some(lock_type) = next_lock_type {
-                        let waker = if let LockFutureState::Queued(waker) = std::mem::replace(&mut head.state, LockFutureState::Acquired) {
+                        let waker = if let LockFutureState::Queued(waker) =
+                            std::mem::replace(&mut head.state, LockFutureState::Acquired)
+                        {
                             waker
                         } else {
-                            panic!("a queued lock future should always be in queue state and contain a waker")
+                            panic!(
+                                "a queued lock future should always be in queue state and contain a waker"
+                            )
                         };
                         inner.locked += 1;
                         inner.lock_type = lock_type;
                         inner.head = head.next;
-                        if let Some (mut next) = inner.head {
+                        if let Some(mut next) = inner.head {
                             unsafe { next.as_mut() }.prev = None;
                         }
                         waker
@@ -269,9 +291,9 @@ impl Drop for LockGuard {
 struct LockInner {
     lock_type: LockType,
     locked: u32,
-    
+
     head: Option<NonNull<LockFuture>>,
-    tail: Option<NonNull<LockFuture>>
+    tail: Option<NonNull<LockFuture>>,
 }
 
 impl LockInner {
@@ -280,21 +302,20 @@ impl LockInner {
             lock_type: LockType::Read,
             locked: 0,
             head: None,
-            tail: None
+            tail: None,
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::{Mutex, atomic::AtomicU32}, time::{Duration, Instant}};
+    use std::{
+        sync::{Mutex, atomic::AtomicU32},
+        time::{Duration, Instant},
+    };
 
     use anyhow::{Result, anyhow};
-    use tokio::{
-        spawn,
-        sync::Barrier,
-        time::timeout,
-    };
+    use tokio::{spawn, sync::Barrier, time::timeout};
 
     use super::*;
 
@@ -444,7 +465,7 @@ mod tests {
         const THREAD_COUNT: i32 = 1000;
         const INC_COUNT: i32 = 10;
 
-        let total_acquire_time: Arc<AtomicU32>= Arc::new(AtomicU32::new(0));
+        let total_acquire_time: Arc<AtomicU32> = Arc::new(AtomicU32::new(0));
 
         for _ in 0..THREAD_COUNT {
             let lock = lock.clone();
@@ -452,12 +473,10 @@ mod tests {
             futures.push(spawn(timeout(Duration::from_secs(10), async move {
                 let guard_start = Instant::now();
                 let _gaurd = lock.acquire(LockType::Write).await;
-                total_acquire_time.fetch_add(guard_start.elapsed().as_nanos() as u32, Ordering::SeqCst);
+                total_acquire_time
+                    .fetch_add(guard_start.elapsed().as_nanos() as u32, Ordering::SeqCst);
 
-
-                // let loop_start = Instant::now();
                 for _ in 0..INC_COUNT {
-                    // println!("{}", i);
                     unsafe {
                         let ptr = ptr_usize as *mut i32;
                         let val = *ptr;
@@ -466,8 +485,6 @@ mod tests {
                         *ptr = val + 1;
                     }
                 }
-                // let loop_time = loop_start.elapsed();
-                // println!("Loop took: {:?}", loop_time);
             })));
         }
 
@@ -477,7 +494,10 @@ mod tests {
 
         // 68305.2564 ns, 10000 tasks, 100 increments each
         // 5 runs: 288961.9898 ns, 117933.4105 ns, 314133.4715 ns, 172989.3006 ns, 12738.2065 ns
-        println!("Average acquire time: {} ns", total_acquire_time.load(Ordering::SeqCst) as f64 / THREAD_COUNT as f64);
+        println!(
+            "Average acquire time: {} ns",
+            total_acquire_time.load(Ordering::SeqCst) as f64 / THREAD_COUNT as f64
+        );
 
         unsafe {
             let ptr = ptr_usize as *mut i32;
@@ -497,7 +517,7 @@ mod tests {
         const THREAD_COUNT: i32 = 1000;
         const INC_COUNT: i32 = 10;
 
-        let total_acquire_time: Arc<AtomicU32>= Arc::new(AtomicU32::new(0));
+        let total_acquire_time: Arc<AtomicU32> = Arc::new(AtomicU32::new(0));
 
         for _ in 0..THREAD_COUNT {
             let lock = lock.clone();
@@ -505,11 +525,10 @@ mod tests {
             futures.push(spawn(timeout(Duration::from_secs(10), async move {
                 let guard_start = Instant::now();
                 let _gaurd = lock.lock().await;
-                total_acquire_time.fetch_add(guard_start.elapsed().as_nanos() as u32, Ordering::SeqCst);
+                total_acquire_time
+                    .fetch_add(guard_start.elapsed().as_nanos() as u32, Ordering::SeqCst);
 
-                // let loop_start = Instant::now();
                 for _ in 0..INC_COUNT {
-                    // println!("{}", i);
                     unsafe {
                         let ptr = ptr_usize as *mut i32;
                         let val = *ptr;
@@ -518,8 +537,6 @@ mod tests {
                         *ptr = val + 1;
                     }
                 }
-                // let loop_time = loop_start.elapsed();
-                // println!("Loop took: {:?}", loop_time);
             })));
         }
 
@@ -529,7 +546,10 @@ mod tests {
 
         // 10000 tasks, 100 increments each
         // 5 runs: 13552.1244 ns, 277410.2668 ns, 287992.2409 ns, 13891.906 ns, 107075.1494 ns
-        println!("Average acquire time: {} ns", total_acquire_time.load(Ordering::SeqCst) as f64 / THREAD_COUNT as f64);
+        println!(
+            "Average acquire time: {} ns",
+            total_acquire_time.load(Ordering::SeqCst) as f64 / THREAD_COUNT as f64
+        );
 
         unsafe {
             let ptr = ptr_usize as *mut i32;
