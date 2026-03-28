@@ -5,6 +5,8 @@ use std::{
     }, task::{Context, Poll, Waker}
 };
 
+use crate::lock;
+
 pub struct SpinLock<T> {
     locked: AtomicBool,
     data: UnsafeCell<T>,
@@ -134,25 +136,35 @@ impl<'a> Future for LockFuture {
         match &this.state {
             LockFutureState::Init => {
                 if !inner.head.is_none() {
+                    //println!("queue has elements in it, queueing");
                     this.prev = inner.tail;
                     inner.tail = Some(unsafe { NonNull::new_unchecked(this_ptr) });
+                    if inner.head.is_none() {
+                        inner.head = inner.tail;
+                    }
                     if let Some(mut prev) = this.prev {
                         unsafe { prev.as_mut() }.next = inner.tail;
                     }
                     this.state = LockFutureState::Queued(cx.waker().clone());
                     Poll::Pending
                 } else if inner.locked == 0 {
+                    // println!("unlocked, acquiring");
                     inner.locked += 1;
                     this.state = LockFutureState::Gaurded;
                     Poll::Ready(LockGuard { lock: this.lock.clone() })
                 } else if let Some(lock_type) = this.lock_type.is_compatible(&this.lock_type) {
+                    // println!("compatible lock, acquiring");
                     inner.locked += 1;
                     inner.lock_type = lock_type;
                     this.state = LockFutureState::Gaurded;
                     Poll::Ready(LockGuard { lock: this.lock.clone() })
                 } else {
+                    // println!("cannot acquire lock, queueing");
                     this.prev = inner.tail;
                     inner.tail = Some(unsafe { NonNull::new_unchecked(this_ptr) });
+                    if inner.head.is_none() {
+                        inner.head = inner.tail;
+                    }
                     if let Some(mut prev) = this.prev {
                         unsafe { prev.as_mut() }.next = inner.tail;
                     }
@@ -162,7 +174,7 @@ impl<'a> Future for LockFuture {
             },
             LockFutureState::Queued(_) => Poll::Pending,
             LockFutureState::Acquired => {
-                inner.locked += 1;
+                // !("unqueued, acquiring");
                 this.state = LockFutureState::Gaurded;
                 Poll::Ready(LockGuard { lock: this.lock.clone() })
             },
@@ -174,6 +186,7 @@ impl<'a> Future for LockFuture {
 
 impl Drop for LockFuture {
     fn drop(&mut self) {
+        // println!("dropping future");
         let ptr = Some(unsafe { NonNull::new_unchecked(self as *mut Self) });
         let mut inner = unsafe { &*(self as *mut Self) }.lock.inner.lock(); 
         if let Some(mut prev) = self.prev {
@@ -188,6 +201,10 @@ impl Drop for LockFuture {
         if inner.tail == ptr {
             inner.tail = self.prev;
         }
+        if matches!(self.state, LockFutureState::Acquired) {
+            // println!("future was acquired but not gaurded, decrementing locked count");
+            inner.locked -= 1;
+        }
     }
 }
 
@@ -200,23 +217,42 @@ unsafe impl Sync for LockGuard {}
 
 impl Drop for LockGuard {
     fn drop(&mut self) {
+        // println!("dropping guard");
+
         {
             let mut inner = self.lock.inner.lock();
             inner.locked -= 1;
+            //println!("locked: {}", inner.locked);
         }
 
         loop {
             let waker: Option<Waker> = {
                 let mut inner = self.lock.inner.lock();
                 if let Some(mut head) = inner.head {
-                    inner.head = unsafe { head.as_ref() }.next;
-                    if let Some (mut next) = inner.head {
-                        unsafe { next.as_mut() }.prev = None;
-                    }
-                    if let LockFutureState::Queued(waker) = std::mem::replace(&mut unsafe { head.as_mut() }.state, LockFutureState::Acquired) {
-                        Some(waker)
+                    // println!("something in queue, might unqueue, checking conditions");
+                    let head = unsafe { head.as_mut() };
+                    let maybe_lock_type = if inner.locked == 0 {
+                        Some(head.lock_type)
                     } else {
-                        panic!("Queued lock futures should always be in queue state")
+                        inner.lock_type.is_compatible(&head.lock_type)
+                    };
+
+                    if let Some(lock_type) = maybe_lock_type {
+                        // println!("can acquire lock, unqueuing");
+                        inner.locked += 1;
+                        inner.lock_type = lock_type;
+                        inner.head = head.next;
+                        if let Some (mut next) = inner.head {
+                            unsafe { next.as_mut() }.prev = None;
+                        }
+                        if let LockFutureState::Queued(waker) = std::mem::replace(&mut head.state, LockFutureState::Acquired) {
+                            Some(waker)
+                        } else {
+                            panic!("Queued lock futures should always be in queue state")
+                        }
+                    } else {
+                        // println!("cannot acquire lock, not unqueuing");
+                        break;
                     }
                 } else {
                     None
@@ -224,6 +260,7 @@ impl Drop for LockGuard {
             };
 
             if let Some(waker) = waker {
+                // println!("found waker, waking");
                 waker.wake();
             } else {
                 break;
