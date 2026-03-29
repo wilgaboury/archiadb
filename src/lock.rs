@@ -1,18 +1,13 @@
 use std::{
     cell::UnsafeCell,
-    collections::VecDeque,
-    future::Ready,
-    marker::PhantomData,
     pin::Pin,
-    ptr::{self, NonNull},
+    ptr::NonNull,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
     task::{Context, Poll, Waker},
 };
-
-use crate::lock;
 
 pub struct SpinLock<T> {
     locked: AtomicBool,

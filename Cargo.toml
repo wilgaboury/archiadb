@@ -3,6 +3,10 @@ name = "archiadb"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "archiadb"
+path = "src/lib.rs"
+
 [dependencies]
 crossbeam = { version = "0.8.4", features = ["crossbeam-deque", "crossbeam-queue"] }
 tokio = { version = "1", features = ["full"] }
