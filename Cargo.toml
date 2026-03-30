@@ -12,3 +12,4 @@ crossbeam = { version = "0.8.4", features = ["crossbeam-deque", "crossbeam-queue
 tokio = { version = "1", features = ["full"] }
 anyhow = "1.0"
 tokio-uring = { version = "0.5.0" }
+rustix = { version = "1.1.4", features = ["fs"] }
