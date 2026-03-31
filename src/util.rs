@@ -5,7 +5,7 @@ use anyhow::Result;
 
 const DEFAULT_BLOCK_SIZE: u64 = 4096;
 
-fn pick_block_size(path: &Path) -> Result<u64> {
+pub fn pick_block_size(path: &Path) -> Result<u64> {
     let file = File::open(path)?;
     let fd = file.as_fd();
     let statx = statx(fd, "", AtFlags::EMPTY_PATH, StatxFlags::ALL)?;
