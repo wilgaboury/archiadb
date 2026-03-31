@@ -1,4 +1,4 @@
-use rustix::fs::{statx, AtFlags, StatxFlags};
+use rustix::fs::{AtFlags, StatxFlags, statx};
 use std::{fs::File, os::fd::AsFd, path::Path};
 
 use anyhow::Result;
