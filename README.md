@@ -14,6 +14,6 @@ This database will make use of conservative 2-phase locking which allows for str
 
 ### File Format
 
-Like LMDB the file will begin with two meta blocks that contain assorted information like database verison and block size. More importantly the meta blocks contain a pointer to root, generation, and checksum. Any modification will be swap writing between the two. On startup, the one with higher generation and valid checksum will be chosen as canonical. This strategy combined with COW operations removes the need for a WAL.
+Like LMDB the file will begin with two meta blocks that contain assorted information like database verison and block size. More importantly the meta blocks contain a pointer to root, generation, and checksum ([crc32c](https://github.com/zowens/crc32c)). Any modification will swap writing between the two. On startup, the one with higher generation and valid checksum will be chosen as canonical. This strategy combined with COW operations removes the need for a WAL.
 
 A block size must be specified up front when creating the database or will be detected automatically using statx.stx_atomic_write_unit_max. After the meta blocks, the rest of the file is a series of chunks, where a chuck begins with a free block bit mask, meaning an entire block such that each 0/1 represents whether a subsequent block is free or allocated, and said series of blocks. For a block size of 4kb, which is a common standard, that translates to a chunk size of ~128mb.
