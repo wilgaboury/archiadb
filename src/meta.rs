@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use zerocopy::{
     FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned,
     native_endian::{U32, U64, U128},
@@ -11,23 +11,23 @@ const VERSION: u64 = 0;
 
 #[derive(FromBytes, IntoBytes, Debug, KnownLayout, Immutable, Unaligned, Clone)]
 #[repr(C)]
-struct Meta {
+pub struct Meta {
     magic: U128,
     version: U64,
     block_size: U64,
-    generation: U64,
-    root: U64,
+    root1: U64,
+    root2: U64,
     checksum: U32,
 }
 
 impl Meta {
-    fn new_with_block_size(block_size: u64) -> Self {
+    fn new(block_size: u64) -> Self {
         let mut res = Self {
             magic: MAGIC.into(),
             version: VERSION.into(),
             block_size: block_size.into(),
-            generation: 0.into(),
-            root: 0.into(),
+            root1: 0.into(),
+            root2: 0.into(),
             checksum: 0.into(),
         };
         res.update_checksum();

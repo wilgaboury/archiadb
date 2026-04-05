@@ -2,7 +2,7 @@ use std::{path::{Path, PathBuf}, sync::Arc};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
-use tokio_uring::fs::{File, OpenOptions};
+use tokio_uring::fs::{self, File, OpenOptions};
 
 use crate::util::pick_block_size;
 
@@ -18,13 +18,17 @@ struct Inner {
 
 impl Db {
     pub async fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
-        Ok(Self {
-            inner: Arc::new(Inner { 
-                path: path.as_ref().to_path_buf(),
-                file: open_file(&path).await?,
-                block_size: pick_block_size(&path)?
-            })
-        })
+        if (file_exists(&path).await) {
+            panic!("TODO: implement reading meta and initializing")
+        } else {
+            Ok(Self {
+                inner: Arc::new(Inner { 
+                    path: path.as_ref().to_path_buf(),
+                    file: open_file(&path).await?,
+                    block_size: pick_block_size(&path)?
+                })
+            })  
+        }
     }
 }
 
@@ -46,4 +50,8 @@ async fn open_file<P: AsRef<Path>>(path: P) -> Result<File> {
             .create(true)
             .open(&path)
             .await?)
+}
+
+async fn file_exists<P: AsRef<Path>>(path: P) -> bool {
+    fs::statx(path).await.is_ok()
 }
