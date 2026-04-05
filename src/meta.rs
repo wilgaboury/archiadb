@@ -21,7 +21,7 @@ pub struct Meta {
 }
 
 impl Meta {
-    fn new(block_size: u64) -> Self {
+    pub fn new(block_size: u64) -> Self {
         let mut res = Self {
             magic: MAGIC.into(),
             version: VERSION.into(),
@@ -34,7 +34,7 @@ impl Meta {
         res
     }
 
-    fn update_checksum(&mut self) {
+    pub fn update_checksum(&mut self) {
         let bytes = self.as_bytes();
         self.checksum = crc32c::crc32c(&bytes[..bytes.len() - size_of::<u32>()]).into();
     }
