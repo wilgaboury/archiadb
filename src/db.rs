@@ -32,6 +32,9 @@ struct Chunk {
     frontier: AtomicU32,
 }
 
+// TODO: create gaurd for better protecting block allocations, committing more efficiently, auto free on drop to handle errors
+struct BlockAllocs(Vec<u64>);
+
 impl Db {
     pub async fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         Self::open_with_block_size(path.as_ref(), pick_block_size(path.as_ref())?).await
