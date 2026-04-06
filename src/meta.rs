@@ -27,7 +27,7 @@ impl Meta {
             version: VERSION.into(),
             block_size: block_size.into(),
             root1: 0.into(),
-            root2: 0.into(),
+            root2: 1.into(),
             checksum: 0.into(),
         };
         res.update_checksum();
