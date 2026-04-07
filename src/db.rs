@@ -1,4 +1,6 @@
 use std::{
+    cmp::Reverse,
+    collections::BinaryHeap,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -7,7 +9,6 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use crossbeam::queue::SegQueue;
 use tokio::sync::{Mutex, RwLock};
 use tokio_uring::fs::{self, File, OpenOptions};
 use zerocopy::IntoBytes;
@@ -23,7 +24,7 @@ struct Inner {
     file: File,
     block_size: u64,
 
-    free: SegQueue<u64>, // TODO: this same data structure but as a stack would be better because of less allocations
+    free: std::sync::Mutex<BinaryHeap<Reverse<u64>>>, // min-heap free list ensures that allocations natrually gather toward front of address space, so database shrinking is possible or requires fewer operations
     chunks: RwLock<Vec<Chunk>>,
 }
 
@@ -32,28 +33,59 @@ struct Chunk {
     frontier: AtomicU32,
 }
 
-// TODO: create gaurd for better protecting block allocations, committing more efficiently, auto free on drop to handle errors
-struct BlockAllocs(Vec<u64>);
+struct BlockPartialAlloc {
+    db: Arc<Inner>,
+    blocks: Vec<u64>,
+}
+
+impl BlockPartialAlloc {
+    async fn commit(self, db: &Db, alloc: bool) -> Result<()> {
+        // TODO: could easily be optimized to batch commits belonging to the same chunk
+        for idx in &self.blocks {
+            db.commit_alloc_to_disc(*idx, alloc).await?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for BlockPartialAlloc {
+    fn drop(&mut self) {
+        self.db
+            .free
+            .lock()
+            .unwrap()
+            .extend(self.blocks.iter().map(|idx| Reverse(*idx)));
+    }
+}
 
 impl Db {
     pub async fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
-        Self::open_with_block_size(path.as_ref(), pick_block_size(path.as_ref())?).await
+        Self::open_with_block_size(path.as_ref(), None).await
     }
 
-    pub async fn open_with_block_size<P: AsRef<Path>>(path: P, block_size: u64) -> Result<Self> {
+    pub async fn open_with_block_size<P: AsRef<Path>>(
+        path: P,
+        block_size: Option<u64>,
+    ) -> Result<Self> {
         if file_exists(path.as_ref()).await {
             todo!("implement reading meta and initializing")
         } else {
             match (|| async {
                 let file = open_file(&path).await?;
 
+                let block_size = if let Some(block_size) = block_size {
+                    block_size
+                } else {
+                    pick_block_size(&path)?
+                };
+
                 let db = Self {
                     inner: Arc::new(Inner {
                         path: path.as_ref().to_path_buf(),
                         file,
-                        block_size: pick_block_size(&path)?,
+                        block_size,
 
-                        free: SegQueue::new(),
+                        free: std::sync::Mutex::new(BinaryHeap::new()),
                         chunks: RwLock::new(vec![Chunk {
                             header_lock: Mutex::new(()),
                             frontier: AtomicU32::new(2),
@@ -106,9 +138,14 @@ impl Db {
     }
 
     /// returns block idx
-    async fn alloc(&self) -> Result<u64> {
+    async fn alloc(&self, partial_alloc: &mut BlockPartialAlloc) -> Result<()> {
         let idx = 'outer: loop {
-            if let Some(idx) = self.inner.free.pop() {
+            let pop = {
+                let mut free = self.inner.free.lock().unwrap();
+                free.pop()
+            };
+
+            if let Some(Reverse(idx)) = pop {
                 break 'outer idx;
             } else {
                 let len = {
@@ -135,15 +172,15 @@ impl Db {
             }
         };
 
-        self.commit_alloc_to_disc(idx, true).await?;
+        partial_alloc.blocks.push(idx);
 
-        Ok(idx)
+        Ok(())
     }
 
     /// takes block idx
     async fn free(&self, idx: u64) -> Result<()> {
         self.commit_alloc_to_disc(idx, false).await?;
-        self.inner.free.push(idx);
+        self.inner.free.lock().unwrap().push(Reverse(idx));
         Ok(())
     }
 
@@ -234,6 +271,57 @@ fn try_increment(counter: &AtomicU32, max: u32) -> Option<u32> {
             .is_ok()
         {
             return Some(cur);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use function_name::named;
+
+    #[test]
+    #[named]
+    fn test_db_open() -> Result<()> {
+        tokio_uring::start(async {
+            let temp_dir = TempDir::new(function_name!())?;
+
+            let db_path = temp_dir.path().join("db");
+            let _db = Db::open(&db_path).await?;
+
+            Ok(())
+        })
+    }
+
+    // Utils
+
+    pub struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        pub fn new(suffix: &str) -> Result<Self> {
+            let path = std::env::temp_dir().join(format!(
+                "{}_{}_{}",
+                suffix,
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir(&path)?;
+            Ok(Self { path })
+        }
+
+        pub fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
         }
     }
 }
