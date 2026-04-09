@@ -10,10 +10,8 @@ use std::{
 
 use anyhow::{Context, Result};
 use tokio::sync::{Mutex, RwLock};
-use tokio_uring::fs::{self, File, OpenOptions};
-use zerocopy::IntoBytes;
 
-use crate::{meta::Meta, util::pick_block_size};
+use crate::fio::Fio;
 
 struct Db {
     inner: Arc<Inner>,
@@ -21,8 +19,7 @@ struct Db {
 
 struct Inner {
     path: PathBuf,
-    file: File,
-    block_size: u64,
+    fio: Fio,
 
     free: std::sync::Mutex<BinaryHeap<Reverse<u64>>>, // min-heap free list ensures that allocations natrually gather toward front of address space, so database shrinking is possible or requires fewer operations
     chunks: RwLock<Vec<Chunk>>,
@@ -67,23 +64,24 @@ impl Db {
         path: P,
         block_size: Option<u64>,
     ) -> Result<Self> {
-        if file_exists(path.as_ref()).await {
+        let fio = Fio::open(path.as_ref())?;
+
+        if fio.len() > 0 {
             todo!("implement reading meta and initializing")
         } else {
             match (|| async {
-                let file = open_file(&path).await?;
+                // let file = open_file(&path).await?;
 
-                let block_size = if let Some(block_size) = block_size {
-                    block_size
-                } else {
-                    pick_block_size(&path)?
-                };
+                // let block_size = if let Some(block_size) = block_size {
+                //     block_size
+                // } else {
+                //     pick_block_size(&path)?
+                // };
 
                 let db = Self {
                     inner: Arc::new(Inner {
                         path: path.as_ref().to_path_buf(),
-                        file,
-                        block_size,
+                        fio,
 
                         free: std::sync::Mutex::new(BinaryHeap::new()),
                         chunks: RwLock::new(vec![Chunk {
@@ -93,24 +91,24 @@ impl Db {
                     }),
                 };
 
-                // allocate meta + first chunk
-                db.inner
-                    .file
-                    .fallocate(0, 2 + block_size * block_size, 0 as i32)
-                    .await?;
+                // // allocate meta + first chunk
+                // db.inner
+                //     .file
+                //     .fallocate(0, 2 + block_size * block_size, 0 as i32)
+                //     .await?;
 
-                let mut buf = db.alloc_vec_block_buf();
+                // let mut buf = db.alloc_vec_block_buf();
 
-                let meta = Meta::new(block_size);
-                let meta_bytes = meta.as_bytes();
-                buf[..meta_bytes.len()].copy_from_slice(meta_bytes);
-                let (result, mut buf) = db.inner.file.write_all_at(buf, 0).await;
-                result.context("Failed to write meta block to file")?;
+                // let meta = Meta::new(block_size);
+                // let meta_bytes = meta.as_bytes();
+                // buf[..meta_bytes.len()].copy_from_slice(meta_bytes);
+                // let (result, mut buf) = db.inner.file.write_all_at(buf, 0).await;
+                // result.context("Failed to write meta block to file")?;
 
-                buf.fill(0);
-                buf[0] = 0b11000000; // first two blocks are root of btree, so mark them as allocated
-                let (result, mut buf) = db.inner.file.write_all_at(buf, block_size).await;
-                result.context("Failed to write first chunk header to file")?;
+                // buf.fill(0);
+                // buf[0] = 0b11000000; // first two blocks are root of btree, so mark them as allocated
+                // let (result, mut buf) = db.inner.file.write_all_at(buf, block_size).await;
+                // result.context("Failed to write first chunk header to file")?;
 
                 // TODO: write btree root nodes, initalize allocator state
 
@@ -121,7 +119,7 @@ impl Db {
                 Ok(db) => Ok(db),
                 e => {
                     // try to cleanup file on error
-                    let did_delete = fs::remove_file(&path).await.is_ok();
+                    let did_delete = true; // TODO: delete path, path.delete().is_ok();
                     let context = if did_delete {
                         "Failed to initialize database file"
                     } else {
@@ -134,7 +132,7 @@ impl Db {
     }
 
     fn alloc_vec_block_buf(&self) -> Vec<u8> {
-        vec![0; self.inner.block_size as usize]
+        vec![0; self.inner.fio.block_size() as usize]
     }
 
     /// returns block idx
@@ -152,9 +150,10 @@ impl Db {
                     let chunks = self.inner.chunks.read().await;
                     for (i, chunk) in (*chunks).iter().enumerate() {
                         if let Some(idx) =
-                            try_increment(&chunk.frontier, self.inner.block_size as u32)
+                            try_increment(&chunk.frontier, self.inner.fio.block_size() as u32)
                         {
-                            break 'outer (i as u64 * (self.inner.block_size + 1)) + idx as u64;
+                            break 'outer (i as u64 * (self.inner.fio.block_size() + 1))
+                                + idx as u64;
                         }
                     }
                     chunks.len()
@@ -166,7 +165,7 @@ impl Db {
                             header_lock: Mutex::new(()),
                             frontier: AtomicU32::new(1),
                         });
-                        break 'outer len as u64 * (self.inner.block_size + 1);
+                        break 'outer len as u64 * (self.inner.fio.block_size() + 1);
                     }
                 }
             }
@@ -192,28 +191,28 @@ impl Db {
             .header_lock
             .lock()
             .await;
-        let (result, mut buf) = self
-            .inner
-            .file
-            .read_exact_at(buf, self.block_idx_to_disk_idx(idx))
-            .await;
-        result.context("Failed to read chunk header for free")?;
-        Self::bitfield_set(&mut buf, idx % self.inner.block_size, alloc);
-        let (result, _) = self
-            .inner
-            .file
-            .write_all_at(buf, self.block_idx_to_disk_idx(idx))
-            .await;
-        result.context("Failed to write chunk header for free")?;
+        // let (result, mut buf) = self
+        //     .inner
+        //     .file
+        //     .read_exact_at(buf, self.block_idx_to_disk_idx(idx))
+        //     .await;
+        // result.context("Failed to read chunk header for free")?;
+        // Self::bitfield_set(&mut buf, idx % self.inner.block_size, alloc);
+        // let (result, _) = self
+        //     .inner
+        //     .file
+        //     .write_all_at(buf, self.block_idx_to_disk_idx(idx))
+        //     .await;
+        // result.context("Failed to write chunk header for free")?;
         Ok(())
     }
 
     fn block_idx_to_chunk_idx(&self, idx: u64) -> usize {
-        (idx / self.inner.block_size) as usize
+        (idx / self.inner.fio.block_size()) as usize
     }
 
     fn block_idx_to_disk_idx(&self, idx: u64) -> u64 {
-        self.inner.block_size + (idx * (self.inner.block_size + 1))
+        self.inner.fio.block_size() + (idx * (self.inner.fio.block_size() + 1))
     }
 
     fn bitfield_set(buf: &mut [u8], idx: u64, as_one: bool) {
@@ -234,30 +233,17 @@ impl Inner {
         prev: &mut u64,
         block: Vec<u8>,
     ) -> Result<()> {
-        self.file
-            .write_all_at(block, *prev)
-            .await
-            .0
-            .context("Failed to write to file")?;
-        self.file.sync_all().await.context("Failed to sync file")?;
+        // self.file
+        //     .write_all_at(block, *prev)
+        //     .await
+        //     .0
+        //     .context("Failed to write to file")?;
+        self.fio.commit().await.context("Failed to sync file")?;
         let tmp = *canon;
         *canon = *prev;
         *prev = tmp;
         Ok(())
     }
-}
-
-async fn open_file<P: AsRef<Path>>(path: P) -> Result<File> {
-    Ok(OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .open(&path)
-        .await?)
-}
-
-async fn file_exists<P: AsRef<Path>>(path: P) -> bool {
-    fs::statx(path).await.is_ok()
 }
 
 fn try_increment(counter: &AtomicU32, max: u32) -> Option<u32> {
@@ -280,17 +266,15 @@ mod tests {
     use super::*;
     use function_name::named;
 
-    #[test]
+    #[tokio::test]
     #[named]
-    fn test_db_open() -> Result<()> {
-        tokio_uring::start(async {
-            let temp_dir = TempDir::new(function_name!())?;
+    async fn test_db_open() -> Result<()> {
+        let temp_dir = TempDir::new(function_name!())?;
 
-            let db_path = temp_dir.path().join("db");
-            let _db = Db::open(&db_path).await?;
+        let db_path = temp_dir.path().join("db");
+        let _db = Db::open(&db_path).await?;
 
-            Ok(())
-        })
+        Ok(())
     }
 
     // Utils

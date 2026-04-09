@@ -8,12 +8,12 @@ name = "archiadb"
 path = "src/lib.rs"
 
 [dependencies]
-crossbeam = { version = "0.8.4", features = ["crossbeam-deque", "crossbeam-queue"] }
-tokio = { version = "1", features = ["full"] }
 anyhow = "1.0"
-tokio-uring = { version = "0.5.0", features = ["bytes"] }
-rustix = { version = "1.1.4", features = ["fs"] }
 crc32c = "0.6.8"
-zerocopy = { version = "0.8", features = ["derive"] }
-bytes = "1.0"
 function_name = "0.3.0"
+rustix = { version = "1.1.4", features = ["fs"] }
+tokio = { version = "1", features = ["sync"] }
+zerocopy = { version = "0.8", features = ["derive"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }

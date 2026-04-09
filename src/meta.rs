@@ -4,8 +4,6 @@ use zerocopy::{
     native_endian::{U32, U64, U128},
 };
 
-use crate::swapper::ByteSliceConvert;
-
 const MAGIC: u128 = 0xa90e3b4b1b0833499933888e3933af0d; // Random GUID
 const VERSION: u64 = 0;
 
@@ -42,16 +40,5 @@ impl Meta {
     fn validate_checksum(&self) -> bool {
         let bytes = self.as_bytes();
         self.checksum.get() == crc32c::crc32c(&bytes[..bytes.len() - size_of::<u32>()])
-    }
-}
-
-impl ByteSliceConvert for Meta {
-    fn try_from_bytes(bytes: &[u8]) -> Result<Self> {
-        Meta::read_from_bytes(bytes)
-            .map_err(|e| anyhow::anyhow!("Failed to read meta from bytes: {:?}", e))
-    }
-
-    fn try_into_bytes(&self) -> Result<&[u8]> {
-        Ok(self.as_bytes())
     }
 }

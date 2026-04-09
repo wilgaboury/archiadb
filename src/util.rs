@@ -3,8 +3,8 @@ use std::{fs::File, os::fd::AsFd, path::Path};
 
 use anyhow::Result;
 
-const MIN_BLOCK_SIZE: u64 = 4096;
-const MAX_BLOCK_SIZE: u64 = 16384;
+const MIN_BLOCK_SIZE: u64 = 4096; // 4kb
+const MAX_BLOCK_SIZE: u64 = 65536; // 64kb
 
 /// file must exist
 pub fn pick_block_size<P: AsRef<Path>>(path: P) -> Result<u64> {
