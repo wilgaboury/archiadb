@@ -4,12 +4,10 @@ use std::{
     os::fd::{AsFd, AsRawFd},
     path::{Path, PathBuf},
     task::Waker,
-    thread::Thread,
 };
 
 use anyhow::{Result, anyhow};
 use rustix::fs::fstatvfs;
-use tokio::sync::Mutex;
 
 use crate::lock::SpinLock;
 

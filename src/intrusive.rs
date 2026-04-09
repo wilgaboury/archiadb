@@ -6,11 +6,19 @@
 
 use std::ptr;
 
-pub trait IntrusiveList {
+pub(crate) trait IntrusiveList {
     type Node: IntrusiveListNode;
 
     fn head(&self) -> &mut *mut Self::Node;
     fn tail(&self) -> &mut *mut Self::Node;
+
+    fn peek(&self) -> Option<*mut Self::Node> {
+        if self.head().is_null() {
+            None
+        } else {
+            Some(*self.head())
+        }
+    }
 
     fn pop(&self) -> Option<*mut Self::Node> {
         if self.head().is_null() {
@@ -30,13 +38,22 @@ pub trait IntrusiveList {
     }
 }
 
-pub trait IntrusiveListNode: Sized {
+pub(crate) trait IntrusiveListNode: Sized {
     type List: IntrusiveList<Node = Self>;
 
     fn prev(&self) -> &mut *mut Self;
     fn next(&self) -> &mut *mut Self;
     fn list(&self) -> Self::List;
 
-    fn push(&self);
-    fn remove(&self);
+    fn push(&self) {
+        let tail = *self.list().tail();
+        *self.list().tail() = self as *const Self as *mut Self;
+        if tail.is_null() {
+            *self.list().head() = *self.list().tail();
+        } else {
+            *(unsafe { &*tail }.next()) = *self.list().tail();
+        }
+    }
+
+    fn remove(&self) {}
 }
