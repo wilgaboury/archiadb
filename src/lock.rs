@@ -114,8 +114,8 @@ impl Lock {
         }
     }
 
-    pub fn acquire(&self, lock_type: LockType) -> Pin<Box<LockFuture>> {
-        Box::pin(LockFuture::new(self.clone(), lock_type))
+    pub fn acquire(&self, lock_type: LockType) -> LockFuture {
+        LockFuture::new(self.clone(), lock_type)
     }
 }
 
