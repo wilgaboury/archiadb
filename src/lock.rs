@@ -1,5 +1,6 @@
 use std::{
     cell::UnsafeCell,
+    marker::PhantomPinned,
     pin::Pin,
     ptr::NonNull,
     sync::{
@@ -113,8 +114,8 @@ impl Lock {
         }
     }
 
-    pub fn acquire(&self, lock_type: LockType) -> LockFuture {
-        LockFuture::new(self.clone(), lock_type)
+    pub fn acquire(&self, lock_type: LockType) -> Pin<Box<LockFuture>> {
+        Box::pin(LockFuture::new(self.clone(), lock_type))
     }
 }
 
@@ -133,6 +134,9 @@ struct LockFuture {
     state: LockFutureState,
     prev: Option<NonNull<LockFuture>>,
     next: Option<NonNull<LockFuture>>,
+
+    // because this uses intrusive lists, this data cannot be moved
+    _pin: PhantomPinned,
 }
 
 unsafe impl Send for LockFuture {}
@@ -146,6 +150,7 @@ impl LockFuture {
             state: LockFutureState::Init,
             prev: None,
             next: None,
+            _pin: PhantomPinned,
         }
     }
 }
