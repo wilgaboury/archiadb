@@ -66,14 +66,14 @@ impl FioQueue {
         }
     }
 
-    pub fn push(&self, op: FioOp) -> FioFuture {
+    fn push(&self, op: FioOp) -> FioFuture {
         let mut guard = self.inner.lock();
         guard.queue.push_back(op);
 
         todo!("finish implementing")
     }
 
-    pub fn pop(&self) -> Option<FioOp> {
+    fn pop(&self) -> Option<FioOp> {
         let mut guard = self.inner.lock();
         let ret = guard.queue.pop_front();
 
