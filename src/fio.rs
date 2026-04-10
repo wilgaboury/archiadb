@@ -9,7 +9,7 @@ use std::{
 use anyhow::{Result, anyhow};
 use rustix::fs::fstatvfs;
 
-use crate::lock::SpinLock;
+use crate::spin::SpinLock;
 
 const MIN_BLOCK_SIZE: u64 = 4096; // 4kb
 const MAX_BLOCK_SIZE: u64 = 65536; // 64kb

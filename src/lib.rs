@@ -4,4 +4,5 @@ pub mod fio;
 pub mod intrusive;
 pub mod lock;
 pub mod meta;
+pub mod spin;
 pub mod util;
