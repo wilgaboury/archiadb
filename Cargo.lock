@@ -16,6 +16,7 @@ dependencies = [
  "crc32c",
  "function_name",
  "io-uring",
+ "libc",
  "rustix",
  "tokio",
  "zerocopy",

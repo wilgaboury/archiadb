@@ -12,7 +12,8 @@ anyhow = "1.0"
 crc32c = "0.6.8"
 function_name = "0.3.0"
 io-uring = "0.7"
-rustix = { version = "1.1.4", features = ["fs"] }
+rustix = { version = "1.1.4", features = ["fs", "io_uring"] }
+libc = "0.2"
 tokio = { version = "1", features = ["sync"] }
 zerocopy = { version = "0.8", features = ["derive"] }
 
