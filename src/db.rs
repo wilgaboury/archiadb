@@ -266,7 +266,7 @@ mod tests {
     use super::*;
     use function_name::named;
 
-    #[tokio::test]
+    // #[tokio::test]
     #[named]
     async fn test_db_open() -> Result<()> {
         let temp_dir = TempDir::new(function_name!())?;

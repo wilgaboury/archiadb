@@ -1,12 +1,15 @@
 use std::{
     marker::PhantomPinned,
     pin::Pin,
-    ptr::NonNull,
+    ptr,
     sync::Arc,
     task::{Context, Poll, Waker},
 };
 
-use crate::spin::SpinLock;
+use crate::{
+    intrusive::{IntrusiveList, IntrusiveListNode},
+    spin::SpinLock,
+};
 
 #[derive(Debug, Clone, Copy)]
 #[repr(u16)]
@@ -73,8 +76,8 @@ struct LockFuture {
 
     // protected by spin lock
     state: LockFutureState,
-    prev: Option<NonNull<LockFuture>>,
-    next: Option<NonNull<LockFuture>>,
+    prev: *mut LockFuture,
+    next: *mut LockFuture,
 
     // because this uses intrusive lists, this data cannot be moved
     _pin: PhantomPinned,
@@ -89,10 +92,26 @@ impl LockFuture {
             lock,
             lock_type,
             state: LockFutureState::Init,
-            prev: None,
-            next: None,
+            prev: ptr::null_mut(),
+            next: ptr::null_mut(),
             _pin: PhantomPinned,
         }
+    }
+}
+
+impl IntrusiveListNode for LockFuture {
+    type List = LockInner;
+
+    #[allow(invalid_reference_casting)]
+    fn prev(&self) -> &mut *mut Self {
+        let this = unsafe { &mut *(self as *const Self as *mut Self) };
+        &mut this.prev
+    }
+
+    #[allow(invalid_reference_casting)]
+    fn next(&self) -> &mut *mut Self {
+        let this = unsafe { &mut *(self as *const Self as *mut Self) };
+        &mut this.next
     }
 }
 
@@ -105,12 +124,8 @@ impl<'a> Future for LockFuture {
         let this = unsafe { &mut *this_ptr };
         match &this.state {
             LockFutureState::Init => {
-                if !inner.head.is_none() {
-                    this.prev = inner.tail;
-                    inner.tail = Some(unsafe { NonNull::new_unchecked(this_ptr) });
-                    if let Some(mut prev) = this.prev {
-                        unsafe { prev.as_mut() }.next = inner.tail;
-                    }
+                if inner.peek().is_some() {
+                    this.push(&inner);
                     this.state = LockFutureState::Queued(cx.waker().clone());
                     Poll::Pending
                 } else if inner.locked == 0 {
@@ -127,11 +142,7 @@ impl<'a> Future for LockFuture {
                         lock: this.lock.clone(),
                     })
                 } else {
-                    this.prev = inner.tail;
-                    inner.tail = Some(unsafe { NonNull::new_unchecked(this_ptr) });
-                    if inner.head.is_none() {
-                        inner.head = inner.tail;
-                    }
+                    this.push(&inner);
                     this.state = LockFutureState::Queued(cx.waker().clone());
                     Poll::Pending
                 }
@@ -150,20 +161,8 @@ impl<'a> Future for LockFuture {
 
 impl Drop for LockFuture {
     fn drop(&mut self) {
-        let ptr = Some(unsafe { NonNull::new_unchecked(self as *mut Self) });
         let mut inner = unsafe { &*(self as *mut Self) }.lock.inner.lock();
-        if let Some(mut prev) = self.prev {
-            unsafe { prev.as_mut() }.next = self.next;
-        }
-        if let Some(mut next) = self.next {
-            unsafe { next.as_mut() }.prev = self.prev;
-        }
-        if inner.head == ptr {
-            inner.head = self.next;
-        }
-        if inner.tail == ptr {
-            inner.tail = self.prev;
-        }
+        self.remove(&inner);
         if matches!(self.state, LockFutureState::Acquired) {
             // lock was acquired but future was dropped before being polled
             inner.locked -= 1;
@@ -190,8 +189,8 @@ impl Drop for LockGuard {
         loop {
             let waker: Waker = {
                 let mut inner = self.lock.inner.lock();
-                if let Some(mut head) = inner.head {
-                    let head = unsafe { head.as_mut() };
+                if let Some(head) = inner.peek() {
+                    let head = unsafe { &mut *head };
                     let next_lock_type = if inner.locked == 0 {
                         Some(head.lock_type)
                     } else {
@@ -210,10 +209,7 @@ impl Drop for LockGuard {
                         };
                         inner.locked += 1;
                         inner.lock_type = lock_type;
-                        inner.head = head.next;
-                        if let Some(mut next) = inner.head {
-                            unsafe { next.as_mut() }.prev = None;
-                        }
+                        inner.pop();
                         waker
                     } else {
                         break;
@@ -233,8 +229,8 @@ struct LockInner {
     lock_type: LockType,
     locked: u32,
 
-    head: Option<NonNull<LockFuture>>,
-    tail: Option<NonNull<LockFuture>>,
+    head: *mut LockFuture,
+    tail: *mut LockFuture,
 }
 
 impl LockInner {
@@ -242,16 +238,35 @@ impl LockInner {
         Self {
             lock_type: LockType::Read,
             locked: 0,
-            head: None,
-            tail: None,
+            head: ptr::null_mut(),
+            tail: ptr::null_mut(),
         }
+    }
+}
+
+impl IntrusiveList for LockInner {
+    type Node = LockFuture;
+
+    #[allow(invalid_reference_casting)]
+    fn head(&self) -> &mut *mut Self::Node {
+        let this = unsafe { &mut *(self as *const Self as *mut Self) };
+        &mut this.head
+    }
+
+    #[allow(invalid_reference_casting)]
+    fn tail(&self) -> &mut *mut Self::Node {
+        let this = unsafe { &mut *(self as *const Self as *mut Self) };
+        &mut this.tail
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::{
-        sync::{Mutex, atomic::{AtomicU32, Ordering}},
+        sync::{
+            Mutex,
+            atomic::{AtomicU32, Ordering},
+        },
         time::{Duration, Instant},
     };
 

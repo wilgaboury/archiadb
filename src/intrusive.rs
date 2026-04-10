@@ -41,20 +41,19 @@ pub(crate) trait IntrusiveListNode: Sized {
 
     fn prev(&self) -> &mut *mut Self;
     fn next(&self) -> &mut *mut Self;
-    fn list(&self) -> &Self::List;
 
-    fn push(&self) {
-        let tail = *self.list().tail();
+    fn push(&self, list: &Self::List) {
+        let tail = *list.tail();
         *self.prev() = tail;
-        *self.list().tail() = self as *const Self as *mut Self;
+        *list.tail() = self as *const Self as *mut Self;
         if tail.is_null() {
-            *self.list().head() = *self.list().tail();
+            *list.head() = *list.tail();
         } else {
-            *(unsafe { &*tail }.next()) = *self.list().tail();
+            *(unsafe { &*tail }.next()) = *list.tail();
         }
     }
 
-    fn remove(&self) {
+    fn remove(&self, list: &Self::List) {
         if !self.prev().is_null() {
             *(unsafe { (**self.prev()).next() }) = *self.next();
         }
@@ -63,11 +62,11 @@ pub(crate) trait IntrusiveListNode: Sized {
         }
 
         let this = self as *const Self as *mut Self;
-        if *self.list().head() == this {
-            *self.list().head() = *self.next();
+        if *list.head() == this {
+            *list.head() = *self.next();
         }
-        if *self.list().tail() == this {
-            *self.list().tail() = *self.prev();
+        if *list.tail() == this {
+            *list.tail() = *self.prev();
         }
 
         *self.prev() = ptr::null_mut();
@@ -125,10 +124,6 @@ mod tests {
             let this = unsafe { &mut *(self as *const Self as *mut Self) };
             &mut this.next
         }
-
-        fn list(&self) -> &Self::List {
-            &self.list
-        }
     }
 
     #[test]
@@ -143,7 +138,7 @@ mod tests {
             next: ptr::null_mut(),
             list: list.clone(),
         };
-        n1.push();
+        n1.push(&list);
         assert!(ptr::eq(list.head, &n1));
         assert!(ptr::eq(list.tail, &n1));
 
@@ -153,7 +148,7 @@ mod tests {
             next: ptr::null_mut(),
             list: list.clone(),
         };
-        n2.push();
+        n2.push(&list);
 
         assert!(ptr::eq(list.head, &n1));
         assert!(ptr::eq(list.tail, &n2));
@@ -169,7 +164,7 @@ mod tests {
             next: ptr::null_mut(),
             list: list.clone(),
         };
-        n3.push();
+        n3.push(&list);
 
         assert!(ptr::eq(list.head, &n1));
         assert!(ptr::eq(list.tail, &n3));
@@ -181,7 +176,7 @@ mod tests {
         assert!(ptr::eq(n3.prev, &n2));
         assert!(n3.next.is_null());
 
-        n2.remove();
+        n2.remove(&list);
 
         assert!(ptr::eq(list.head, &n1));
         assert!(ptr::eq(list.tail, &n3));
@@ -198,7 +193,7 @@ mod tests {
             list: list.clone(),
         };
 
-        n4.push();
+        n4.push(&list);
 
         let n5 = TestNode {
             num: 5,
@@ -207,9 +202,9 @@ mod tests {
             list: list.clone(),
         };
 
-        n5.push();
+        n5.push(&list);
 
-        n1.remove();
+        n1.remove(&list);
 
         assert!(ptr::eq(list.head, &n3));
         assert!(ptr::eq(list.tail, &n5));
@@ -221,7 +216,7 @@ mod tests {
         assert!(ptr::eq(n5.prev, &n4));
         assert!(n5.next.is_null());
 
-        n5.remove();
+        n5.remove(&list);
 
         assert!(ptr::eq(list.head, &n3));
         assert!(ptr::eq(list.tail, &n4));
