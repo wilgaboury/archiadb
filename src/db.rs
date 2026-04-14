@@ -21,7 +21,7 @@ struct Inner {
     path: PathBuf,
     fio: Fio,
 
-    free: std::sync::Mutex<BinaryHeap<Reverse<u64>>>, // min-heap free list ensures that allocations natrually gather toward front of address space, so database shrinking is possible or requires fewer operations
+    free: std::sync::Mutex<BinaryHeap<Reverse<usize>>>, // min-heap free list ensures that allocations natrually gather toward front of address space, so database shrinking is possible or requires fewer operations
     chunks: RwLock<Vec<Chunk>>,
 }
 
@@ -32,7 +32,7 @@ struct Chunk {
 
 struct BlockPartialAlloc {
     db: Arc<Inner>,
-    blocks: Vec<u64>,
+    blocks: Vec<usize>,
 }
 
 impl BlockPartialAlloc {
@@ -145,8 +145,7 @@ impl Db {
                         if let Some(idx) =
                             try_increment(&chunk.frontier, self.inner.fio.block_size() as u32)
                         {
-                            break 'outer (i as u64 * (self.inner.fio.block_size() + 1))
-                                + idx as u64;
+                            break 'outer (i * (self.inner.fio.block_size() + 1)) + idx as usize;
                         }
                     }
                     chunks.len()
@@ -158,7 +157,7 @@ impl Db {
                             header_lock: Mutex::new(()),
                             frontier: AtomicU32::new(1),
                         });
-                        break 'outer len as u64 * (self.inner.fio.block_size() + 1);
+                        break 'outer len * (self.inner.fio.block_size() + 1);
                     }
                 }
             }
@@ -170,13 +169,13 @@ impl Db {
     }
 
     /// takes block idx
-    async fn free(&self, idx: u64) -> Result<()> {
+    async fn free(&self, idx: usize) -> Result<()> {
         self.commit_alloc_to_disc(idx, false).await?;
         self.inner.free.lock().unwrap().push(Reverse(idx));
         Ok(())
     }
 
-    async fn commit_alloc_to_disc(&self, idx: u64, alloc: bool) -> Result<()> {
+    async fn commit_alloc_to_disc(&self, idx: usize, alloc: bool) -> Result<()> {
         let buf = self.alloc_vec_block_buf();
 
         let chunks = self.inner.chunks.read().await;
@@ -200,15 +199,15 @@ impl Db {
         Ok(())
     }
 
-    fn block_idx_to_chunk_idx(&self, idx: u64) -> usize {
-        (idx / self.inner.fio.block_size()) as usize
+    fn block_idx_to_chunk_idx(&self, idx: usize) -> usize {
+        idx / self.inner.fio.block_size()
     }
 
-    fn block_idx_to_disk_idx(&self, idx: u64) -> u64 {
+    fn block_idx_to_disk_idx(&self, idx: usize) -> usize {
         self.inner.fio.block_size() + (idx * (self.inner.fio.block_size() + 1))
     }
 
-    fn bitfield_set(buf: &mut [u8], idx: u64, as_one: bool) {
+    fn bitfield_set(buf: &mut [u8], idx: usize, as_one: bool) {
         let byte_idx = (idx / 8) as usize;
         let bit_idx = (idx % 8) as u8;
         if as_one {

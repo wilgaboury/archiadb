@@ -18,21 +18,20 @@ use std::{
 };
 
 use anyhow::{Ok, Result, anyhow};
-use crossbeam::queue::SegQueue;
+use crossbeam::queue::{ArrayQueue, SegQueue};
 use io_uring::IoUring;
 use libc::{O_DIRECT, iovec};
 use rustix::fs::fstatvfs;
 
 use crate::spin::SpinLock;
 
-const MIN_BLOCK_SIZE: u64 = 4096; // 4kb
-const MAX_BLOCK_SIZE: u64 = 65536; // 64kb
+const MIN_BLOCK_SIZE: usize = 4096; // 4kb
+const MAX_BLOCK_SIZE: usize = 65536; // 64kb
 
 const IO_URING_SQ: u32 = 256;
 const IO_URING_CQ: u32 = 512;
 const IO_URING_SPIN_LIMIT: u64 = 32;
 
-#[derive(Clone)]
 enum FioOp {
     Read(ReadData),
     Write(WriteData),
@@ -40,27 +39,25 @@ enum FioOp {
     Alloc(AllocData),
 }
 
-#[derive(Clone)]
 struct ReadData {
-    block: u64,
+    block: usize,
     waker: Waker,
+    buf: BufRef,
     state: Arc<SpinLock<ReadState>>,
 }
 
 enum ReadState {
     Init,
-    Pending(Vec<u8>),
-    Ready(Vec<u8>),
+    Pending,
+    Ready(BufRef),
     Done,
 }
 
-#[derive(Clone)]
 struct WriteData {
-    idx: u64,
-    data: Vec<u8>,
+    idx: usize,
+    buf: BufRef,
 }
 
-#[derive(Clone)]
 struct CommitData {
     waker: Waker,
     state: Arc<SpinLock<CommitState>>,
@@ -72,9 +69,8 @@ pub enum CommitState {
     Done,
 }
 
-#[derive(Clone)]
 struct AllocData {
-    len: u64,
+    len: usize,
     waker: Waker,
     state: Arc<SpinLock<AllocState>>,
 }
@@ -87,30 +83,61 @@ pub enum AllocState {
 
 pub struct Fio {
     path: PathBuf,
-    block_size: u64,
     file: File,
-    fd: i32,
-    shared: Arc<Shared>,
+    inner: Arc<Inner>,
     join: Option<JoinHandle<Result<()>>>,
 }
 
-struct Shared {
+struct Inner {
+    block_size: usize,
     len: AtomicU64,
     stop: AtomicBool,
     queue: SegQueue<FioOp>,
+    bufs: Box<[u8]>,
+    free_bufs: ArrayQueue<usize>,
 }
 
-pub struct BufRef {
-    buf: Vec<u8>,
+pub enum BufRef {
+    Shared(SharedBuf),
+    Owned(Box<[u8]>),
 }
 
 impl BufRef {
     pub fn get(&self) -> &[u8] {
-        &self.buf
+        match self {
+            BufRef::Shared(shared) => {
+                let block_size = shared.fio.block_size;
+                unsafe { std::slice::from_raw_parts(shared.ptr(), block_size as usize) }
+            }
+            BufRef::Owned(buf) => buf,
+        }
     }
 
     pub fn get_mut(&mut self) -> &mut [u8] {
-        &mut self.buf
+        match self {
+            BufRef::Shared(shared) => {
+                let block_size = shared.fio.block_size;
+                unsafe { std::slice::from_raw_parts_mut(shared.ptr(), block_size as usize) }
+            }
+            BufRef::Owned(buf) => buf,
+        }
+    }
+}
+
+pub struct SharedBuf {
+    idx: usize,
+    fio: Arc<Inner>,
+}
+
+impl SharedBuf {
+    pub fn ptr(&self) -> *mut u8 {
+        self.fio.bufs[self.idx * self.fio.block_size..].as_ptr() as *mut u8
+    }
+}
+
+impl Drop for SharedBuf {
+    fn drop(&mut self) {
+        let _ = self.fio.free_bufs.push(self.idx); // TODO: handle error
     }
 }
 
@@ -129,48 +156,59 @@ impl Fio {
         validate_block_size(block_size)?;
 
         let fd = file.as_raw_fd();
-        let len = file.metadata()?.len() / block_size;
+        let len = file.metadata()?.len() as usize / block_size;
 
         let stop = AtomicBool::new(false);
         let queue = SegQueue::new();
-        let shared = Arc::new(Shared {
-            len: AtomicU64::new(len),
+        let bufs = vec![0u8; 2 * IO_URING_CQ as usize * block_size as usize].into_boxed_slice();
+        let free_bufs = ArrayQueue::new(2 * IO_URING_CQ as usize);
+        for idx in 0usize..(2 * IO_URING_CQ as usize) {
+            let _ = free_bufs.push(idx); // TODO: handle error
+        }
+
+        let inner = Arc::new(Inner {
+            block_size,
+            len: AtomicU64::new(len as u64),
             stop,
             queue,
+            bufs,
+            free_bufs,
         });
 
         let join = {
-            let shared = shared.clone();
+            let shared = inner.clone();
             thread::spawn(move || io_uring_loop(block_size, fd, shared))
         };
 
         Ok(Self {
             path: path.as_ref().to_path_buf(),
-            block_size,
             file,
-            fd,
-            shared,
+            inner,
             join: Some(join),
         })
     }
 
-    pub fn block_size(&self) -> u64 {
-        self.block_size
+    pub fn block_size(&self) -> usize {
+        self.inner.block_size
     }
 
     pub fn len(&self) -> u64 {
-        self.shared.len.load(Ordering::Acquire)
+        self.inner.len.load(Ordering::Acquire)
     }
 
-    pub async fn read_block(&self, idx: u64) -> BufRef {
+    pub fn get_buf(&self) -> BufRef {
+        get_buf(&self.inner)
+    }
+
+    pub async fn read(&self, idx: usize) -> BufRef {
         pub struct ReadBlockFuture<'a> {
             fio: &'a Fio,
-            idx: u64,
+            idx: usize,
             result: Arc<SpinLock<ReadState>>,
         }
 
         impl<'a> Future for ReadBlockFuture<'a> {
-            type Output = Vec<u8>;
+            type Output = BufRef;
 
             fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
                 let mut result = self.result.lock();
@@ -180,15 +218,16 @@ impl Fio {
                         let op = FioOp::Read(ReadData {
                             block: self.idx,
                             waker: cx.waker().clone(),
+                            buf: self.fio.get_buf(),
                             state: self.result.clone(),
                         });
-                        self.fio.shared.queue.push(op);
+                        self.fio.inner.queue.push(op);
                         self.fio.join.as_ref().unwrap().thread().unpark();
 
-                        *result = ReadState::Pending(vec![0u8; self.fio.block_size as usize]);
+                        *result = ReadState::Pending;
                         Poll::Pending
                     }
-                    ReadState::Pending(_) => {
+                    ReadState::Pending => {
                         *result = state;
                         Poll::Pending
                     }
@@ -208,28 +247,17 @@ impl Fio {
             }
         }
 
-        BufRef {
-            buf: ReadBlockFuture {
-                fio: self,
-                idx,
-                result: Arc::new(SpinLock::new(ReadState::Init)),
-            }
-            .await,
-        }
-    }
-
-    pub fn get_buf(&self) -> BufRef {
-        BufRef {
-            buf: vec![0u8; self.block_size as usize],
-        }
-    }
-
-    pub fn write_block(&self, idx: u64, data: BufRef) {
-        let op = FioOp::Write(WriteData {
+        ReadBlockFuture {
+            fio: self,
             idx,
-            data: data.buf,
-        });
-        self.shared.queue.push(op);
+            result: Arc::new(SpinLock::new(ReadState::Init)),
+        }
+        .await
+    }
+
+    pub fn write(&self, idx: usize, buf: BufRef) {
+        let op = FioOp::Write(WriteData { idx, buf });
+        self.inner.queue.push(op);
         self.join.as_ref().unwrap().thread().unpark();
     }
 
@@ -251,7 +279,7 @@ impl Fio {
                             state: self.result.clone(),
                             waker: cx.waker().clone(),
                         });
-                        self.fio.shared.queue.push(op);
+                        self.fio.inner.queue.push(op);
                         self.fio.join.as_ref().unwrap().thread().unpark();
 
                         *result = CommitState::Pending;
@@ -280,10 +308,10 @@ impl Fio {
         .await
     }
 
-    pub async fn alloc(&self, len: u64) {
+    pub async fn alloc(&self, len: usize) {
         pub struct AllocFuture<'a> {
             fio: &'a Fio,
-            len: u64,
+            len: usize,
             result: Arc<SpinLock<AllocState>>,
         }
 
@@ -300,7 +328,7 @@ impl Fio {
                             state: self.result.clone(),
                             waker: cx.waker().clone(),
                         });
-                        self.fio.shared.queue.push(op);
+                        self.fio.inner.queue.push(op);
                         self.fio.join.as_ref().unwrap().thread().unpark();
 
                         *result = AllocState::Pending;
@@ -331,36 +359,53 @@ impl Fio {
     }
 }
 
+fn get_buf(inner: &Arc<Inner>) -> BufRef {
+    inner
+        .free_bufs
+        .pop()
+        .map(|idx| {
+            BufRef::Shared(SharedBuf {
+                idx,
+                fio: inner.clone(),
+            })
+        })
+        .unwrap_or_else(|| BufRef::Owned(vec![0u8; inner.block_size as usize].into_boxed_slice()))
+}
+
 impl Drop for Fio {
     fn drop(&mut self) {
         let _ = self.file.unlock();
-        self.shared.stop.store(true, Ordering::Release);
+        self.inner.stop.store(true, Ordering::Release);
         let join = self.join.take().unwrap();
         join.thread().unpark();
         let _ = join.join();
     }
 }
 
-fn io_uring_loop(block_size: u64, fd: i32, shared: Arc<Shared>) -> Result<()> {
+fn io_uring_loop(block_size: usize, fd: i32, inner: Arc<Inner>) -> Result<()> {
     let mut pending: u32 = 0;
-    let mut submitted: u32 = 0;
     let mut ring = IoUring::builder()
         .setup_cqsize(IO_URING_CQ)
         .build(IO_URING_SQ)?;
-    let mut buffers: Vec<Vec<u8>> = (0..IO_URING_CQ)
-        .map(|_| vec![0u8; block_size as usize])
-        .collect();
+
+    let mut bufs = vec![0u8; IO_URING_CQ as usize * block_size as usize].into_boxed_slice();
     let mut ids: VecDeque<usize> = (0..IO_URING_CQ as usize).collect();
-    let mut pending_ops: Vec<Option<FioOp>> = vec![None; IO_URING_CQ as usize];
+
+    let mut ops = Vec::new();
+    ops.resize_with(IO_URING_CQ as usize, || None);
+    let mut ops = ops.into_boxed_slice();
+
     let mut spins = 0;
 
-    // The kernel expects an array of `iovec` structures (pointer + length).
-    let iovecs: Vec<iovec> = buffers
-        .iter_mut()
-        .map(|buf| iovec {
-            iov_base: buf.as_mut_ptr() as *mut c_void,
-            iov_len: buf.len(),
+    let iovecs: Vec<iovec> = (0usize..IO_URING_CQ as usize)
+        .map(|i| iovec {
+            iov_base: (bufs[i * block_size..].as_mut_ptr()) as *mut c_void,
+            iov_len: block_size,
         })
+        .chain((0usize..(2 * IO_URING_CQ as usize)).map(|i| iovec {
+            iov_base: (inner.bufs[i * block_size..].as_ptr() as *mut u8) as *mut c_void,
+            iov_len: block_size,
+        }))
         .collect();
 
     unsafe {
@@ -370,77 +415,104 @@ fn io_uring_loop(block_size: u64, fd: i32, shared: Arc<Shared>) -> Result<()> {
     }
 
     loop {
-        submitted = 0;
+        let mut submitted = 0;
 
-        if shared.queue.is_empty() && pending == 0 {
+        if inner.queue.is_empty() && pending == 0 {
             thread::park();
         }
-        if shared.stop.load(Ordering::Acquire) {
+        if inner.stop.load(Ordering::Acquire) {
             return Ok(());
         }
 
         while !ids.is_empty()
             && submitted < IO_URING_SQ
             && submitted + pending < IO_URING_CQ
-            && let Some(op) = shared.queue.pop()
+            && let Some(op) = inner.queue.pop()
         {
+            submitted += 1;
             match op {
                 FioOp::Read(data) => {
                     let id = ids.pop_front().unwrap();
                     let offset = data.block * block_size;
-                    let read = io_uring::opcode::Read::new(
-                        io_uring::types::Fd(fd),
-                        buffers[id].as_mut_ptr(),
-                        block_size as u32,
-                    )
-                    .offset(offset)
-                    .build()
-                    .user_data(id as u64);
+
+                    let (buf, len, idx) = match &data.buf {
+                        BufRef::Shared(shared) => (
+                            shared.ptr(),
+                            block_size as u32,
+                            (IO_URING_SQ as usize + id) as u16,
+                        ),
+                        BufRef::Owned(_) => (
+                            bufs[id * block_size..].as_mut_ptr(),
+                            block_size as u32,
+                            id as u16,
+                        ),
+                    };
+
+                    let read =
+                        io_uring::opcode::ReadFixed::new(io_uring::types::Fd(fd), buf, len, idx)
+                            .offset(offset as u64)
+                            .build()
+                            .user_data(id as u64);
                     unsafe {
-                        ring.submission().push(&read);
+                        let _ = ring.submission().push(&read); // TODO: handle error
                     }
-                    pending_ops[id] = Some(FioOp::Read(data));
+                    ops[id] = Some(FioOp::Read(data));
                 }
                 FioOp::Write(data) => {
                     let id = ids.pop_front().unwrap();
                     let offset = data.idx * block_size;
-                    buffers[id].copy_from_slice(&data.data);
-                    let write = io_uring::opcode::Write::new(
-                        io_uring::types::Fd(fd),
-                        buffers[id].as_mut_ptr(),
-                        block_size as u32,
-                    )
-                    .offset(offset)
-                    .build()
-                    .user_data(id as u64);
+
+                    let (buf, len, idx) = match &data.buf {
+                        BufRef::Shared(shared) => (
+                            shared.ptr(),
+                            block_size as u32,
+                            (IO_URING_SQ as usize + id) as u16,
+                        ),
+                        BufRef::Owned(vec) => {
+                            bufs[id * block_size..(id + 1) * block_size].copy_from_slice(vec);
+                            (
+                                bufs[id * block_size..].as_mut_ptr(),
+                                block_size as u32,
+                                id as u16,
+                            )
+                        }
+                    };
+
+                    let write =
+                        io_uring::opcode::WriteFixed::new(io_uring::types::Fd(fd), buf, len, idx)
+                            .offset(offset as u64)
+                            .build()
+                            .user_data(id as u64);
                     unsafe {
-                        ring.submission().push(&write);
+                        let _ = ring.submission().push(&write); // TODO: handle error
                     }
-                    pending_ops[id] = Some(FioOp::Write(data));
+                    ops[id] = Some(FioOp::Write(data));
                 }
                 FioOp::Commit(data) => {
+                    // TODO: combine fsyncs and move to back of batch
+
                     let id = ids.pop_front().unwrap();
                     let fsync = io_uring::opcode::Fsync::new(io_uring::types::Fd(fd))
                         .build()
                         .user_data(id as u64)
                         .flags(io_uring::squeue::Flags::IO_DRAIN);
                     unsafe {
-                        ring.submission().push(&fsync);
+                        let _ = ring.submission().push(&fsync); // TODO: handle error
                     }
-                    pending_ops[id] = Some(FioOp::Commit(data));
+                    ops[id] = Some(FioOp::Commit(data));
                 }
                 FioOp::Alloc(data) => {
                     let id = ids.pop_front().unwrap();
                     let alloc = io_uring::opcode::Fallocate::new(
                         io_uring::types::Fd(fd),
-                        data.len * block_size,
+                        (data.len * block_size) as u64,
                     )
                     .build()
                     .user_data(id as u64);
                     unsafe {
-                        ring.submission().push(&alloc);
+                        let _ = ring.submission().push(&alloc); // TODO: handle error
                     }
-                    pending_ops[id] = Some(FioOp::Alloc(data));
+                    ops[id] = Some(FioOp::Alloc(data));
                 }
             }
         }
@@ -451,24 +523,24 @@ fn io_uring_loop(block_size: u64, fd: i32, shared: Arc<Shared>) -> Result<()> {
         }
 
         let cq: io_uring::CompletionQueue = ring.completion();
-        let mut got_completion = false;
+        let mut completed: u32 = 0;
         for cqe in cq {
-            got_completion = true;
+            completed += 1;
 
             let id = cqe.user_data() as usize;
-            match std::mem::take(&mut pending_ops[id]) {
+            match std::mem::take(&mut ops[id]) {
                 Some(FioOp::Read(ReadData {
                     block: _,
                     waker,
+                    mut buf,
                     state: result,
                 })) => {
                     {
                         let mut inner = result.lock();
-                        let state = std::mem::replace(&mut *inner, ReadState::Done);
-                        if let ReadState::Pending(mut data) = state {
-                            data.copy_from_slice(&buffers[id]);
-                            *inner = ReadState::Ready(data);
+                        if let BufRef::Owned(buf) = &mut buf {
+                            buf.copy_from_slice(&bufs[id * block_size..(id + 1) * block_size]);
                         }
+                        *inner = ReadState::Ready(buf);
                     }
                     waker.wake();
                 }
@@ -487,7 +559,7 @@ fn io_uring_loop(block_size: u64, fd: i32, shared: Arc<Shared>) -> Result<()> {
                         let mut inner = state.lock();
                         let _ = std::mem::replace(&mut *inner, AllocState::Done);
                     }
-                    shared.len.fetch_max(len, Ordering::AcqRel);
+                    inner.len.fetch_max(len as u64, Ordering::AcqRel);
                     waker.wake();
                 }
                 _ => panic!("should never get here"),
@@ -497,26 +569,26 @@ fn io_uring_loop(block_size: u64, fd: i32, shared: Arc<Shared>) -> Result<()> {
             pending -= 1;
         }
 
-        if got_completion {
-            spins = 0;
-        } else {
+        if submitted == 0 && completed == 0 {
             spins += 1;
             if spins >= IO_URING_SPIN_LIMIT && pending > 0 {
-                ring.submit_and_wait(1); // TODO: handle errors
+                let _ = ring.submit_and_wait(1); // TODO: handle errors
                 spins = 0;
             }
+        } else {
+            spins = 0;
         }
     }
 }
 
-pub fn get_block_size<P: AsRef<Path>>(path: P) -> Result<u64> {
+pub fn get_block_size<P: AsRef<Path>>(path: P) -> Result<usize> {
     let file = File::open(path)?;
     let fd = file.as_fd();
     let fstatvfs = fstatvfs(fd)?;
-    Ok(fstatvfs.f_bsize)
+    Ok(fstatvfs.f_bsize as usize)
 }
 
-pub fn validate_block_size(block_size: u64) -> Result<()> {
+pub fn validate_block_size(block_size: usize) -> Result<()> {
     if block_size >= MIN_BLOCK_SIZE
         && block_size <= MAX_BLOCK_SIZE
         && block_size % MIN_BLOCK_SIZE == 0
@@ -563,12 +635,12 @@ mod tests {
             .write(true)
             .append(true)
             .open(test_file)?;
-        file.write_all(&vec![1u8; fio.block_size() as usize])?;
+        file.write_all(&vec![1u8; fio.block_size()])?;
         file.flush()?;
         file.sync_all()?;
 
-        let data = fio.read_block(0).await;
-        assert_eq!(vec![1u8; fio.block_size() as usize], data.get());
+        let data = fio.read(0).await;
+        assert_eq!(vec![1u8; fio.block_size()], data.get());
 
         Ok(())
     }
@@ -582,21 +654,21 @@ mod tests {
         let fio = Fio::open(test_file.clone()).unwrap();
         let mut buf = fio.get_buf();
         buf.get_mut()[0..].fill(1u8);
-        fio.write_block(0, buf);
+        fio.write(0, buf);
         fio.commit().await;
 
         let mut file = OpenOptions::new().read(true).append(true).open(test_file)?;
-        let mut buf = vec![0u8; fio.block_size() as usize];
+        let mut buf = vec![0u8; fio.block_size()];
         file.read_exact(&mut buf)?;
 
-        assert_eq!(vec![1u8; fio.block_size() as usize], buf);
+        assert_eq!(vec![1u8; fio.block_size()], buf);
 
         Ok(())
     }
 
     #[named]
     #[tokio::test]
-    async fn test_single_alloc() -> Result<()> {
+    async fn test_simple_alloc() -> Result<()> {
         let temp_dir = TempDir::new(function_name!())?;
         let test_file = temp_dir.path().join("db");
 
@@ -605,11 +677,14 @@ mod tests {
 
         fio.alloc(1).await;
         assert_eq!(1, fio.len());
-        assert_eq!(fio.block_size(), fs::metadata(&test_file)?.len());
+        assert_eq!(fio.block_size(), fs::metadata(&test_file)?.len() as usize);
 
         fio.alloc(3).await;
         assert_eq!(3, fio.len());
-        assert_eq!(3 * fio.block_size(), fs::metadata(&test_file)?.len());
+        assert_eq!(
+            3 * fio.block_size(),
+            fs::metadata(&test_file)?.len() as usize
+        );
 
         Ok(())
     }
