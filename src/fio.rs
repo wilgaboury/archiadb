@@ -10,7 +10,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     task::{Context, Poll, Waker},
     thread::{self, JoinHandle},
@@ -35,13 +35,14 @@ enum FioOp {
     Read(ReadData),
     Write(WriteData),
     Commit(CommitData),
+    Alloc(AllocData),
 }
 
 #[derive(Clone)]
 struct ReadData {
     block: u64,
     waker: Waker,
-    result: Arc<SpinLock<ReadState>>,
+    state: Arc<SpinLock<ReadState>>,
 }
 
 enum ReadState {
@@ -59,11 +60,24 @@ struct WriteData {
 
 #[derive(Clone)]
 struct CommitData {
-    state: Arc<SpinLock<CommitState>>,
     waker: Waker,
+    state: Arc<SpinLock<CommitState>>,
 }
 
 pub enum CommitState {
+    Init,
+    Pending,
+    Done,
+}
+
+#[derive(Clone)]
+struct AllocData {
+    len: u64,
+    waker: Waker,
+    state: Arc<SpinLock<AllocState>>,
+}
+
+pub enum AllocState {
     Init,
     Pending,
     Done,
@@ -83,6 +97,7 @@ struct Inner {
 }
 
 struct Shared {
+    len: AtomicU64,
     stop: AtomicBool,
     queue: SegQueue<FioOp>,
 }
@@ -104,10 +119,15 @@ impl Fio {
         validate_block_size(block_size)?;
 
         let fd = file.as_raw_fd();
+        let len = file.metadata()?.len() / block_size;
 
         let stop = AtomicBool::new(false);
         let queue = SegQueue::new();
-        let shared = Arc::new(Shared { stop, queue });
+        let shared = Arc::new(Shared {
+            len: AtomicU64::new(len),
+            stop,
+            queue,
+        });
 
         let join = {
             let shared = shared.clone();
@@ -131,7 +151,7 @@ impl Fio {
     }
 
     pub fn len(&self) -> u64 {
-        todo!("implement len")
+        self.inner.shared.len.load(Ordering::Acquire)
     }
 
     pub async fn read_block(&self, idx: u64) -> Vec<u8> {
@@ -152,7 +172,7 @@ impl Fio {
                         let op = FioOp::Read(ReadData {
                             block: self.idx,
                             waker: cx.waker().clone(),
-                            result: self.result.clone(),
+                            state: self.result.clone(),
                         });
                         self.fio.inner.shared.queue.push(op);
                         self.fio.inner.join.as_ref().unwrap().thread().unpark();
@@ -241,9 +261,55 @@ impl Fio {
         .await
     }
 
-    // pub async fn alloc(&self, blocks: u64) -> Result<()> {
-    //     todo!("implement alloc")
-    // }
+    pub async fn alloc(&self, len: u64) {
+        pub struct AllocFuture<'a> {
+            fio: &'a Fio,
+            len: u64,
+            result: Arc<SpinLock<AllocState>>,
+        }
+
+        impl<'a> Future for AllocFuture<'a> {
+            type Output = ();
+
+            fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+                let mut result = self.result.lock();
+                let state = std::mem::replace(&mut *result, AllocState::Done);
+                match state {
+                    AllocState::Init => {
+                        let op = FioOp::Alloc(AllocData {
+                            len: self.len,
+                            state: self.result.clone(),
+                            waker: cx.waker().clone(),
+                        });
+                        self.fio.inner.shared.queue.push(op);
+                        self.fio.inner.join.as_ref().unwrap().thread().unpark();
+
+                        *result = AllocState::Pending;
+                        Poll::Pending
+                    }
+                    AllocState::Pending => {
+                        *result = state;
+                        Poll::Pending
+                    }
+                    AllocState::Done => Poll::Ready(()),
+                }
+            }
+        }
+
+        impl Drop for AllocFuture<'_> {
+            fn drop(&mut self) {
+                let mut result = self.result.lock();
+                *result = AllocState::Done;
+            }
+        }
+
+        AllocFuture {
+            fio: self,
+            len: len,
+            result: Arc::new(SpinLock::new(AllocState::Init)),
+        }
+        .await
+    }
 
     // pub fn delete(self) -> Result<()> {
     //     todo!("implement delete")
@@ -337,6 +403,17 @@ fn io_uring_loop(block_size: u64, fd: i32, shared: Arc<Shared>) -> Result<()> {
                     submission_batch.push(fsync);
                     pending_ops[id] = Some(FioOp::Commit(data));
                 }
+                FioOp::Alloc(data) => {
+                    let id = ids.pop_front().unwrap();
+                    let fsync = io_uring::opcode::Fallocate::new(
+                        io_uring::types::Fd(fd),
+                        data.len * block_size,
+                    )
+                    .build()
+                    .user_data(id as u64);
+                    submission_batch.push(fsync);
+                    pending_ops[id] = Some(FioOp::Alloc(data));
+                }
             }
         }
 
@@ -361,7 +438,7 @@ fn io_uring_loop(block_size: u64, fd: i32, shared: Arc<Shared>) -> Result<()> {
                 Some(FioOp::Read(ReadData {
                     block: _,
                     waker,
-                    result,
+                    state: result,
                 })) => {
                     {
                         let mut inner = result.lock();
@@ -381,6 +458,14 @@ fn io_uring_loop(block_size: u64, fd: i32, shared: Arc<Shared>) -> Result<()> {
                         let mut inner = state.lock();
                         let _ = std::mem::replace(&mut *inner, CommitState::Done);
                     }
+                    waker.wake();
+                }
+                Some(FioOp::Alloc(AllocData { len, waker, state })) => {
+                    {
+                        let mut inner = state.lock();
+                        let _ = std::mem::replace(&mut *inner, AllocState::Done);
+                    }
+                    shared.len.fetch_max(len, Ordering::AcqRel);
                     waker.wake();
                 }
                 _ => panic!("should never get here"),
@@ -428,7 +513,10 @@ pub fn validate_block_size(block_size: u64) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Read, Write};
+    use std::{
+        fs,
+        io::{Read, Write},
+    };
 
     use function_name::named;
 
@@ -446,7 +534,7 @@ mod tests {
     #[tokio::test]
     async fn test_single_read_block() -> Result<()> {
         let temp_dir = TempDir::new(function_name!())?;
-        let test_file = temp_dir.path().join("testfile");
+        let test_file = temp_dir.path().join("db");
 
         let fio = Fio::open(test_file.clone()).unwrap();
         let mut file = OpenOptions::new()
@@ -467,7 +555,7 @@ mod tests {
     #[tokio::test]
     async fn test_single_write_block() -> Result<()> {
         let temp_dir = TempDir::new(function_name!())?;
-        let test_file = temp_dir.path().join("testfile");
+        let test_file = temp_dir.path().join("db");
 
         let fio = Fio::open(test_file.clone()).unwrap();
         fio.write_block(0, vec![1u8; fio.block_size() as usize]);
@@ -478,6 +566,26 @@ mod tests {
         file.read_exact(&mut buf)?;
 
         assert_eq!(vec![1u8; fio.block_size() as usize], buf);
+
+        Ok(())
+    }
+
+    #[named]
+    #[tokio::test]
+    async fn test_single_alloc() -> Result<()> {
+        let temp_dir = TempDir::new(function_name!())?;
+        let test_file = temp_dir.path().join("db");
+
+        let fio = Fio::open(&test_file).unwrap();
+        assert_eq!(0, fio.len());
+
+        fio.alloc(1).await;
+        assert_eq!(1, fio.len());
+        assert_eq!(fio.block_size(), fs::metadata(&test_file)?.len());
+
+        fio.alloc(3).await;
+        assert_eq!(3, fio.len());
+        assert_eq!(3 * fio.block_size(), fs::metadata(&test_file)?.len());
 
         Ok(())
     }
