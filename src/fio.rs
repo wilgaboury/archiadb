@@ -18,8 +18,8 @@ use std::{
 };
 
 use anyhow::{Ok, Result, anyhow};
-use crossbeam::queue::SegQueue;
-use io_uring::{IoUring, squeue::Flags};
+use crossbeam::queue::{ArrayQueue, SegQueue};
+use io_uring::IoUring;
 use libc::{O_DIRECT, iovec};
 use rustix::fs::fstatvfs;
 
@@ -84,10 +84,6 @@ pub enum AllocState {
 }
 
 pub struct Fio {
-    inner: Arc<Inner>,
-}
-
-struct Inner {
     path: PathBuf,
     block_size: u64,
     file: File,
@@ -135,23 +131,21 @@ impl Fio {
         };
 
         Ok(Self {
-            inner: Arc::new(Inner {
-                path: path.as_ref().to_path_buf(),
-                block_size,
-                file,
-                fd,
-                shared,
-                join: Some(join),
-            }),
+            path: path.as_ref().to_path_buf(),
+            block_size,
+            file,
+            fd,
+            shared,
+            join: Some(join),
         })
     }
 
     pub fn block_size(&self) -> u64 {
-        self.inner.block_size
+        self.block_size
     }
 
     pub fn len(&self) -> u64 {
-        self.inner.shared.len.load(Ordering::Acquire)
+        self.shared.len.load(Ordering::Acquire)
     }
 
     pub async fn read_block(&self, idx: u64) -> Vec<u8> {
@@ -174,10 +168,10 @@ impl Fio {
                             waker: cx.waker().clone(),
                             state: self.result.clone(),
                         });
-                        self.fio.inner.shared.queue.push(op);
-                        self.fio.inner.join.as_ref().unwrap().thread().unpark();
+                        self.fio.shared.queue.push(op);
+                        self.fio.join.as_ref().unwrap().thread().unpark();
 
-                        *result = ReadState::Pending(vec![0u8; self.fio.inner.block_size as usize]);
+                        *result = ReadState::Pending(vec![0u8; self.fio.block_size as usize]);
                         Poll::Pending
                     }
                     ReadState::Pending(_) => {
@@ -210,8 +204,8 @@ impl Fio {
 
     pub fn write_block(&self, idx: u64, data: Vec<u8>) {
         let op = FioOp::Write(WriteData { idx, data });
-        self.inner.shared.queue.push(op);
-        self.inner.join.as_ref().unwrap().thread().unpark();
+        self.shared.queue.push(op);
+        self.join.as_ref().unwrap().thread().unpark();
     }
 
     pub async fn commit(&self) {
@@ -232,8 +226,8 @@ impl Fio {
                             state: self.result.clone(),
                             waker: cx.waker().clone(),
                         });
-                        self.fio.inner.shared.queue.push(op);
-                        self.fio.inner.join.as_ref().unwrap().thread().unpark();
+                        self.fio.shared.queue.push(op);
+                        self.fio.join.as_ref().unwrap().thread().unpark();
 
                         *result = CommitState::Pending;
                         Poll::Pending
@@ -281,8 +275,8 @@ impl Fio {
                             state: self.result.clone(),
                             waker: cx.waker().clone(),
                         });
-                        self.fio.inner.shared.queue.push(op);
-                        self.fio.inner.join.as_ref().unwrap().thread().unpark();
+                        self.fio.shared.queue.push(op);
+                        self.fio.join.as_ref().unwrap().thread().unpark();
 
                         *result = AllocState::Pending;
                         Poll::Pending
@@ -316,7 +310,7 @@ impl Fio {
     // }
 }
 
-impl Drop for Inner {
+impl Drop for Fio {
     fn drop(&mut self) {
         let _ = self.file.unlock();
         self.shared.stop.store(true, Ordering::Release);

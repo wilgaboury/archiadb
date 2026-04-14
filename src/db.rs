@@ -57,13 +57,6 @@ impl Drop for BlockPartialAlloc {
 
 impl Db {
     pub async fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
-        Self::open_with_block_size(path.as_ref(), None).await
-    }
-
-    pub async fn open_with_block_size<P: AsRef<Path>>(
-        path: P,
-        block_size: Option<u64>,
-    ) -> Result<Self> {
         let fio = Fio::open(path.as_ref())?;
 
         if fio.len() > 0 {
