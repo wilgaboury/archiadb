@@ -98,7 +98,19 @@ struct Shared {
     queue: SegQueue<FioOp>,
 }
 
-pub struct FioBlock {}
+pub struct BufRef {
+    buf: Vec<u8>,
+}
+
+impl BufRef {
+    pub fn get(&self) -> &[u8] {
+        &self.buf
+    }
+
+    pub fn get_mut(&mut self) -> &mut [u8] {
+        &mut self.buf
+    }
+}
 
 impl Fio {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
@@ -148,7 +160,7 @@ impl Fio {
         self.shared.len.load(Ordering::Acquire)
     }
 
-    pub async fn read_block(&self, idx: u64) -> Vec<u8> {
+    pub async fn read_block(&self, idx: u64) -> BufRef {
         pub struct ReadBlockFuture<'a> {
             fio: &'a Fio,
             idx: u64,
@@ -194,16 +206,27 @@ impl Fio {
             }
         }
 
-        ReadBlockFuture {
-            fio: self,
-            idx,
-            result: Arc::new(SpinLock::new(ReadState::Init)),
+        BufRef {
+            buf: ReadBlockFuture {
+                fio: self,
+                idx,
+                result: Arc::new(SpinLock::new(ReadState::Init)),
+            }
+            .await,
         }
-        .await
     }
 
-    pub fn write_block(&self, idx: u64, data: Vec<u8>) {
-        let op = FioOp::Write(WriteData { idx, data });
+    pub fn get_buf(&self) -> BufRef {
+        BufRef {
+            buf: vec![0u8; self.block_size as usize],
+        }
+    }
+
+    pub fn write_block(&self, idx: u64, data: BufRef) {
+        let op = FioOp::Write(WriteData {
+            idx,
+            data: data.buf,
+        });
         self.shared.queue.push(op);
         self.join.as_ref().unwrap().thread().unpark();
     }
@@ -540,7 +563,7 @@ mod tests {
         file.sync_all()?;
 
         let data = fio.read_block(0).await;
-        assert_eq!(vec![1u8; fio.block_size() as usize], data);
+        assert_eq!(vec![1u8; fio.block_size() as usize], data.get());
 
         Ok(())
     }
@@ -552,7 +575,9 @@ mod tests {
         let test_file = temp_dir.path().join("db");
 
         let fio = Fio::open(test_file.clone()).unwrap();
-        fio.write_block(0, vec![1u8; fio.block_size() as usize]);
+        let mut buf = fio.get_buf();
+        buf.get_mut()[0..].fill(1u8);
+        fio.write_block(0, buf);
         fio.commit().await;
 
         let mut file = OpenOptions::new().read(true).append(true).open(test_file)?;
