@@ -238,7 +238,7 @@ impl Inner {
         //     .await
         //     .0
         //     .context("Failed to write to file")?;
-        self.fio.commit().await.context("Failed to sync file")?;
+        // self.fio.commit().await.context("Failed to sync file")?;
         let tmp = *canon;
         *canon = *prev;
         *prev = tmp;

@@ -10,6 +10,7 @@ path = "src/lib.rs"
 [dependencies]
 anyhow = "1.0"
 crc32c = "0.6.8"
+crossbeam = "0.8"
 function_name = "0.3.0"
 io-uring = "0.7"
 rustix = { version = "1.1.4", features = ["fs", "io_uring"] }
