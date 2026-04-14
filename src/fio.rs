@@ -18,7 +18,7 @@ use std::{
 };
 
 use anyhow::{Ok, Result, anyhow};
-use crossbeam::queue::{ArrayQueue, SegQueue};
+use crossbeam::queue::SegQueue;
 use io_uring::IoUring;
 use libc::{O_DIRECT, iovec};
 use rustix::fs::fstatvfs;
@@ -28,7 +28,9 @@ use crate::spin::SpinLock;
 const MIN_BLOCK_SIZE: u64 = 4096; // 4kb
 const MAX_BLOCK_SIZE: u64 = 65536; // 64kb
 
-const QD: u32 = 128;
+const IO_URING_SQ: u32 = 256;
+const IO_URING_CQ: u32 = 512;
+const IO_URING_SPIN_LIMIT: u64 = 32;
 
 #[derive(Clone)]
 enum FioOp {
@@ -327,10 +329,6 @@ impl Fio {
         }
         .await
     }
-
-    // pub fn delete(self) -> Result<()> {
-    //     todo!("implement delete")
-    // }
 }
 
 impl Drop for Fio {
@@ -343,14 +341,17 @@ impl Drop for Fio {
     }
 }
 
-const SPIN_LIMIT: u64 = 32;
-
 fn io_uring_loop(block_size: u64, fd: i32, shared: Arc<Shared>) -> Result<()> {
-    let mut pending_operations = 0;
-    let mut ring = IoUring::new(QD)?;
-    let mut buffers: Vec<Vec<u8>> = (0..QD).map(|_| vec![0u8; block_size as usize]).collect();
-    let mut ids: VecDeque<usize> = (0..QD as usize).collect();
-    let mut pending_ops: Vec<Option<FioOp>> = vec![None; QD as usize];
+    let mut pending: u32 = 0;
+    let mut submitted: u32 = 0;
+    let mut ring = IoUring::builder()
+        .setup_cqsize(IO_URING_CQ)
+        .build(IO_URING_SQ)?;
+    let mut buffers: Vec<Vec<u8>> = (0..IO_URING_CQ)
+        .map(|_| vec![0u8; block_size as usize])
+        .collect();
+    let mut ids: VecDeque<usize> = (0..IO_URING_CQ as usize).collect();
+    let mut pending_ops: Vec<Option<FioOp>> = vec![None; IO_URING_CQ as usize];
     let mut spins = 0;
 
     // The kernel expects an array of `iovec` structures (pointer + length).
@@ -368,10 +369,10 @@ fn io_uring_loop(block_size: u64, fd: i32, shared: Arc<Shared>) -> Result<()> {
             .expect("Failed to register buffers");
     }
 
-    let mut submission_batch = Vec::with_capacity(QD as usize);
-
     loop {
-        if shared.queue.is_empty() && pending_operations == 0 {
+        submitted = 0;
+
+        if shared.queue.is_empty() && pending == 0 {
             thread::park();
         }
         if shared.stop.load(Ordering::Acquire) {
@@ -379,6 +380,8 @@ fn io_uring_loop(block_size: u64, fd: i32, shared: Arc<Shared>) -> Result<()> {
         }
 
         while !ids.is_empty()
+            && submitted < IO_URING_SQ
+            && submitted + pending < IO_URING_CQ
             && let Some(op) = shared.queue.pop()
         {
             match op {
@@ -393,7 +396,9 @@ fn io_uring_loop(block_size: u64, fd: i32, shared: Arc<Shared>) -> Result<()> {
                     .offset(offset)
                     .build()
                     .user_data(id as u64);
-                    submission_batch.push(read);
+                    unsafe {
+                        ring.submission().push(&read);
+                    }
                     pending_ops[id] = Some(FioOp::Read(data));
                 }
                 FioOp::Write(data) => {
@@ -408,7 +413,9 @@ fn io_uring_loop(block_size: u64, fd: i32, shared: Arc<Shared>) -> Result<()> {
                     .offset(offset)
                     .build()
                     .user_data(id as u64);
-                    submission_batch.push(write);
+                    unsafe {
+                        ring.submission().push(&write);
+                    }
                     pending_ops[id] = Some(FioOp::Write(data));
                 }
                 FioOp::Commit(data) => {
@@ -417,38 +424,36 @@ fn io_uring_loop(block_size: u64, fd: i32, shared: Arc<Shared>) -> Result<()> {
                         .build()
                         .user_data(id as u64)
                         .flags(io_uring::squeue::Flags::IO_DRAIN);
-                    submission_batch.push(fsync);
+                    unsafe {
+                        ring.submission().push(&fsync);
+                    }
                     pending_ops[id] = Some(FioOp::Commit(data));
                 }
                 FioOp::Alloc(data) => {
                     let id = ids.pop_front().unwrap();
-                    let fsync = io_uring::opcode::Fallocate::new(
+                    let alloc = io_uring::opcode::Fallocate::new(
                         io_uring::types::Fd(fd),
                         data.len * block_size,
                     )
                     .build()
                     .user_data(id as u64);
-                    submission_batch.push(fsync);
+                    unsafe {
+                        ring.submission().push(&alloc);
+                    }
                     pending_ops[id] = Some(FioOp::Alloc(data));
                 }
             }
         }
 
-        if !submission_batch.is_empty() {
-            unsafe {
-                ring.submission()
-                    .push_multiple(&submission_batch)
-                    .expect("Failed to push submission queue");
-            }
-            let submitted = ring.submit().unwrap(); // TODO: handle errors
-            pending_operations += submitted;
-            submission_batch.drain(0..submitted);
+        if !ring.submission().is_empty() {
+            let _ = ring.submit();
+            pending += submitted;
         }
 
-        let cq = ring.completion();
-        let mut had_entry = false;
+        let cq: io_uring::CompletionQueue = ring.completion();
+        let mut got_completion = false;
         for cqe in cq {
-            had_entry = true;
+            got_completion = true;
 
             let id = cqe.user_data() as usize;
             match std::mem::take(&mut pending_ops[id]) {
@@ -489,14 +494,14 @@ fn io_uring_loop(block_size: u64, fd: i32, shared: Arc<Shared>) -> Result<()> {
             }
 
             ids.push_back(id);
-            pending_operations -= 1;
+            pending -= 1;
         }
 
-        if had_entry {
+        if got_completion {
             spins = 0;
         } else {
             spins += 1;
-            if spins >= SPIN_LIMIT && pending_operations > 0 {
+            if spins >= IO_URING_SPIN_LIMIT && pending > 0 {
                 ring.submit_and_wait(1); // TODO: handle errors
                 spins = 0;
             }
