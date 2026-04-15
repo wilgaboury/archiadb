@@ -125,7 +125,7 @@ impl Db {
     }
 
     fn alloc_vec_block_buf(&self) -> Vec<u8> {
-        vec![0; self.inner.fio.block_size() as usize]
+        vec![0; self.inner.fio.page_size() as usize]
     }
 
     /// returns block idx
@@ -143,9 +143,9 @@ impl Db {
                     let chunks = self.inner.chunks.read().await;
                     for (i, chunk) in (*chunks).iter().enumerate() {
                         if let Some(idx) =
-                            try_increment(&chunk.frontier, self.inner.fio.block_size() as u32)
+                            try_increment(&chunk.frontier, self.inner.fio.page_size() as u32)
                         {
-                            break 'outer (i * (self.inner.fio.block_size() + 1)) + idx as usize;
+                            break 'outer (i * (self.inner.fio.page_size() + 1)) + idx as usize;
                         }
                     }
                     chunks.len()
@@ -157,7 +157,7 @@ impl Db {
                             header_lock: Mutex::new(()),
                             frontier: AtomicU32::new(1),
                         });
-                        break 'outer len * (self.inner.fio.block_size() + 1);
+                        break 'outer len * (self.inner.fio.page_size() + 1);
                     }
                 }
             }
@@ -200,11 +200,11 @@ impl Db {
     }
 
     fn block_idx_to_chunk_idx(&self, idx: usize) -> usize {
-        idx / self.inner.fio.block_size()
+        idx / self.inner.fio.page_size()
     }
 
     fn block_idx_to_disk_idx(&self, idx: usize) -> usize {
-        self.inner.fio.block_size() + (idx * (self.inner.fio.block_size() + 1))
+        self.inner.fio.page_size() + (idx * (self.inner.fio.page_size() + 1))
     }
 
     fn bitfield_set(buf: &mut [u8], idx: usize, as_one: bool) {

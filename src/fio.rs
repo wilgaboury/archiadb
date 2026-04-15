@@ -1,4 +1,6 @@
 use std::{
+    alloc::{Layout, alloc},
+    cmp,
     collections::VecDeque,
     ffi::c_void,
     fs::{File, OpenOptions},
@@ -25,8 +27,7 @@ use rustix::fs::fstatvfs;
 
 use crate::spin::SpinLock;
 
-const MIN_BLOCK_SIZE: usize = 4096; // 4kb
-const MAX_BLOCK_SIZE: usize = 65536; // 64kb
+pub const MIN_PAGE_SIZE: usize = 4096; // smallest supported page size and most common filesystem block size
 
 const IO_URING_SQ: u32 = 256;
 const IO_URING_CQ: u32 = 512;
@@ -40,7 +41,7 @@ enum FioOp {
 }
 
 struct ReadData {
-    block: usize,
+    pgidx: usize,
     waker: Waker,
     buf: BufRef,
     state: Arc<SpinLock<ReadState>>,
@@ -54,7 +55,7 @@ enum ReadState {
 }
 
 struct WriteData {
-    idx: usize,
+    pgidx: usize,
     buf: BufRef,
 }
 
@@ -89,11 +90,11 @@ pub struct Fio {
 }
 
 struct Inner {
-    block_size: usize,
+    page_size: usize,
     len: AtomicU64,
     stop: AtomicBool,
     queue: SegQueue<FioOp>,
-    bufs: Box<[u8]>,
+    bufs: Pin<Box<[u8]>>,
     free_bufs: ArrayQueue<usize>,
 }
 
@@ -106,8 +107,8 @@ impl BufRef {
     pub fn get(&self) -> &[u8] {
         match self {
             BufRef::Shared(shared) => {
-                let block_size = shared.fio.block_size;
-                unsafe { std::slice::from_raw_parts(shared.ptr(), block_size as usize) }
+                let page_size = shared.fio.page_size;
+                unsafe { std::slice::from_raw_parts(shared.ptr(), page_size as usize) }
             }
             BufRef::Owned(buf) => buf,
         }
@@ -116,8 +117,8 @@ impl BufRef {
     pub fn get_mut(&mut self) -> &mut [u8] {
         match self {
             BufRef::Shared(shared) => {
-                let block_size = shared.fio.block_size;
-                unsafe { std::slice::from_raw_parts_mut(shared.ptr(), block_size as usize) }
+                let page_size = shared.fio.page_size;
+                unsafe { std::slice::from_raw_parts_mut(shared.ptr(), page_size as usize) }
             }
             BufRef::Owned(buf) => buf,
         }
@@ -131,7 +132,7 @@ pub struct SharedBuf {
 
 impl SharedBuf {
     pub fn ptr(&self) -> *mut u8 {
-        self.fio.bufs[self.idx * self.fio.block_size..].as_ptr() as *mut u8
+        self.fio.bufs[self.idx * self.fio.page_size..].as_ptr() as *mut u8
     }
 }
 
@@ -147,27 +148,26 @@ impl Fio {
             .read(true)
             .write(true)
             .create(true)
-            .custom_flags(O_DIRECT)
+            .custom_flags(O_DIRECT) // TODO: if filesystem block size does not match db page (the file was moved to another computers/filesystem), O_DIRECT will not work
             .open(path.as_ref())?;
 
         file.try_lock()?; // prevent multiple instances from opening the same file
 
-        let block_size = get_block_size(path.as_ref())?;
-        validate_block_size(block_size)?;
+        let page_size = choose_page_size(path.as_ref())?;
 
         let fd = file.as_raw_fd();
-        let len = file.metadata()?.len() as usize / block_size;
+        let len = file.metadata()?.len() as usize / page_size;
 
         let stop = AtomicBool::new(false);
         let queue = SegQueue::new();
-        let bufs = vec![0u8; 2 * IO_URING_CQ as usize * block_size as usize].into_boxed_slice();
+        let bufs = alloc_aligned_buffer(2 * IO_URING_CQ as usize, page_size)?;
         let free_bufs = ArrayQueue::new(2 * IO_URING_CQ as usize);
         for idx in 0usize..(2 * IO_URING_CQ as usize) {
             let _ = free_bufs.push(idx); // TODO: handle error
         }
 
         let inner = Arc::new(Inner {
-            block_size,
+            page_size,
             len: AtomicU64::new(len as u64),
             stop,
             queue,
@@ -177,7 +177,7 @@ impl Fio {
 
         let join = {
             let shared = inner.clone();
-            thread::spawn(move || io_uring_loop(block_size, fd, shared))
+            thread::spawn(move || io_uring_loop(page_size, fd, shared))
         };
 
         Ok(Self {
@@ -188,8 +188,8 @@ impl Fio {
         })
     }
 
-    pub fn block_size(&self) -> usize {
-        self.inner.block_size
+    pub fn page_size(&self) -> usize {
+        self.inner.page_size
     }
 
     pub fn len(&self) -> u64 {
@@ -200,14 +200,14 @@ impl Fio {
         get_buf(&self.inner)
     }
 
-    pub async fn read(&self, idx: usize) -> BufRef {
-        pub struct ReadBlockFuture<'a> {
+    pub async fn read(&self, pgidx: usize) -> BufRef {
+        pub struct ReadFuture<'a> {
             fio: &'a Fio,
             idx: usize,
             result: Arc<SpinLock<ReadState>>,
         }
 
-        impl<'a> Future for ReadBlockFuture<'a> {
+        impl<'a> Future for ReadFuture<'a> {
             type Output = BufRef;
 
             fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -216,7 +216,7 @@ impl Fio {
                 match state {
                     ReadState::Init => {
                         let op = FioOp::Read(ReadData {
-                            block: self.idx,
+                            pgidx: self.idx,
                             waker: cx.waker().clone(),
                             buf: self.fio.get_buf(),
                             state: self.result.clone(),
@@ -240,23 +240,23 @@ impl Fio {
             }
         }
 
-        impl Drop for ReadBlockFuture<'_> {
+        impl Drop for ReadFuture<'_> {
             fn drop(&mut self) {
                 let mut result = self.result.lock();
                 *result = ReadState::Done;
             }
         }
 
-        ReadBlockFuture {
+        ReadFuture {
             fio: self,
-            idx,
+            idx: pgidx,
             result: Arc::new(SpinLock::new(ReadState::Init)),
         }
         .await
     }
 
-    pub fn write(&self, idx: usize, buf: BufRef) {
-        let op = FioOp::Write(WriteData { idx, buf });
+    pub fn write(&self, pgidx: usize, buf: BufRef) {
+        let op = FioOp::Write(WriteData { pgidx, buf });
         self.inner.queue.push(op);
         self.join.as_ref().unwrap().thread().unpark();
     }
@@ -369,7 +369,7 @@ fn get_buf(inner: &Arc<Inner>) -> BufRef {
                 fio: inner.clone(),
             })
         })
-        .unwrap_or_else(|| BufRef::Owned(vec![0u8; inner.block_size as usize].into_boxed_slice()))
+        .unwrap_or_else(|| BufRef::Owned(vec![0u8; inner.page_size as usize].into_boxed_slice()))
 }
 
 impl Drop for Fio {
@@ -382,13 +382,13 @@ impl Drop for Fio {
     }
 }
 
-fn io_uring_loop(block_size: usize, fd: i32, inner: Arc<Inner>) -> Result<()> {
+fn io_uring_loop(page_size: usize, fd: i32, inner: Arc<Inner>) -> Result<()> {
     let mut pending: u32 = 0;
     let mut ring = IoUring::builder()
         .setup_cqsize(IO_URING_CQ)
         .build(IO_URING_SQ)?;
 
-    let mut bufs = vec![0u8; IO_URING_CQ as usize * block_size as usize].into_boxed_slice();
+    let mut bufs = alloc_aligned_buffer(IO_URING_CQ as usize, page_size)?;
     let mut ids: VecDeque<usize> = (0..IO_URING_CQ as usize).collect();
 
     let mut ops = Vec::new();
@@ -397,16 +397,22 @@ fn io_uring_loop(block_size: usize, fd: i32, inner: Arc<Inner>) -> Result<()> {
 
     let mut spins = 0;
 
+    let shared_offset = IO_URING_CQ as usize;
     let iovecs: Vec<iovec> = (0usize..IO_URING_CQ as usize)
         .map(|i| iovec {
-            iov_base: (bufs[i * block_size..].as_mut_ptr()) as *mut c_void,
-            iov_len: block_size,
+            iov_base: (bufs[i * page_size..].as_mut_ptr()) as *mut c_void,
+            iov_len: page_size,
         })
         .chain((0usize..(2 * IO_URING_CQ as usize)).map(|i| iovec {
-            iov_base: (inner.bufs[i * block_size..].as_ptr() as *mut u8) as *mut c_void,
-            iov_len: block_size,
+            iov_base: (inner.bufs[i * page_size..].as_ptr() as *mut u8) as *mut c_void,
+            iov_len: page_size,
         }))
         .collect();
+
+    println!(
+        "registered address 1: {:p}",
+        (inner.bufs[0 * page_size..].as_ptr() as *mut u8)
+    );
 
     unsafe {
         ring.submitter()
@@ -433,17 +439,15 @@ fn io_uring_loop(block_size: usize, fd: i32, inner: Arc<Inner>) -> Result<()> {
             match op {
                 FioOp::Read(data) => {
                     let id = ids.pop_front().unwrap();
-                    let offset = data.block * block_size;
+                    let offset = data.pgidx * page_size;
 
                     let (buf, len, idx) = match &data.buf {
-                        BufRef::Shared(shared) => (
-                            shared.ptr(),
-                            block_size as u32,
-                            (IO_URING_SQ as usize + id) as u16,
-                        ),
+                        BufRef::Shared(shared) => {
+                            (shared.ptr(), page_size as u32, (shared_offset + id) as u16)
+                        }
                         BufRef::Owned(_) => (
-                            bufs[id * block_size..].as_mut_ptr(),
-                            block_size as u32,
+                            bufs[id * page_size..].as_mut_ptr(),
+                            page_size as u32,
                             id as u16,
                         ),
                     };
@@ -460,19 +464,17 @@ fn io_uring_loop(block_size: usize, fd: i32, inner: Arc<Inner>) -> Result<()> {
                 }
                 FioOp::Write(data) => {
                     let id = ids.pop_front().unwrap();
-                    let offset = data.idx * block_size;
+                    let offset = data.pgidx * page_size;
 
                     let (buf, len, idx) = match &data.buf {
-                        BufRef::Shared(shared) => (
-                            shared.ptr(),
-                            block_size as u32,
-                            (IO_URING_SQ as usize + id) as u16,
-                        ),
+                        BufRef::Shared(shared) => {
+                            (shared.ptr(), page_size as u32, (shared_offset + id) as u16)
+                        }
                         BufRef::Owned(vec) => {
-                            bufs[id * block_size..(id + 1) * block_size].copy_from_slice(vec);
+                            bufs[id * page_size..(id + 1) * page_size].copy_from_slice(vec);
                             (
-                                bufs[id * block_size..].as_mut_ptr(),
-                                block_size as u32,
+                                bufs[id * page_size..].as_mut_ptr(),
+                                page_size as u32,
                                 id as u16,
                             )
                         }
@@ -505,7 +507,7 @@ fn io_uring_loop(block_size: usize, fd: i32, inner: Arc<Inner>) -> Result<()> {
                     let id = ids.pop_front().unwrap();
                     let alloc = io_uring::opcode::Fallocate::new(
                         io_uring::types::Fd(fd),
-                        (data.len * block_size) as u64,
+                        (data.len * page_size) as u64,
                     )
                     .build()
                     .user_data(id as u64);
@@ -527,10 +529,12 @@ fn io_uring_loop(block_size: usize, fd: i32, inner: Arc<Inner>) -> Result<()> {
         for cqe in cq {
             completed += 1;
 
+            println!("result: {}", cqe.result());
+
             let id = cqe.user_data() as usize;
             match std::mem::take(&mut ops[id]) {
                 Some(FioOp::Read(ReadData {
-                    block: _,
+                    pgidx: _,
                     waker,
                     mut buf,
                     state: result,
@@ -538,7 +542,7 @@ fn io_uring_loop(block_size: usize, fd: i32, inner: Arc<Inner>) -> Result<()> {
                     {
                         let mut inner = result.lock();
                         if let BufRef::Owned(buf) = &mut buf {
-                            buf.copy_from_slice(&bufs[id * block_size..(id + 1) * block_size]);
+                            buf.copy_from_slice(&bufs[id * page_size..(id + 1) * page_size]);
                         }
                         *inner = ReadState::Ready(buf);
                     }
@@ -581,28 +585,34 @@ fn io_uring_loop(block_size: usize, fd: i32, inner: Arc<Inner>) -> Result<()> {
     }
 }
 
-pub fn get_block_size<P: AsRef<Path>>(path: P) -> Result<usize> {
+pub fn choose_page_size<P: AsRef<Path>>(path: P) -> Result<usize> {
     let file = File::open(path)?;
     let fd = file.as_fd();
     let fstatvfs = fstatvfs(fd)?;
-    Ok(fstatvfs.f_bsize as usize)
+    let block_size = fstatvfs.f_bsize as usize;
+    if MIN_PAGE_SIZE % block_size == 0 || block_size % MIN_PAGE_SIZE == 0 {
+        Ok(cmp::max(block_size, MIN_PAGE_SIZE))
+    } else {
+        // realistically, there should be no linux filesytems that fail this check
+        Err(anyhow!("Unsupported filesystem block size: {}", block_size))
+    }
 }
 
-pub fn validate_block_size(block_size: usize) -> Result<()> {
-    if block_size >= MIN_BLOCK_SIZE
-        && block_size <= MAX_BLOCK_SIZE
-        && block_size % MIN_BLOCK_SIZE == 0
-    {
-        Ok(())
-    } else {
-        Err(anyhow!(
-            "Block size for filesystem is {}, but it must between {} and {} and a multiple of {}",
-            block_size,
-            MIN_BLOCK_SIZE,
-            MAX_BLOCK_SIZE,
-            MIN_BLOCK_SIZE
-        ))
+pub fn alloc_aligned_buffer(pages: usize, page_size: usize) -> Result<Pin<Box<[u8]>>> {
+    let size = pages * page_size;
+    let layout = Layout::from_size_align(size, page_size)
+        .map_err(|_| anyhow!("Invalid layout for buffer alignment"))?;
+
+    let ptr = unsafe { alloc(layout) };
+    if ptr.is_null() {
+        return Err(anyhow!("Failed to allocate aligned buffer"));
     }
+
+    unsafe {
+        std::ptr::write_bytes(ptr, 0, size);
+    }
+
+    Ok(unsafe { Pin::from(Box::from_raw(std::slice::from_raw_parts_mut(ptr, size))) })
 }
 
 #[cfg(test)]
@@ -619,14 +629,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_pick_block_size() {
-        let block_size = get_block_size(Path::new("/")).unwrap();
-        println!("Auto picked size: {}", block_size);
+    fn test_choose_page_size() {
+        let page_size = choose_page_size(Path::new("/")).unwrap();
+        println!("Auto picked size: {}", page_size);
+    }
+
+    #[named]
+    #[test]
+    fn test_buf() -> Result<()> {
+        let temp_dir = TempDir::new(function_name!())?;
+        let test_file = temp_dir.path().join("db");
+
+        let fio = Fio::open(test_file.clone()).unwrap();
+        let mut buf = fio.get_buf();
+        assert!(matches!(buf, BufRef::Shared(_)));
+
+        buf.get_mut()[0] = 1;
+        assert_eq!(1, buf.get()[0]);
+
+        Ok(())
     }
 
     #[named]
     #[tokio::test]
-    async fn test_single_read_block() -> Result<()> {
+    async fn test_single_read_page() -> Result<()> {
         let temp_dir = TempDir::new(function_name!())?;
         let test_file = temp_dir.path().join("db");
 
@@ -635,19 +661,28 @@ mod tests {
             .write(true)
             .append(true)
             .open(test_file)?;
-        file.write_all(&vec![1u8; fio.block_size()])?;
+        file.write_all(&vec![1u8; fio.page_size()])?;
         file.flush()?;
         file.sync_all()?;
 
         let data = fio.read(0).await;
-        assert_eq!(vec![1u8; fio.block_size()], data.get());
+
+        if let BufRef::Shared(shared) = &data {
+            println!(
+                "read page into shared buffer with idx {}, address {:p}",
+                shared.idx,
+                shared.ptr()
+            );
+        }
+
+        assert_eq!(vec![1u8; fio.page_size()], data.get());
 
         Ok(())
     }
 
     #[named]
     #[tokio::test]
-    async fn test_single_write_block() -> Result<()> {
+    async fn test_single_write_page() -> Result<()> {
         let temp_dir = TempDir::new(function_name!())?;
         let test_file = temp_dir.path().join("db");
 
@@ -658,10 +693,10 @@ mod tests {
         fio.commit().await;
 
         let mut file = OpenOptions::new().read(true).append(true).open(test_file)?;
-        let mut buf = vec![0u8; fio.block_size()];
+        let mut buf = vec![0u8; fio.page_size()];
         file.read_exact(&mut buf)?;
 
-        assert_eq!(vec![1u8; fio.block_size()], buf);
+        assert_eq!(vec![1u8; fio.page_size()], buf);
 
         Ok(())
     }
@@ -677,12 +712,12 @@ mod tests {
 
         fio.alloc(1).await;
         assert_eq!(1, fio.len());
-        assert_eq!(fio.block_size(), fs::metadata(&test_file)?.len() as usize);
+        assert_eq!(fio.page_size(), fs::metadata(&test_file)?.len() as usize);
 
         fio.alloc(3).await;
         assert_eq!(3, fio.len());
         assert_eq!(
-            3 * fio.block_size(),
+            3 * fio.page_size(),
             fs::metadata(&test_file)?.len() as usize
         );
 
