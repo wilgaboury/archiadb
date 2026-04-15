@@ -29,8 +29,8 @@ use crate::spin::SpinLock;
 
 pub const MIN_PAGE_SIZE: usize = 4096; // smallest supported page size and most common filesystem block size
 
-const IO_URING_SQ: u32 = 256;
-const IO_URING_CQ: u32 = 512;
+const IO_URING_SQ: u32 = 16;
+const IO_URING_CQ: u32 = 32;
 const IO_URING_SPIN_LIMIT: u64 = 32;
 
 enum FioOp {
@@ -153,7 +153,7 @@ impl Fio {
             .read(true)
             .write(true)
             .create(true)
-            // .custom_flags(O_DIRECT) // TODO: if filesystem block size does not match db page (the file was moved to another computers/filesystem), O_DIRECT will not work
+            .custom_flags(O_DIRECT) // TODO: if filesystem block size does not match db page (the file was moved to another computers/filesystem), O_DIRECT will not work
             .open(path.as_ref())?;
 
         file.try_lock()?; // prevent multiple instances from opening the same file
