@@ -14,12 +14,12 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    task::{Context, Poll, Waker},
+    task::{self, Poll, Waker},
     thread::{self, JoinHandle},
     vec,
 };
 
-use anyhow::{Ok, Result, anyhow};
+use anyhow::{Context, Ok, Result, anyhow};
 use crossbeam::queue::{ArrayQueue, SegQueue};
 use io_uring::IoUring;
 use libc::{O_DIRECT, iovec};
@@ -86,7 +86,7 @@ pub struct Fio {
     path: PathBuf,
     file: File,
     inner: Arc<Inner>,
-    join: Option<JoinHandle<Result<()>>>,
+    join: Option<JoinHandle<()>>,
 }
 
 struct Inner {
@@ -138,7 +138,12 @@ impl SharedBuf {
 
 impl Drop for SharedBuf {
     fn drop(&mut self) {
-        let _ = self.fio.free_bufs.push(self.idx); // TODO: handle error
+        if let Err(e) = self.fio.free_bufs.push(self.idx) {
+            eprintln!(
+                "Failed to return buffer idx {} to free pool: {}",
+                self.idx, e
+            );
+        }
     }
 }
 
@@ -163,7 +168,9 @@ impl Fio {
         let bufs = alloc_aligned_buffer(2 * IO_URING_CQ as usize, page_size)?;
         let free_bufs = ArrayQueue::new(2 * IO_URING_CQ as usize);
         for idx in 0usize..(2 * IO_URING_CQ as usize) {
-            let _ = free_bufs.push(idx); // TODO: handle error
+            free_bufs
+                .push(idx)
+                .map_err(|idx| anyhow!("Failed to initialize idx {} in free buffer pool", idx))?;
         }
 
         let inner = Arc::new(Inner {
@@ -177,7 +184,11 @@ impl Fio {
 
         let join = {
             let shared = inner.clone();
-            thread::spawn(move || io_uring_loop(page_size, fd, shared))
+            thread::spawn(move || {
+                if let Err(e) = io_uring_loop(page_size, fd, shared) {
+                    panic!("io_uring thread failed with error: {:?}", e);
+                }
+            })
         };
 
         Ok(Self {
@@ -210,7 +221,7 @@ impl Fio {
         impl<'a> Future for ReadFuture<'a> {
             type Output = BufRef;
 
-            fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
                 let mut result = self.result.lock();
                 let state = std::mem::replace(&mut *result, ReadState::Done);
                 match state {
@@ -270,7 +281,7 @@ impl Fio {
         impl<'a> Future for CommitFuture<'a> {
             type Output = ();
 
-            fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
                 let mut result = self.result.lock();
                 let state = std::mem::replace(&mut *result, CommitState::Done);
                 match state {
@@ -318,7 +329,7 @@ impl Fio {
         impl<'a> Future for AllocFuture<'a> {
             type Output = ();
 
-            fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
                 let mut result = self.result.lock();
                 let state = std::mem::replace(&mut *result, AllocState::Done);
                 match state {
@@ -374,11 +385,16 @@ fn get_buf(inner: &Arc<Inner>) -> BufRef {
 
 impl Drop for Fio {
     fn drop(&mut self) {
-        let _ = self.file.unlock();
+        if let Err(e) = self.file.unlock() {
+            eprintln!("Failed to unlock file: {}", e);
+        }
         self.inner.stop.store(true, Ordering::Release);
         let join = self.join.take().unwrap();
         join.thread().unpark();
-        let _ = join.join();
+        let thread_id = join.thread().id();
+        if let Err(e) = join.join() {
+            eprintln!("Failed to join io_uring thread {:?}: {:?}", thread_id, e);
+        }
     }
 }
 
@@ -417,7 +433,7 @@ fn io_uring_loop(page_size: usize, fd: i32, inner: Arc<Inner>) -> Result<()> {
     unsafe {
         ring.submitter()
             .register_buffers(&iovecs)
-            .expect("Failed to register buffers");
+            .context("Failed to register buffers")?;
     }
 
     loop {
@@ -458,7 +474,9 @@ fn io_uring_loop(page_size: usize, fd: i32, inner: Arc<Inner>) -> Result<()> {
                             .build()
                             .user_data(id as u64);
                     unsafe {
-                        let _ = ring.submission().push(&read); // TODO: handle error
+                        ring.submission()
+                            .push(&read)
+                            .context("Failed to push read entry onto submission queue")?;
                     }
                     ops[id] = Some(FioOp::Read(data));
                 }
@@ -486,7 +504,9 @@ fn io_uring_loop(page_size: usize, fd: i32, inner: Arc<Inner>) -> Result<()> {
                             .build()
                             .user_data(id as u64);
                     unsafe {
-                        let _ = ring.submission().push(&write); // TODO: handle error
+                        ring.submission()
+                            .push(&write)
+                            .context("Failed to push write entry onto submission queue")?;
                     }
                     ops[id] = Some(FioOp::Write(data));
                 }
@@ -499,7 +519,9 @@ fn io_uring_loop(page_size: usize, fd: i32, inner: Arc<Inner>) -> Result<()> {
                         .user_data(id as u64)
                         .flags(io_uring::squeue::Flags::IO_DRAIN);
                     unsafe {
-                        let _ = ring.submission().push(&fsync); // TODO: handle error
+                        ring.submission()
+                            .push(&fsync)
+                            .context("Failed to push fsync entry onto submission queue")?;
                     }
                     ops[id] = Some(FioOp::Commit(data));
                 }
@@ -512,7 +534,9 @@ fn io_uring_loop(page_size: usize, fd: i32, inner: Arc<Inner>) -> Result<()> {
                     .build()
                     .user_data(id as u64);
                     unsafe {
-                        let _ = ring.submission().push(&alloc); // TODO: handle error
+                        ring.submission()
+                            .push(&alloc)
+                            .context("Failed to push alloc entry onto submission queue")?;
                     }
                     ops[id] = Some(FioOp::Alloc(data));
                 }
@@ -520,7 +544,7 @@ fn io_uring_loop(page_size: usize, fd: i32, inner: Arc<Inner>) -> Result<()> {
         }
 
         if !ring.submission().is_empty() {
-            let _ = ring.submit();
+            ring.submit().context("Failed to submit submission queue")?;
             pending += submitted;
         }
 
@@ -576,7 +600,8 @@ fn io_uring_loop(page_size: usize, fd: i32, inner: Arc<Inner>) -> Result<()> {
         if submitted == 0 && completed == 0 {
             spins += 1;
             if spins >= IO_URING_SPIN_LIMIT && pending > 0 {
-                let _ = ring.submit_and_wait(1); // TODO: handle errors
+                ring.submit_and_wait(1)
+                    .context("Failed to submit and wait on io_uring")?;
                 spins = 0;
             }
         } else {
