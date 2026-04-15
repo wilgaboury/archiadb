@@ -153,7 +153,7 @@ impl Fio {
             .read(true)
             .write(true)
             .create(true)
-            .custom_flags(O_DIRECT) // TODO: if filesystem block size does not match db page (the file was moved to another computers/filesystem), O_DIRECT will not work
+            // .custom_flags(O_DIRECT) // TODO: if filesystem block size does not match db page (the file was moved to another computers/filesystem), O_DIRECT will not work
             .open(path.as_ref())?;
 
         file.try_lock()?; // prevent multiple instances from opening the same file
