@@ -57,7 +57,7 @@ impl Drop for BlockPartialAlloc {
 
 impl Db {
     pub async fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let fio = Fio::open(path.as_ref())?;
+        let fio = Fio::builder().path(path.as_ref()).build()?;
 
         if fio.len() > 0 {
             todo!("implement reading meta and initializing")

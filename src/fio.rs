@@ -20,6 +20,7 @@ use std::{
 };
 
 use anyhow::{Context, Ok, Result, anyhow};
+use bon::bon;
 use crossbeam::queue::{ArrayQueue, SegQueue};
 use io_uring::IoUring;
 use libc::{O_DIRECT, iovec};
@@ -29,8 +30,9 @@ use crate::spin::SpinLock;
 
 pub const MIN_PAGE_SIZE: usize = 4096; // smallest supported page size and most common filesystem block size
 
-const IO_URING_SQ: u32 = 16;
-const IO_URING_CQ: u32 = 32;
+const DEFAULT_SQ_SIZE: usize = 128;
+const DEFAULT_CQ_SIZE: usize = 256;
+const DEFAULT_PAGE_BUF_POOL_SIZE: usize = 512;
 const IO_URING_SPIN_LIMIT: u64 = 32;
 
 enum FioOp {
@@ -147,8 +149,15 @@ impl Drop for SharedBuf {
     }
 }
 
+#[bon]
 impl Fio {
-    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+    #[builder]
+    pub fn new<P: AsRef<Path>>(
+        path: P,
+        #[builder(default = DEFAULT_SQ_SIZE)] sq: usize,
+        #[builder(default = DEFAULT_CQ_SIZE)] cq: usize,
+        #[builder(default = DEFAULT_PAGE_BUF_POOL_SIZE)] page_buf_pool: usize,
+    ) -> Result<Self> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -165,9 +174,9 @@ impl Fio {
 
         let stop = AtomicBool::new(false);
         let queue = SegQueue::new();
-        let bufs = alloc_aligned_buffer(2 * IO_URING_CQ as usize, page_size)?;
-        let free_bufs = ArrayQueue::new(2 * IO_URING_CQ as usize);
-        for idx in 0usize..(2 * IO_URING_CQ as usize) {
+        let bufs = alloc_aligned_buffer(page_buf_pool as usize, page_size)?;
+        let free_bufs = ArrayQueue::new(page_buf_pool as usize);
+        for idx in 0usize..(page_buf_pool as usize) {
             free_bufs
                 .push(idx)
                 .map_err(|idx| anyhow!("Failed to initialize idx {} in free buffer pool", idx))?;
@@ -183,12 +192,9 @@ impl Fio {
         });
 
         let join = {
-            let shared = inner.clone();
-            thread::spawn(move || {
-                if let Err(e) = io_uring_loop(page_size, fd, shared) {
-                    panic!("io_uring thread failed with error: {:?}", e);
-                }
-            })
+            let inner = inner.clone();
+            let mut io_loop = IoLoop::new(page_size, sq, cq, page_buf_pool, fd, inner)?;
+            thread::spawn(move || io_loop.run())
         };
 
         Ok(Self {
@@ -398,214 +404,311 @@ impl Drop for Fio {
     }
 }
 
-fn io_uring_loop(page_size: usize, fd: i32, inner: Arc<Inner>) -> Result<()> {
-    let mut pending: u32 = 0;
-    let mut ring = IoUring::builder()
-        .setup_cqsize(IO_URING_CQ)
-        .build(IO_URING_SQ)?;
+struct IoLoop {
+    page_size: usize,
+    sq_size: usize,
+    cq_size: usize,
+    page_buf_pool_size: usize,
+    fd: i32,
+    inner: Arc<Inner>,
 
-    let mut bufs = alloc_aligned_buffer(IO_URING_CQ as usize, page_size)?;
-    let mut ids: VecDeque<usize> = (0..IO_URING_CQ as usize).collect();
+    ring: IoUring,
+    bufs: Pin<Box<[u8]>>,
+    ops: Box<[Option<FioOp>]>,
+}
 
-    let mut ops = Vec::new();
-    ops.resize_with(IO_URING_CQ as usize, || None);
-    let mut ops = ops.into_boxed_slice();
+impl IoLoop {
+    fn new(
+        page_size: usize,
+        sq_size: usize,
+        cq_size: usize,
+        page_buf_pool_size: usize,
+        fd: i32,
+        inner: Arc<Inner>,
+    ) -> Result<Self> {
+        let ring = IoUring::builder()
+            .setup_cqsize(cq_size as u32)
+            .build(sq_size as u32)?;
+        let mut bufs = alloc_aligned_buffer(cq_size as usize, page_size)?;
 
-    let mut spins = 0;
+        let iovecs: Vec<iovec> = (0usize..cq_size as usize)
+            .map(|i| iovec {
+                iov_base: (bufs[i * page_size..].as_mut_ptr()) as *mut c_void,
+                iov_len: page_size,
+            })
+            .chain((0usize..(page_buf_pool_size as usize)).map(|i| iovec {
+                iov_base: (inner.bufs[i * page_size..].as_ptr() as *mut u8) as *mut c_void,
+                iov_len: page_size,
+            }))
+            .collect();
 
-    let shared_offset = IO_URING_CQ as usize;
-    let iovecs: Vec<iovec> = (0usize..IO_URING_CQ as usize)
-        .map(|i| iovec {
-            iov_base: (bufs[i * page_size..].as_mut_ptr()) as *mut c_void,
-            iov_len: page_size,
+        let mut ops = Vec::new();
+        ops.resize_with(cq_size as usize, || None);
+        let ops = ops.into_boxed_slice();
+
+        unsafe {
+            ring.submitter()
+                .register_buffers(&iovecs)
+                .context("Failed to register buffers")?;
+        }
+
+        Ok(Self {
+            page_size,
+            sq_size,
+            cq_size,
+            page_buf_pool_size,
+            fd,
+            inner,
+            ring,
+            bufs,
+            ops,
         })
-        .chain((0usize..(2 * IO_URING_CQ as usize)).map(|i| iovec {
-            iov_base: (inner.bufs[i * page_size..].as_ptr() as *mut u8) as *mut c_void,
-            iov_len: page_size,
-        }))
-        .collect();
-
-    println!(
-        "registered address 1: {:p}",
-        (inner.bufs[0 * page_size..].as_ptr() as *mut u8)
-    );
-
-    unsafe {
-        ring.submitter()
-            .register_buffers(&iovecs)
-            .context("Failed to register buffers")?;
     }
 
-    loop {
-        let mut submitted = 0;
-
-        if inner.queue.is_empty() && pending == 0 {
-            thread::park();
+    fn no_op_op(op: FioOp) {
+        match op {
+            FioOp::Read(ReadData { waker, .. }) => {
+                waker.wake();
+            }
+            FioOp::Write(_) => {
+                // no-op
+            }
+            FioOp::Commit(CommitData { waker, .. }) => {
+                waker.wake();
+            }
+            FioOp::Alloc(AllocData { waker, .. }) => {
+                waker.wake();
+            }
         }
-        if inner.stop.load(Ordering::Acquire) {
-            return Ok(());
-        }
+    }
 
-        while !ids.is_empty()
-            && submitted < IO_URING_SQ
-            && submitted + pending < IO_URING_CQ
-            && let Some(op) = inner.queue.pop()
-        {
-            submitted += 1;
-            match op {
-                FioOp::Read(data) => {
-                    let id = ids.pop_front().unwrap();
-                    let offset = data.pgidx * page_size;
+    fn run(&mut self) {
+        if let Err(e) = self.run_unchecked() {
+            eprintln!("io_uring thread failed: {}", e);
 
-                    let (buf, len, idx) = match &data.buf {
-                        BufRef::Shared(shared) => {
-                            (shared.ptr(), page_size as u32, (shared_offset + id) as u16)
-                        }
-                        BufRef::Owned(_) => (
-                            bufs[id * page_size..].as_mut_ptr(),
-                            page_size as u32,
-                            id as u16,
-                        ),
-                    };
-
-                    let read =
-                        io_uring::opcode::ReadFixed::new(io_uring::types::Fd(fd), buf, len, idx)
-                            .offset(offset as u64)
-                            .build()
-                            .user_data(id as u64);
-                    unsafe {
-                        ring.submission()
-                            .push(&read)
-                            .context("Failed to push read entry onto submission queue")?;
+            for i in 0..self.ops.len() {
+                match std::mem::take(&mut self.ops[i]) {
+                    Some(op) => Self::no_op_op(op),
+                    None => {
+                        // no-op
                     }
-                    ops[id] = Some(FioOp::Read(data));
                 }
-                FioOp::Write(data) => {
-                    let id = ids.pop_front().unwrap();
-                    let offset = data.pgidx * page_size;
+            }
 
-                    let (buf, len, idx) = match &data.buf {
-                        BufRef::Shared(shared) => {
-                            (shared.ptr(), page_size as u32, (shared_offset + id) as u16)
-                        }
-                        BufRef::Owned(vec) => {
-                            bufs[id * page_size..(id + 1) * page_size].copy_from_slice(vec);
-                            (
-                                bufs[id * page_size..].as_mut_ptr(),
-                                page_size as u32,
+            loop {
+                if self.inner.queue.is_empty() {
+                    thread::park();
+                }
+                if self.inner.stop.load(Ordering::Acquire) {
+                    return;
+                }
+                while let Some(op) = self.inner.queue.pop() {
+                    Self::no_op_op(op);
+                }
+            }
+        }
+    }
+
+    fn run_unchecked(&mut self) -> Result<()> {
+        let mut pending: usize = 0;
+
+        let mut ids: VecDeque<usize> = (0..self.cq_size as usize).collect();
+
+        let mut spins = 0;
+
+        loop {
+            let mut submitted = 0;
+
+            if self.inner.queue.is_empty() && pending == 0 {
+                thread::park();
+            }
+            if self.inner.stop.load(Ordering::Acquire) {
+                return Ok(());
+            }
+
+            while !ids.is_empty()
+                && submitted < self.sq_size
+                && submitted + pending < self.cq_size
+                && let Some(op) = self.inner.queue.pop()
+            {
+                submitted += 1;
+                match op {
+                    FioOp::Read(data) => {
+                        let id = ids.pop_front().unwrap();
+                        let offset = data.pgidx * self.page_size;
+
+                        let (buf, len, idx) = match &data.buf {
+                            BufRef::Shared(shared) => (
+                                shared.ptr(),
+                                self.page_size as u32,
+                                (self.cq_size + id) as u16,
+                            ),
+                            BufRef::Owned(_) => (
+                                self.bufs[id * self.page_size..].as_mut_ptr(),
+                                self.page_size as u32,
                                 id as u16,
-                            )
-                        }
-                    };
+                            ),
+                        };
 
-                    let write =
-                        io_uring::opcode::WriteFixed::new(io_uring::types::Fd(fd), buf, len, idx)
-                            .offset(offset as u64)
-                            .build()
-                            .user_data(id as u64);
-                    unsafe {
-                        ring.submission()
-                            .push(&write)
-                            .context("Failed to push write entry onto submission queue")?;
-                    }
-                    ops[id] = Some(FioOp::Write(data));
-                }
-                FioOp::Commit(data) => {
-                    // TODO: combine fsyncs and move to back of batch
-
-                    let id = ids.pop_front().unwrap();
-                    let fsync = io_uring::opcode::Fsync::new(io_uring::types::Fd(fd))
+                        let read = io_uring::opcode::ReadFixed::new(
+                            io_uring::types::Fd(self.fd),
+                            buf,
+                            len,
+                            idx,
+                        )
+                        .offset(offset as u64)
                         .build()
-                        .user_data(id as u64)
-                        .flags(io_uring::squeue::Flags::IO_DRAIN);
-                    unsafe {
-                        ring.submission()
-                            .push(&fsync)
-                            .context("Failed to push fsync entry onto submission queue")?;
-                    }
-                    ops[id] = Some(FioOp::Commit(data));
-                }
-                FioOp::Alloc(data) => {
-                    let id = ids.pop_front().unwrap();
-                    let alloc = io_uring::opcode::Fallocate::new(
-                        io_uring::types::Fd(fd),
-                        (data.len * page_size) as u64,
-                    )
-                    .build()
-                    .user_data(id as u64);
-                    unsafe {
-                        ring.submission()
-                            .push(&alloc)
-                            .context("Failed to push alloc entry onto submission queue")?;
-                    }
-                    ops[id] = Some(FioOp::Alloc(data));
-                }
-            }
-        }
-
-        if !ring.submission().is_empty() {
-            ring.submit().context("Failed to submit submission queue")?;
-            pending += submitted;
-        }
-
-        let cq: io_uring::CompletionQueue = ring.completion();
-        let mut completed: u32 = 0;
-        for cqe in cq {
-            completed += 1;
-
-            println!("result: {}", cqe.result());
-
-            let id = cqe.user_data() as usize;
-            match std::mem::take(&mut ops[id]) {
-                Some(FioOp::Read(ReadData {
-                    pgidx: _,
-                    waker,
-                    mut buf,
-                    state: result,
-                })) => {
-                    {
-                        let mut inner = result.lock();
-                        if let BufRef::Owned(buf) = &mut buf {
-                            buf.copy_from_slice(&bufs[id * page_size..(id + 1) * page_size]);
+                        .user_data(id as u64);
+                        unsafe {
+                            self.ring
+                                .submission()
+                                .push(&read)
+                                .context("Failed to push read entry onto submission queue")?;
                         }
-                        *inner = ReadState::Ready(buf);
+                        self.ops[id] = Some(FioOp::Read(data));
                     }
-                    waker.wake();
-                }
-                Some(FioOp::Write(_)) => {
-                    // no-op
-                }
-                Some(FioOp::Commit(CommitData { state, waker })) => {
-                    {
-                        let mut inner = state.lock();
-                        let _ = std::mem::replace(&mut *inner, CommitState::Done);
+                    FioOp::Write(data) => {
+                        let id = ids.pop_front().unwrap();
+                        let offset = data.pgidx * self.page_size;
+
+                        let (buf, len, idx) = match &data.buf {
+                            BufRef::Shared(shared) => (
+                                shared.ptr(),
+                                self.page_size as u32,
+                                (self.cq_size + id) as u16,
+                            ),
+                            BufRef::Owned(vec) => {
+                                self.bufs[id * self.page_size..(id + 1) * self.page_size]
+                                    .copy_from_slice(vec);
+                                (
+                                    self.bufs[id * self.page_size..].as_mut_ptr(),
+                                    self.page_size as u32,
+                                    id as u16,
+                                )
+                            }
+                        };
+
+                        let write = io_uring::opcode::WriteFixed::new(
+                            io_uring::types::Fd(self.fd),
+                            buf,
+                            len,
+                            idx,
+                        )
+                        .offset(offset as u64)
+                        .build()
+                        .user_data(id as u64);
+                        unsafe {
+                            self.ring
+                                .submission()
+                                .push(&write)
+                                .context("Failed to push write entry onto submission queue")?;
+                        }
+                        self.ops[id] = Some(FioOp::Write(data));
                     }
-                    waker.wake();
-                }
-                Some(FioOp::Alloc(AllocData { len, waker, state })) => {
-                    {
-                        let mut inner = state.lock();
-                        let _ = std::mem::replace(&mut *inner, AllocState::Done);
+                    FioOp::Commit(data) => {
+                        // TODO: combine fsyncs and move to back of batch
+
+                        let id = ids.pop_front().unwrap();
+                        let fsync = io_uring::opcode::Fsync::new(io_uring::types::Fd(self.fd))
+                            .build()
+                            .user_data(id as u64)
+                            .flags(io_uring::squeue::Flags::IO_DRAIN);
+                        unsafe {
+                            self.ring
+                                .submission()
+                                .push(&fsync)
+                                .context("Failed to push fsync entry onto submission queue")?;
+                        }
+                        self.ops[id] = Some(FioOp::Commit(data));
                     }
-                    inner.len.fetch_max(len as u64, Ordering::AcqRel);
-                    waker.wake();
+                    FioOp::Alloc(data) => {
+                        let id = ids.pop_front().unwrap();
+                        let alloc = io_uring::opcode::Fallocate::new(
+                            io_uring::types::Fd(self.fd),
+                            (data.len * self.page_size) as u64,
+                        )
+                        .build()
+                        .user_data(id as u64);
+                        unsafe {
+                            self.ring
+                                .submission()
+                                .push(&alloc)
+                                .context("Failed to push alloc entry onto submission queue")?;
+                        }
+                        self.ops[id] = Some(FioOp::Alloc(data));
+                    }
                 }
-                _ => panic!("should never get here"),
             }
 
-            ids.push_back(id);
-            pending -= 1;
-        }
+            if !self.ring.submission().is_empty() {
+                self.ring
+                    .submit()
+                    .context("Failed to submit submission queue")?;
+                pending += submitted;
+            }
 
-        if submitted == 0 && completed == 0 {
-            spins += 1;
-            if spins >= IO_URING_SPIN_LIMIT && pending > 0 {
-                ring.submit_and_wait(1)
-                    .context("Failed to submit and wait on io_uring")?;
+            let cq: io_uring::CompletionQueue = self.ring.completion();
+            let mut completed: u32 = 0;
+            for cqe in cq {
+                completed += 1;
+
+                println!("result: {}", cqe.result());
+
+                let id = cqe.user_data() as usize;
+                match std::mem::take(&mut self.ops[id]) {
+                    Some(FioOp::Read(ReadData {
+                        pgidx: _,
+                        waker,
+                        mut buf,
+                        state: result,
+                    })) => {
+                        {
+                            let mut inner = result.lock();
+                            if let BufRef::Owned(buf) = &mut buf {
+                                buf.copy_from_slice(
+                                    &self.bufs[id * self.page_size..(id + 1) * self.page_size],
+                                );
+                            }
+                            *inner = ReadState::Ready(buf);
+                        }
+                        waker.wake();
+                    }
+                    Some(FioOp::Write(_)) => {
+                        // no-op
+                    }
+                    Some(FioOp::Commit(CommitData { state, waker })) => {
+                        {
+                            let mut inner = state.lock();
+                            let _ = std::mem::replace(&mut *inner, CommitState::Done);
+                        }
+                        waker.wake();
+                    }
+                    Some(FioOp::Alloc(AllocData { len, waker, state })) => {
+                        {
+                            let mut inner = state.lock();
+                            let _ = std::mem::replace(&mut *inner, AllocState::Done);
+                        }
+                        self.inner.len.fetch_max(len as u64, Ordering::AcqRel);
+                        waker.wake();
+                    }
+                    _ => panic!("should never get here"),
+                }
+
+                ids.push_back(id);
+                pending -= 1;
+            }
+
+            if submitted == 0 && completed == 0 {
+                spins += 1;
+                if spins >= IO_URING_SPIN_LIMIT && pending > 0 {
+                    self.ring
+                        .submit_and_wait(1)
+                        .context("Failed to submit and wait on io_uring")?;
+                    spins = 0;
+                }
+            } else {
                 spins = 0;
             }
-        } else {
-            spins = 0;
         }
     }
 }
@@ -665,7 +768,12 @@ mod tests {
         let temp_dir = TempDir::new(function_name!())?;
         let test_file = temp_dir.path().join("db");
 
-        let fio = Fio::open(test_file.clone()).unwrap();
+        let fio = Fio::builder()
+            .sq(2)
+            .cq(4)
+            .page_buf_pool(2)
+            .path(test_file.clone())
+            .build()?;
         let mut buf = fio.get_buf();
         assert!(matches!(buf, BufRef::Shared(_)));
 
@@ -681,7 +789,13 @@ mod tests {
         let temp_dir = TempDir::new(function_name!())?;
         let test_file = temp_dir.path().join("db");
 
-        let fio = Fio::open(test_file.clone()).unwrap();
+        let fio = Fio::builder()
+            .sq(2)
+            .cq(4)
+            .page_buf_pool(2)
+            .path(test_file.clone())
+            .build()
+            .unwrap();
         let mut file = OpenOptions::new()
             .write(true)
             .append(true)
@@ -711,7 +825,12 @@ mod tests {
         let temp_dir = TempDir::new(function_name!())?;
         let test_file = temp_dir.path().join("db");
 
-        let fio = Fio::open(test_file.clone()).unwrap();
+        let fio = Fio::builder()
+            .sq(2)
+            .cq(4)
+            .page_buf_pool(2)
+            .path(test_file.clone())
+            .build()?;
         let mut buf = fio.get_buf();
         buf.get_mut()[0..].fill(1u8);
         fio.write(0, buf);
@@ -732,7 +851,13 @@ mod tests {
         let temp_dir = TempDir::new(function_name!())?;
         let test_file = temp_dir.path().join("db");
 
-        let fio = Fio::open(&test_file).unwrap();
+        let fio = Fio::builder()
+            .sq(2)
+            .cq(4)
+            .page_buf_pool(2)
+            .path(test_file.clone())
+            .build()
+            .unwrap();
         assert_eq!(0, fio.len());
 
         fio.alloc(1).await;
