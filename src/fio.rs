@@ -45,20 +45,20 @@ enum FioOp {
 struct ReadData {
     pgidx: usize,
     waker: Waker,
-    buf: BufRef,
+    buf: PageBuf,
     state: Arc<SpinLock<ReadState>>,
 }
 
 enum ReadState {
     Init,
     Pending,
-    Ready(BufRef),
+    Ready(PageBuf),
     Done,
 }
 
 struct WriteData {
     pgidx: usize,
-    buf: BufRef,
+    buf: PageBuf,
 }
 
 struct CommitData {
@@ -100,45 +100,45 @@ struct Inner {
     free_bufs: ArrayQueue<usize>,
 }
 
-pub enum BufRef {
-    Shared(SharedBuf),
-    Owned(Box<[u8]>),
+pub enum PageBuf {
+    Pool(PoolBuf),
+    Dynamic(Box<[u8]>),
 }
 
-impl BufRef {
+impl PageBuf {
     pub fn get(&self) -> &[u8] {
         match self {
-            BufRef::Shared(shared) => {
+            PageBuf::Pool(shared) => {
                 let page_size = shared.fio.page_size;
                 unsafe { std::slice::from_raw_parts(shared.ptr(), page_size as usize) }
             }
-            BufRef::Owned(buf) => buf,
+            PageBuf::Dynamic(buf) => buf,
         }
     }
 
     pub fn get_mut(&mut self) -> &mut [u8] {
         match self {
-            BufRef::Shared(shared) => {
+            PageBuf::Pool(shared) => {
                 let page_size = shared.fio.page_size;
                 unsafe { std::slice::from_raw_parts_mut(shared.ptr(), page_size as usize) }
             }
-            BufRef::Owned(buf) => buf,
+            PageBuf::Dynamic(buf) => buf,
         }
     }
 }
 
-pub struct SharedBuf {
+pub struct PoolBuf {
     idx: usize,
     fio: Arc<Inner>,
 }
 
-impl SharedBuf {
+impl PoolBuf {
     pub fn ptr(&self) -> *mut u8 {
         self.fio.bufs[self.idx * self.fio.page_size..].as_ptr() as *mut u8
     }
 }
 
-impl Drop for SharedBuf {
+impl Drop for PoolBuf {
     fn drop(&mut self) {
         if let Err(e) = self.fio.free_bufs.push(self.idx) {
             eprintln!(
@@ -175,7 +175,7 @@ impl Fio {
         let stop = AtomicBool::new(false);
         let queue = SegQueue::new();
         let bufs = alloc_aligned_buffer(page_buf_pool as usize, page_size)?;
-        let free_bufs = ArrayQueue::new(page_buf_pool as usize);
+        let free_bufs = ArrayQueue::new(cmp::max(1, page_buf_pool as usize));
         for idx in 0usize..(page_buf_pool as usize) {
             free_bufs
                 .push(idx)
@@ -213,11 +213,11 @@ impl Fio {
         self.inner.len.load(Ordering::Acquire)
     }
 
-    pub fn get_buf(&self) -> BufRef {
+    pub fn get_buf(&self) -> PageBuf {
         get_buf(&self.inner)
     }
 
-    pub async fn read(&self, pgidx: usize) -> BufRef {
+    pub async fn read(&self, pgidx: usize) -> PageBuf {
         pub struct ReadFuture<'a> {
             fio: &'a Fio,
             idx: usize,
@@ -225,7 +225,7 @@ impl Fio {
         }
 
         impl<'a> Future for ReadFuture<'a> {
-            type Output = BufRef;
+            type Output = PageBuf;
 
             fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
                 let mut result = self.result.lock();
@@ -272,7 +272,7 @@ impl Fio {
         .await
     }
 
-    pub fn write(&self, pgidx: usize, buf: BufRef) {
+    pub fn write(&self, pgidx: usize, buf: PageBuf) {
         let op = FioOp::Write(WriteData { pgidx, buf });
         self.inner.queue.push(op);
         self.join.as_ref().unwrap().thread().unpark();
@@ -376,17 +376,17 @@ impl Fio {
     }
 }
 
-fn get_buf(inner: &Arc<Inner>) -> BufRef {
+fn get_buf(inner: &Arc<Inner>) -> PageBuf {
     inner
         .free_bufs
         .pop()
         .map(|idx| {
-            BufRef::Shared(SharedBuf {
+            PageBuf::Pool(PoolBuf {
                 idx,
                 fio: inner.clone(),
             })
         })
-        .unwrap_or_else(|| BufRef::Owned(vec![0u8; inner.page_size as usize].into_boxed_slice()))
+        .unwrap_or_else(|| PageBuf::Dynamic(vec![0u8; inner.page_size as usize].into_boxed_slice()))
 }
 
 impl Drop for Fio {
@@ -538,12 +538,12 @@ impl IoLoop {
                         let offset = data.pgidx * self.page_size;
 
                         let (buf, len, idx) = match &data.buf {
-                            BufRef::Shared(shared) => (
+                            PageBuf::Pool(shared) => (
                                 shared.ptr(),
                                 self.page_size as u32,
                                 (self.cq_size + id) as u16,
                             ),
-                            BufRef::Owned(_) => (
+                            PageBuf::Dynamic(_) => (
                                 self.bufs[id * self.page_size..].as_mut_ptr(),
                                 self.page_size as u32,
                                 id as u16,
@@ -572,12 +572,12 @@ impl IoLoop {
                         let offset = data.pgidx * self.page_size;
 
                         let (buf, len, idx) = match &data.buf {
-                            BufRef::Shared(shared) => (
+                            PageBuf::Pool(shared) => (
                                 shared.ptr(),
                                 self.page_size as u32,
                                 (self.cq_size + id) as u16,
                             ),
-                            BufRef::Owned(vec) => {
+                            PageBuf::Dynamic(vec) => {
                                 self.bufs[id * self.page_size..(id + 1) * self.page_size]
                                     .copy_from_slice(vec);
                                 (
@@ -664,7 +664,7 @@ impl IoLoop {
                     })) => {
                         {
                             let mut inner = result.lock();
-                            if let BufRef::Owned(buf) = &mut buf {
+                            if let PageBuf::Dynamic(buf) = &mut buf {
                                 buf.copy_from_slice(
                                     &self.bufs[id * self.page_size..(id + 1) * self.page_size],
                                 );
@@ -775,7 +775,7 @@ mod tests {
             .path(test_file.clone())
             .build()?;
         let mut buf = fio.get_buf();
-        assert!(matches!(buf, BufRef::Shared(_)));
+        assert!(matches!(buf, PageBuf::Pool(_)));
 
         buf.get_mut()[0] = 1;
         assert_eq!(1, buf.get()[0]);
@@ -806,7 +806,43 @@ mod tests {
 
         let data = fio.read(0).await;
 
-        if let BufRef::Shared(shared) = &data {
+        if let PageBuf::Pool(shared) = &data {
+            println!(
+                "read page into shared buffer with idx {}, address {:p}",
+                shared.idx,
+                shared.ptr()
+            );
+        }
+
+        assert_eq!(vec![1u8; fio.page_size()], data.get());
+
+        Ok(())
+    }
+
+    #[named]
+    #[tokio::test]
+    async fn test_single_read_page_dynamic() -> Result<()> {
+        let temp_dir = TempDir::new(function_name!())?;
+        let test_file = temp_dir.path().join("db");
+
+        let fio = Fio::builder()
+            .sq(2)
+            .cq(4)
+            .page_buf_pool(0)
+            .path(test_file.clone())
+            .build()
+            .unwrap();
+        let mut file = OpenOptions::new()
+            .write(true)
+            .append(true)
+            .open(test_file)?;
+        file.write_all(&vec![1u8; fio.page_size()])?;
+        file.flush()?;
+        file.sync_all()?;
+
+        let data = fio.read(0).await;
+
+        if let PageBuf::Pool(shared) = &data {
             println!(
                 "read page into shared buffer with idx {}, address {:p}",
                 shared.idx,
@@ -829,6 +865,32 @@ mod tests {
             .sq(2)
             .cq(4)
             .page_buf_pool(2)
+            .path(test_file.clone())
+            .build()?;
+        let mut buf = fio.get_buf();
+        buf.get_mut()[0..].fill(1u8);
+        fio.write(0, buf);
+        fio.commit().await;
+
+        let mut file = OpenOptions::new().read(true).append(true).open(test_file)?;
+        let mut buf = vec![0u8; fio.page_size()];
+        file.read_exact(&mut buf)?;
+
+        assert_eq!(vec![1u8; fio.page_size()], buf);
+
+        Ok(())
+    }
+
+    #[named]
+    #[tokio::test]
+    async fn test_single_write_page_dynamic() -> Result<()> {
+        let temp_dir = TempDir::new(function_name!())?;
+        let test_file = temp_dir.path().join("db");
+
+        let fio = Fio::builder()
+            .sq(2)
+            .cq(4)
+            .page_buf_pool(0)
             .path(test_file.clone())
             .build()?;
         let mut buf = fio.get_buf();
