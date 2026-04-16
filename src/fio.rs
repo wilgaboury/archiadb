@@ -691,7 +691,9 @@ impl IoLoop {
                         self.inner.len.fetch_max(len as u64, Ordering::AcqRel);
                         waker.wake();
                     }
-                    _ => panic!("should never get here"),
+                    _ => {
+                        eprintln!("completion user data did not match a valid operation");
+                    }
                 }
 
                 ids.push_back(id);
