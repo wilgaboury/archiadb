@@ -53,6 +53,7 @@ enum ReadState {
     Init,
     Pending,
     Ready(PageBuf),
+    Err(String),
     Done,
 }
 
@@ -69,6 +70,7 @@ struct CommitData {
 pub enum CommitState {
     Init,
     Pending,
+    Err(String),
     Done,
 }
 
@@ -81,6 +83,7 @@ struct AllocData {
 pub enum AllocState {
     Init,
     Pending,
+    Err(String),
     Done,
 }
 
@@ -217,7 +220,7 @@ impl Fio {
         get_buf(&self.inner)
     }
 
-    pub async fn read(&self, pgidx: usize) -> PageBuf {
+    pub async fn read(&self, pgidx: usize) -> Result<PageBuf> {
         pub struct ReadFuture<'a> {
             fio: &'a Fio,
             idx: usize,
@@ -225,7 +228,7 @@ impl Fio {
         }
 
         impl<'a> Future for ReadFuture<'a> {
-            type Output = PageBuf;
+            type Output = Result<PageBuf>;
 
             fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
                 let mut result = self.result.lock();
@@ -250,7 +253,11 @@ impl Fio {
                     }
                     ReadState::Ready(data) => {
                         *result = ReadState::Done;
-                        Poll::Ready(data)
+                        Poll::Ready(Ok(data))
+                    }
+                    ReadState::Err(reason) => {
+                        *result = ReadState::Done;
+                        Poll::Ready(Err(anyhow!(reason)))
                     }
                     ReadState::Done => Poll::Pending,
                 }
@@ -278,14 +285,14 @@ impl Fio {
         self.join.as_ref().unwrap().thread().unpark();
     }
 
-    pub async fn commit(&self) {
+    pub async fn commit(&self) -> Result<()> {
         pub struct CommitFuture<'a> {
             fio: &'a Fio,
             result: Arc<SpinLock<CommitState>>,
         }
 
         impl<'a> Future for CommitFuture<'a> {
-            type Output = ();
+            type Output = Result<()>;
 
             fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
                 let mut result = self.result.lock();
@@ -306,7 +313,11 @@ impl Fio {
                         *result = state;
                         Poll::Pending
                     }
-                    CommitState::Done => Poll::Ready(()),
+                    CommitState::Err(reason) => {
+                        *result = CommitState::Done;
+                        Poll::Ready(Err(anyhow!(reason)))
+                    }
+                    CommitState::Done => Poll::Ready(Ok(())),
                 }
             }
         }
@@ -325,7 +336,7 @@ impl Fio {
         .await
     }
 
-    pub async fn alloc(&self, len: usize) {
+    pub async fn alloc(&self, len: usize) -> Result<()> {
         pub struct AllocFuture<'a> {
             fio: &'a Fio,
             len: usize,
@@ -333,7 +344,7 @@ impl Fio {
         }
 
         impl<'a> Future for AllocFuture<'a> {
-            type Output = ();
+            type Output = Result<()>;
 
             fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
                 let mut result = self.result.lock();
@@ -355,7 +366,11 @@ impl Fio {
                         *result = state;
                         Poll::Pending
                     }
-                    AllocState::Done => Poll::Ready(()),
+                    AllocState::Err(reason) => {
+                        *result = AllocState::Done;
+                        Poll::Ready(Err(anyhow!(reason)))
+                    }
+                    AllocState::Done => Poll::Ready(Ok(())),
                 }
             }
         }
@@ -467,16 +482,28 @@ impl IoLoop {
 
     fn no_op_op(op: FioOp) {
         match op {
-            FioOp::Read(ReadData { waker, .. }) => {
+            FioOp::Read(ReadData { waker, state, .. }) => {
+                {
+                    let mut state = state.lock();
+                    *state = ReadState::Err("io_uring thread experienced failure".to_string());
+                }
                 waker.wake();
             }
             FioOp::Write(_) => {
                 // no-op
             }
-            FioOp::Commit(CommitData { waker, .. }) => {
+            FioOp::Commit(CommitData { waker, state, .. }) => {
+                {
+                    let mut state = state.lock();
+                    *state = CommitState::Err("io_uring thread experienced failure".to_string());
+                }
                 waker.wake();
             }
-            FioOp::Alloc(AllocData { waker, .. }) => {
+            FioOp::Alloc(AllocData { waker, state, .. }) => {
+                {
+                    let mut state = state.lock();
+                    *state = AllocState::Err("io_uring thread experienced failure".to_string());
+                }
                 waker.wake();
             }
         }
@@ -652,8 +679,6 @@ impl IoLoop {
             for cqe in cq {
                 completed += 1;
 
-                println!("result: {}", cqe.result());
-
                 let id = cqe.user_data() as usize;
                 match std::mem::take(&mut self.ops[id]) {
                     Some(FioOp::Read(ReadData {
@@ -664,12 +689,19 @@ impl IoLoop {
                     })) => {
                         {
                             let mut inner = result.lock();
-                            if let PageBuf::Dynamic(buf) = &mut buf {
-                                buf.copy_from_slice(
-                                    &self.bufs[id * self.page_size..(id + 1) * self.page_size],
-                                );
+                            if cqe.result() >= 0 {
+                                if let PageBuf::Dynamic(buf) = &mut buf {
+                                    buf.copy_from_slice(
+                                        &self.bufs[id * self.page_size..(id + 1) * self.page_size],
+                                    );
+                                }
+                                *inner = ReadState::Ready(buf);
+                            } else {
+                                *inner = ReadState::Err(format!(
+                                    "Read failed with code {}",
+                                    cqe.result()
+                                ))
                             }
-                            *inner = ReadState::Ready(buf);
                         }
                         waker.wake();
                     }
@@ -679,14 +711,28 @@ impl IoLoop {
                     Some(FioOp::Commit(CommitData { state, waker })) => {
                         {
                             let mut inner = state.lock();
-                            let _ = std::mem::replace(&mut *inner, CommitState::Done);
+                            if cqe.result() >= 0 {
+                                let _ = std::mem::replace(&mut *inner, CommitState::Done);
+                            } else {
+                                *inner = CommitState::Err(format!(
+                                    "Read failed with code {}",
+                                    cqe.result()
+                                ))
+                            }
                         }
                         waker.wake();
                     }
                     Some(FioOp::Alloc(AllocData { len, waker, state })) => {
                         {
                             let mut inner = state.lock();
-                            let _ = std::mem::replace(&mut *inner, AllocState::Done);
+                            if cqe.result() >= 0 {
+                                let _ = std::mem::replace(&mut *inner, AllocState::Done);
+                            } else {
+                                *inner = AllocState::Err(format!(
+                                    "Read failed with code {}",
+                                    cqe.result()
+                                ))
+                            }
                         }
                         self.inner.len.fetch_max(len as u64, Ordering::AcqRel);
                         waker.wake();
@@ -806,7 +852,7 @@ mod tests {
         file.flush()?;
         file.sync_all()?;
 
-        let data = fio.read(0).await;
+        let data = fio.read(0).await?;
 
         if let PageBuf::Pool(shared) = &data {
             println!(
@@ -842,7 +888,7 @@ mod tests {
         file.flush()?;
         file.sync_all()?;
 
-        let data = fio.read(0).await;
+        let data = fio.read(0).await?;
 
         if let PageBuf::Pool(shared) = &data {
             println!(
@@ -872,7 +918,7 @@ mod tests {
         let mut buf = fio.get_buf();
         buf.get_mut()[0..].fill(1u8);
         fio.write(0, buf);
-        fio.commit().await;
+        fio.commit().await?;
 
         let mut file = OpenOptions::new().read(true).append(true).open(test_file)?;
         let mut buf = vec![0u8; fio.page_size()];
@@ -898,7 +944,7 @@ mod tests {
         let mut buf = fio.get_buf();
         buf.get_mut()[0..].fill(1u8);
         fio.write(0, buf);
-        fio.commit().await;
+        fio.commit().await?;
 
         let mut file = OpenOptions::new().read(true).append(true).open(test_file)?;
         let mut buf = vec![0u8; fio.page_size()];
@@ -924,11 +970,11 @@ mod tests {
             .unwrap();
         assert_eq!(0, fio.len());
 
-        fio.alloc(1).await;
+        fio.alloc(1).await?;
         assert_eq!(1, fio.len());
         assert_eq!(fio.page_size(), fs::metadata(&test_file)?.len() as usize);
 
-        fio.alloc(3).await;
+        fio.alloc(3).await?;
         assert_eq!(3, fio.len());
         assert_eq!(
             3 * fio.page_size(),
