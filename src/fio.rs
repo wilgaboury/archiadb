@@ -11,8 +11,8 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
     task::{self, Poll, Waker},
     thread::{self, JoinHandle},
@@ -42,19 +42,41 @@ enum FioOp {
     Alloc(AllocData),
 }
 
+#[repr(u32)]
+enum GenericOpState {
+    Init = 0,
+    Pending,
+    Ready,
+    Err,
+}
+
+impl TryFrom<u32> for GenericOpState {
+    type Error = anyhow::Error;
+
+    fn try_from(value: u32) -> std::result::Result<Self, Self::Error> {
+        match value {
+            0 => Ok(GenericOpState::Init),
+            1 => Ok(GenericOpState::Pending),
+            2 => Ok(GenericOpState::Ready),
+            3 => Ok(GenericOpState::Err),
+            _ => Err(anyhow!("could not convert value {}", value)),
+        }
+    }
+}
+
 struct ReadData {
     pgidx: usize,
     waker: Waker,
     buf: PageBuf,
-    state: Arc<SpinLock<ReadState>>,
+    state: Arc<Mutex<ReadState>>,
 }
 
 enum ReadState {
     Init,
     Pending,
     Ready(PageBuf),
-    Err(String),
     Done,
+    Err,
 }
 
 struct WriteData {
@@ -64,27 +86,13 @@ struct WriteData {
 
 struct CommitData {
     waker: Waker,
-    state: Arc<SpinLock<CommitState>>,
-}
-
-pub enum CommitState {
-    Init,
-    Pending,
-    Err(String),
-    Done,
+    state: Arc<AtomicU32>,
 }
 
 struct AllocData {
     len: usize,
     waker: Waker,
-    state: Arc<SpinLock<AllocState>>,
-}
-
-pub enum AllocState {
-    Init,
-    Pending,
-    Err(String),
-    Done,
+    state: Arc<AtomicU32>,
 }
 
 pub struct Fio {
@@ -224,14 +232,14 @@ impl Fio {
         pub struct ReadFuture<'a> {
             fio: &'a Fio,
             idx: usize,
-            result: Arc<SpinLock<ReadState>>,
+            result: Arc<Mutex<ReadState>>,
         }
 
         impl<'a> Future for ReadFuture<'a> {
             type Output = Result<PageBuf>;
 
             fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
-                let mut result = self.result.lock();
+                let mut result = self.result.lock().unwrap();
                 let state = std::mem::replace(&mut *result, ReadState::Done);
                 match state {
                     ReadState::Init => {
@@ -255,26 +263,19 @@ impl Fio {
                         *result = ReadState::Done;
                         Poll::Ready(Ok(data))
                     }
-                    ReadState::Err(reason) => {
-                        *result = ReadState::Done;
-                        Poll::Ready(Err(anyhow!(reason)))
-                    }
                     ReadState::Done => Poll::Pending,
+                    ReadState::Err => {
+                        *result = ReadState::Done;
+                        Poll::Ready(Err(anyhow!("Failed to read page")))
+                    }
                 }
-            }
-        }
-
-        impl Drop for ReadFuture<'_> {
-            fn drop(&mut self) {
-                let mut result = self.result.lock();
-                *result = ReadState::Done;
             }
         }
 
         ReadFuture {
             fio: self,
             idx: pgidx,
-            result: Arc::new(SpinLock::new(ReadState::Init)),
+            result: Arc::new(Mutex::new(ReadState::Init)),
         }
         .await
     }
@@ -288,50 +289,39 @@ impl Fio {
     pub async fn commit(&self) -> Result<()> {
         pub struct CommitFuture<'a> {
             fio: &'a Fio,
-            result: Arc<SpinLock<CommitState>>,
+            result: Arc<AtomicU32>,
         }
 
         impl<'a> Future for CommitFuture<'a> {
             type Output = Result<()>;
 
             fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
-                let mut result = self.result.lock();
-                let state = std::mem::replace(&mut *result, CommitState::Done);
+                let state = self.result.load(Ordering::Acquire).try_into().unwrap();
                 match state {
-                    CommitState::Init => {
+                    GenericOpState::Init => {
+                        self.result
+                            .store(GenericOpState::Pending as u32, Ordering::Release);
+
                         let op = FioOp::Commit(CommitData {
                             state: self.result.clone(),
                             waker: cx.waker().clone(),
                         });
                         self.fio.inner.queue.push(op);
                         self.fio.join.as_ref().unwrap().thread().unpark();
-
-                        *result = CommitState::Pending;
                         Poll::Pending
                     }
-                    CommitState::Pending => {
-                        *result = state;
-                        Poll::Pending
+                    GenericOpState::Pending => Poll::Pending,
+                    GenericOpState::Ready => Poll::Ready(Ok(())),
+                    GenericOpState::Err => {
+                        Poll::Ready(Err(anyhow!("Failed to perform disk commit")))
                     }
-                    CommitState::Err(reason) => {
-                        *result = CommitState::Done;
-                        Poll::Ready(Err(anyhow!(reason)))
-                    }
-                    CommitState::Done => Poll::Ready(Ok(())),
                 }
-            }
-        }
-
-        impl Drop for CommitFuture<'_> {
-            fn drop(&mut self) {
-                let mut result = self.result.lock();
-                *result = CommitState::Done;
             }
         }
 
         CommitFuture {
             fio: self,
-            result: Arc::new(SpinLock::new(CommitState::Init)),
+            result: Arc::new(AtomicU32::new(GenericOpState::Init as u32)),
         }
         .await
     }
@@ -340,17 +330,19 @@ impl Fio {
         pub struct AllocFuture<'a> {
             fio: &'a Fio,
             len: usize,
-            result: Arc<SpinLock<AllocState>>,
+            result: Arc<AtomicU32>,
         }
 
         impl<'a> Future for AllocFuture<'a> {
             type Output = Result<()>;
 
             fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
-                let mut result = self.result.lock();
-                let state = std::mem::replace(&mut *result, AllocState::Done);
+                let state = self.result.load(Ordering::Acquire).try_into().unwrap();
                 match state {
-                    AllocState::Init => {
+                    GenericOpState::Init => {
+                        self.result
+                            .store(GenericOpState::Pending as u32, Ordering::Release);
+
                         let op = FioOp::Alloc(AllocData {
                             len: self.len,
                             state: self.result.clone(),
@@ -358,34 +350,21 @@ impl Fio {
                         });
                         self.fio.inner.queue.push(op);
                         self.fio.join.as_ref().unwrap().thread().unpark();
-
-                        *result = AllocState::Pending;
                         Poll::Pending
                     }
-                    AllocState::Pending => {
-                        *result = state;
-                        Poll::Pending
+                    GenericOpState::Pending => Poll::Pending,
+                    GenericOpState::Ready => Poll::Ready(Ok(())),
+                    GenericOpState::Err => {
+                        Poll::Ready(Err(anyhow!("Failed to perform disk commit")))
                     }
-                    AllocState::Err(reason) => {
-                        *result = AllocState::Done;
-                        Poll::Ready(Err(anyhow!(reason)))
-                    }
-                    AllocState::Done => Poll::Ready(Ok(())),
                 }
-            }
-        }
-
-        impl Drop for AllocFuture<'_> {
-            fn drop(&mut self) {
-                let mut result = self.result.lock();
-                *result = AllocState::Done;
             }
         }
 
         AllocFuture {
             fio: self,
             len: len,
-            result: Arc::new(SpinLock::new(AllocState::Init)),
+            result: Arc::new(AtomicU32::new(GenericOpState::Init as u32)),
         }
         .await
     }
@@ -480,12 +459,12 @@ impl IoLoop {
         })
     }
 
-    fn no_op_op(op: FioOp) {
+    fn complete_op_with_error(op: FioOp) {
         match op {
             FioOp::Read(ReadData { waker, state, .. }) => {
                 {
-                    let mut state = state.lock();
-                    *state = ReadState::Err("io_uring thread experienced failure".to_string());
+                    let mut state = state.lock().unwrap();
+                    *state = ReadState::Err;
                 }
                 waker.wake();
             }
@@ -493,17 +472,11 @@ impl IoLoop {
                 // no-op
             }
             FioOp::Commit(CommitData { waker, state, .. }) => {
-                {
-                    let mut state = state.lock();
-                    *state = CommitState::Err("io_uring thread experienced failure".to_string());
-                }
+                state.store(GenericOpState::Err as u32, Ordering::Release);
                 waker.wake();
             }
             FioOp::Alloc(AllocData { waker, state, .. }) => {
-                {
-                    let mut state = state.lock();
-                    *state = AllocState::Err("io_uring thread experienced failure".to_string());
-                }
+                state.store(GenericOpState::Err as u32, Ordering::Release);
                 waker.wake();
             }
         }
@@ -513,15 +486,17 @@ impl IoLoop {
         if let Err(e) = self.run_unchecked() {
             eprintln!("io_uring thread failed: {}", e);
 
+            // wake all outstanding operations
             for i in 0..self.ops.len() {
                 match std::mem::take(&mut self.ops[i]) {
-                    Some(op) => Self::no_op_op(op),
+                    Some(op) => Self::complete_op_with_error(op),
                     None => {
                         // no-op
                     }
                 }
             }
 
+            // complete future operations immediately with error
             loop {
                 if self.inner.queue.is_empty() {
                     thread::park();
@@ -530,7 +505,7 @@ impl IoLoop {
                     return;
                 }
                 while let Some(op) = self.inner.queue.pop() {
-                    Self::no_op_op(op);
+                    Self::complete_op_with_error(op);
                 }
             }
         }
@@ -688,7 +663,7 @@ impl IoLoop {
                         state: result,
                     })) => {
                         {
-                            let mut inner = result.lock();
+                            let mut inner = result.lock().unwrap();
                             if cqe.result() >= 0 {
                                 if let PageBuf::Dynamic(buf) = &mut buf {
                                     buf.copy_from_slice(
@@ -697,10 +672,8 @@ impl IoLoop {
                                 }
                                 *inner = ReadState::Ready(buf);
                             } else {
-                                *inner = ReadState::Err(format!(
-                                    "Read failed with code {}",
-                                    cqe.result()
-                                ))
+                                eprintln!("Read failed with error: {}", cqe.result());
+                                *inner = ReadState::Err;
                             }
                         }
                         waker.wake();
@@ -709,32 +682,22 @@ impl IoLoop {
                         // no-op
                     }
                     Some(FioOp::Commit(CommitData { state, waker })) => {
-                        {
-                            let mut inner = state.lock();
-                            if cqe.result() >= 0 {
-                                let _ = std::mem::replace(&mut *inner, CommitState::Done);
-                            } else {
-                                *inner = CommitState::Err(format!(
-                                    "Read failed with code {}",
-                                    cqe.result()
-                                ))
-                            }
+                        if cqe.result() >= 0 {
+                            state.store(GenericOpState::Ready as u32, Ordering::Release);
+                        } else {
+                            eprintln!("Commit failed with error: {}", cqe.result());
+                            state.store(GenericOpState::Err as u32, Ordering::Release);
                         }
                         waker.wake();
                     }
                     Some(FioOp::Alloc(AllocData { len, waker, state })) => {
-                        {
-                            let mut inner = state.lock();
-                            if cqe.result() >= 0 {
-                                let _ = std::mem::replace(&mut *inner, AllocState::Done);
-                            } else {
-                                *inner = AllocState::Err(format!(
-                                    "Read failed with code {}",
-                                    cqe.result()
-                                ))
-                            }
+                        if cqe.result() >= 0 {
+                            self.inner.len.fetch_max(len as u64, Ordering::AcqRel);
+                            state.store(GenericOpState::Ready as u32, Ordering::Release);
+                        } else {
+                            eprintln!("Commit failed with error: {}", cqe.result());
+                            state.store(GenericOpState::Err as u32, Ordering::Release);
                         }
-                        self.inner.len.fetch_max(len as u64, Ordering::AcqRel);
                         waker.wake();
                     }
                     _ => {
