@@ -1,4 +1,3 @@
-use anyhow::Result;
 use zerocopy::{
     FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned,
     native_endian::{U32, U64, U128},

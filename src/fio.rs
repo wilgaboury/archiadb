@@ -26,13 +26,10 @@ use io_uring::IoUring;
 use libc::{O_DIRECT, iovec};
 use rustix::fs::fstatvfs;
 
-use crate::spin::SpinLock;
-
 pub const MIN_PAGE_SIZE: usize = 4096; // smallest supported page size and most common filesystem block size
 
 const DEFAULT_SQ_SIZE: usize = 128;
 const DEFAULT_CQ_SIZE: usize = 256;
-const DEFAULT_PAGE_BUF_POOL_SIZE: usize = 512;
 const IO_URING_SPIN_LIMIT: u64 = 32;
 
 enum FioOp {
@@ -86,13 +83,13 @@ struct WriteData {
 
 struct CommitData {
     waker: Waker,
-    state: Arc<AtomicU32>,
+    state: GenericOpStateRef,
 }
 
 struct AllocData {
     len: usize,
     waker: Waker,
-    state: Arc<AtomicU32>,
+    state: GenericOpStateRef,
 }
 
 pub struct Fio {
@@ -107,8 +104,44 @@ struct Inner {
     len: AtomicU64,
     stop: AtomicBool,
     queue: SegQueue<FioOp>,
+
     bufs: Pin<Box<[u8]>>,
     free_bufs: ArrayQueue<usize>,
+
+    generic_op_states: Box<[AtomicU32]>,
+    free_generic_op_states: ArrayQueue<usize>,
+}
+
+#[derive(Clone)]
+enum GenericOpStateRef {
+    Pool(PoolGenericOpState),
+    Dynamic(Arc<AtomicU32>),
+}
+
+#[derive(Clone)]
+struct PoolGenericOpState {
+    idx: usize,
+    fio: Arc<Inner>,
+}
+
+impl GenericOpStateRef {
+    pub fn get(&self) -> &AtomicU32 {
+        match &self {
+            GenericOpStateRef::Pool(pool) => &pool.fio.generic_op_states[pool.idx],
+            GenericOpStateRef::Dynamic(arc) => &arc,
+        }
+    }
+}
+
+impl Drop for PoolGenericOpState {
+    fn drop(&mut self) {
+        if let Err(e) = self.fio.free_generic_op_states.push(self.idx) {
+            eprintln!(
+                "Failed to return buffer idx {} to free pool: {}",
+                self.idx, e
+            );
+        }
+    }
 }
 
 pub enum PageBuf {
@@ -167,8 +200,12 @@ impl Fio {
         path: P,
         #[builder(default = DEFAULT_SQ_SIZE)] sq: usize,
         #[builder(default = DEFAULT_CQ_SIZE)] cq: usize,
-        #[builder(default = DEFAULT_PAGE_BUF_POOL_SIZE)] page_buf_pool: usize,
+        page_buf_pool: Option<usize>,
+        generic_op_state_pool: Option<usize>,
     ) -> Result<Self> {
+        let page_buf_pool = page_buf_pool.unwrap_or_else(|| 2 * cq);
+        let generic_op_state_pool = generic_op_state_pool.unwrap_or_else(|| 2 * cq);
+
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -192,6 +229,15 @@ impl Fio {
                 .push(idx)
                 .map_err(|idx| anyhow!("Failed to initialize idx {} in free buffer pool", idx))?;
         }
+        let mut generic_op_states = Vec::with_capacity(generic_op_state_pool);
+        let free_generic_op_states = ArrayQueue::new(cmp::max(1, generic_op_state_pool as usize));
+        for idx in 0usize..(generic_op_state_pool as usize) {
+            generic_op_states.push(AtomicU32::new(GenericOpState::Init as u32));
+            free_generic_op_states
+                .push(idx)
+                .map_err(|idx| anyhow!("Failed to initialize idx {} in free buffer pool", idx))?;
+        }
+        let generic_op_states = generic_op_states.into_boxed_slice();
 
         let inner = Arc::new(Inner {
             page_size,
@@ -200,6 +246,8 @@ impl Fio {
             queue,
             bufs,
             free_bufs,
+            generic_op_states,
+            free_generic_op_states,
         });
 
         let join = {
@@ -289,17 +337,23 @@ impl Fio {
     pub async fn commit(&self) -> Result<()> {
         pub struct CommitFuture<'a> {
             fio: &'a Fio,
-            result: Arc<AtomicU32>,
+            result: GenericOpStateRef,
         }
 
         impl<'a> Future for CommitFuture<'a> {
             type Output = Result<()>;
 
             fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
-                let state = self.result.load(Ordering::Acquire).try_into().unwrap();
+                let state = self
+                    .result
+                    .get()
+                    .load(Ordering::Acquire)
+                    .try_into()
+                    .unwrap();
                 match state {
                     GenericOpState::Init => {
                         self.result
+                            .get()
                             .store(GenericOpState::Pending as u32, Ordering::Release);
 
                         let op = FioOp::Commit(CommitData {
@@ -321,7 +375,7 @@ impl Fio {
 
         CommitFuture {
             fio: self,
-            result: Arc::new(AtomicU32::new(GenericOpState::Init as u32)),
+            result: get_generic_op_state(&self.inner),
         }
         .await
     }
@@ -330,17 +384,23 @@ impl Fio {
         pub struct AllocFuture<'a> {
             fio: &'a Fio,
             len: usize,
-            result: Arc<AtomicU32>,
+            result: GenericOpStateRef,
         }
 
         impl<'a> Future for AllocFuture<'a> {
             type Output = Result<()>;
 
             fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
-                let state = self.result.load(Ordering::Acquire).try_into().unwrap();
+                let state = self
+                    .result
+                    .get()
+                    .load(Ordering::Acquire)
+                    .try_into()
+                    .unwrap();
                 match state {
                     GenericOpState::Init => {
                         self.result
+                            .get()
                             .store(GenericOpState::Pending as u32, Ordering::Release);
 
                         let op = FioOp::Alloc(AllocData {
@@ -364,7 +424,7 @@ impl Fio {
         AllocFuture {
             fio: self,
             len: len,
-            result: Arc::new(AtomicU32::new(GenericOpState::Init as u32)),
+            result: get_generic_op_state(&self.inner),
         }
         .await
     }
@@ -381,6 +441,21 @@ fn get_buf(inner: &Arc<Inner>) -> PageBuf {
             })
         })
         .unwrap_or_else(|| PageBuf::Dynamic(vec![0u8; inner.page_size as usize].into_boxed_slice()))
+}
+
+fn get_generic_op_state(inner: &Arc<Inner>) -> GenericOpStateRef {
+    inner
+        .free_generic_op_states
+        .pop()
+        .map(|idx| {
+            GenericOpStateRef::Pool(PoolGenericOpState {
+                idx,
+                fio: inner.clone(),
+            })
+        })
+        .unwrap_or_else(|| {
+            GenericOpStateRef::Dynamic(Arc::new(AtomicU32::new(GenericOpState::Init as u32)))
+        })
 }
 
 impl Drop for Fio {
@@ -472,11 +547,15 @@ impl IoLoop {
                 // no-op
             }
             FioOp::Commit(CommitData { waker, state, .. }) => {
-                state.store(GenericOpState::Err as u32, Ordering::Release);
+                state
+                    .get()
+                    .store(GenericOpState::Err as u32, Ordering::Release);
                 waker.wake();
             }
             FioOp::Alloc(AllocData { waker, state, .. }) => {
-                state.store(GenericOpState::Err as u32, Ordering::Release);
+                state
+                    .get()
+                    .store(GenericOpState::Err as u32, Ordering::Release);
                 waker.wake();
             }
         }
@@ -683,20 +762,28 @@ impl IoLoop {
                     }
                     Some(FioOp::Commit(CommitData { state, waker })) => {
                         if cqe.result() >= 0 {
-                            state.store(GenericOpState::Ready as u32, Ordering::Release);
+                            state
+                                .get()
+                                .store(GenericOpState::Ready as u32, Ordering::Release);
                         } else {
                             eprintln!("Commit failed with error: {}", cqe.result());
-                            state.store(GenericOpState::Err as u32, Ordering::Release);
+                            state
+                                .get()
+                                .store(GenericOpState::Err as u32, Ordering::Release);
                         }
                         waker.wake();
                     }
                     Some(FioOp::Alloc(AllocData { len, waker, state })) => {
                         if cqe.result() >= 0 {
                             self.inner.len.fetch_max(len as u64, Ordering::AcqRel);
-                            state.store(GenericOpState::Ready as u32, Ordering::Release);
+                            state
+                                .get()
+                                .store(GenericOpState::Ready as u32, Ordering::Release);
                         } else {
                             eprintln!("Commit failed with error: {}", cqe.result());
-                            state.store(GenericOpState::Err as u32, Ordering::Release);
+                            state
+                                .get()
+                                .store(GenericOpState::Err as u32, Ordering::Release);
                         }
                         waker.wake();
                     }
