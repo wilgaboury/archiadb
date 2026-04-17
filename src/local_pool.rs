@@ -1,4 +1,5 @@
-// TODO: this was good brainstorming but is a bunch of crap, preallocation will be more efficient.
+// TODO: this was good brainstorming but bad for my use case of reducing dynamic allocations
+// for shared reference counted objects
 
 use std::{cell::RefCell, sync::Arc};
 

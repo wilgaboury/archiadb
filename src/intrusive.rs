@@ -1,6 +1,5 @@
-// Utility trait for unsafe intrusive lists. This is a good data structure for future waker queues because they have
-// constant time insertion/deletion and do not require any dynamic allocations beyond the future itself. Modifications
-// to the databastructure are at most a handful of jumps and pointer operations.
+// intrusive list lock futures with spin lock to protect list is honestly a load of crap
+// A better scheme is to use crossbeam SegQueue in combination with a lock per shared state
 
 use std::ptr;
 
