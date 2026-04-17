@@ -108,6 +108,9 @@ struct Inner {
     bufs: Pin<Box<[u8]>>,
     free_bufs: ArrayQueue<usize>,
 
+    // TODO: fully implement
+    // read_states: Box<Mutex<ReadState>>,
+    // free_read_states: ArrayQueue<usize>,
     generic_op_states: Box<[AtomicU32]>,
     free_generic_op_states: ArrayQueue<usize>,
 }
@@ -204,7 +207,7 @@ impl Fio {
         generic_op_state_pool: Option<usize>,
     ) -> Result<Self> {
         let page_buf_pool = page_buf_pool.unwrap_or_else(|| 2 * cq);
-        let generic_op_state_pool = generic_op_state_pool.unwrap_or_else(|| 2 * cq);
+        let generic_op_state_pool = generic_op_state_pool.unwrap_or_else(|| cq);
 
         let file = OpenOptions::new()
             .read(true)
