@@ -62,7 +62,7 @@ impl TryFrom<u32> for GenericOpState {
 }
 
 struct ReadData {
-    pgidx: usize,
+    pgidx: u64,
     waker: Waker,
     buf: PageBuf,
     state: Arc<Mutex<ReadState>>,
@@ -77,7 +77,7 @@ enum ReadState {
 }
 
 struct WriteData {
-    pgidx: usize,
+    pgidx: u64,
     buf: PageBuf,
 }
 
@@ -87,7 +87,7 @@ struct CommitData {
 }
 
 struct AllocData {
-    len: usize,
+    len: u64,
     waker: Waker,
     state: GenericOpStateRef,
 }
@@ -279,10 +279,10 @@ impl Fio {
         get_buf(&self.inner)
     }
 
-    pub async fn read(&self, pgidx: usize) -> Result<PageBuf> {
+    pub async fn read(&self, pgidx: u64) -> Result<PageBuf> {
         pub struct ReadFuture<'a> {
             fio: &'a Fio,
-            idx: usize,
+            idx: u64,
             result: Arc<Mutex<ReadState>>,
         }
 
@@ -331,7 +331,7 @@ impl Fio {
         .await
     }
 
-    pub fn write(&self, pgidx: usize, buf: PageBuf) {
+    pub fn write(&self, pgidx: u64, buf: PageBuf) {
         let op = FioOp::Write(WriteData { pgidx, buf });
         self.inner.queue.push(op);
         self.join.as_ref().unwrap().thread().unpark();
@@ -383,10 +383,10 @@ impl Fio {
         .await
     }
 
-    pub async fn alloc(&self, len: usize) -> Result<()> {
+    pub async fn alloc(&self, len: u64) -> Result<()> {
         pub struct AllocFuture<'a> {
             fio: &'a Fio,
-            len: usize,
+            len: u64,
             result: GenericOpStateRef,
         }
 
@@ -426,7 +426,7 @@ impl Fio {
 
         AllocFuture {
             fio: self,
-            len: len,
+            len,
             result: get_generic_op_state(&self.inner),
         }
         .await
@@ -619,7 +619,7 @@ impl IoLoop {
                 match op {
                     FioOp::Read(data) => {
                         let id = ids.pop_front().unwrap();
-                        let offset = data.pgidx * self.page_size;
+                        let offset = data.pgidx * self.page_size as u64;
 
                         let (buf, len, idx) = match &data.buf {
                             PageBuf::Pool(shared) => (
@@ -640,7 +640,7 @@ impl IoLoop {
                             len,
                             idx,
                         )
-                        .offset(offset as u64)
+                        .offset(offset)
                         .build()
                         .user_data(id as u64);
                         unsafe {
@@ -653,7 +653,7 @@ impl IoLoop {
                     }
                     FioOp::Write(data) => {
                         let id = ids.pop_front().unwrap();
-                        let offset = data.pgidx * self.page_size;
+                        let offset = data.pgidx * self.page_size as u64;
 
                         let (buf, len, idx) = match &data.buf {
                             PageBuf::Pool(shared) => (
@@ -678,7 +678,7 @@ impl IoLoop {
                             len,
                             idx,
                         )
-                        .offset(offset as u64)
+                        .offset(offset)
                         .build()
                         .user_data(id as u64);
                         unsafe {
@@ -709,7 +709,7 @@ impl IoLoop {
                         let id = ids.pop_front().unwrap();
                         let alloc = io_uring::opcode::Fallocate::new(
                             io_uring::types::Fd(self.fd),
-                            (data.len * self.page_size) as u64,
+                            data.len * self.page_size as u64,
                         )
                         .build()
                         .user_data(id as u64);

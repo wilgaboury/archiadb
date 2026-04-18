@@ -1,5 +1,5 @@
 use std::{
-    cell::RefCell,
+    cell::UnsafeCell,
     sync::atomic::{AtomicPtr, AtomicU64, Ordering},
 };
 
@@ -26,23 +26,26 @@ struct PageAllocator {
 }
 
 thread_local! {
-    static LOC: RefCell<usize> = RefCell::new(0);
+    static LOC: UnsafeCell<usize> = UnsafeCell::new(0);
 }
 
 impl PageAllocator {
     pub fn alloc(&self) -> u64 {
         loop {
-            let loc = LOC.with(|loc| *loc.borrow());
+            let loc = LOC.with(|loc| unsafe { *loc.get() });
             let seg_idx = loc / SEGMENT_LEN;
             let in_seg_idx = loc % SEGMENT_LEN;
             if seg_idx >= self.capaticy.load(Ordering::Relaxed) as usize {
-                LOC.with(|loc| *loc.borrow_mut() = 0);
+                LOC.with(|loc| unsafe { *loc.get() = 0 });
                 continue;
             }
             let seg = &self.segments[seg_idx];
             let seg = unsafe { &*seg.load(Ordering::Acquire) };
             let word = seg[in_seg_idx].load(Ordering::Relaxed);
             let free_idx = word.leading_ones();
+            if free_idx == 64 {
+                continue;
+            }
             let mask = 1u64 << free_idx;
             let old = seg[in_seg_idx].fetch_or(mask, Ordering::Relaxed);
             if old & mask == 0 {
@@ -56,7 +59,7 @@ impl PageAllocator {
                 return ret;
             } else {
                 // there was conflict move forward one cache line
-                LOC.with(|location| *location.borrow_mut() = loc + CACHE_LINE_SIZE);
+                LOC.with(|location| unsafe { *location.get() = loc + CACHE_LINE_SIZE });
             }
         }
     }
