@@ -267,6 +267,10 @@ impl Fio {
         })
     }
 
+    pub fn path(&self) -> &PathBuf {
+        &self.path
+    }
+
     pub fn page_size(&self) -> usize {
         self.inner.page_size
     }
@@ -888,19 +892,11 @@ mod tests {
     #[tokio::test]
     async fn test_single_read_page() -> Result<()> {
         let temp_dir = TempDir::new(function_name!())?;
-        let test_file = temp_dir.path().join("db");
-
-        let fio = Fio::builder()
-            .sq(2)
-            .cq(4)
-            .page_buf_pool(2)
-            .path(test_file.clone())
-            .build()
-            .unwrap();
+        let fio = temp_dir.fio("db")?;
         let mut file = OpenOptions::new()
             .write(true)
             .append(true)
-            .open(test_file)?;
+            .open(fio.path())?;
         file.write_all(&vec![1u8; fio.page_size()])?;
         file.flush()?;
         file.sync_all()?;
@@ -960,20 +956,17 @@ mod tests {
     #[tokio::test]
     async fn test_single_write_page() -> Result<()> {
         let temp_dir = TempDir::new(function_name!())?;
-        let test_file = temp_dir.path().join("db");
+        let fio = temp_dir.fio("db")?;
 
-        let fio = Fio::builder()
-            .sq(2)
-            .cq(4)
-            .page_buf_pool(2)
-            .path(test_file.clone())
-            .build()?;
         let mut buf = fio.get_buf();
         buf.get_mut()[0..].fill(1u8);
         fio.write(0, buf);
         fio.commit().await?;
 
-        let mut file = OpenOptions::new().read(true).append(true).open(test_file)?;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(fio.path())?;
         let mut buf = vec![0u8; fio.page_size()];
         file.read_exact(&mut buf)?;
 
@@ -1012,26 +1005,18 @@ mod tests {
     #[tokio::test]
     async fn test_simple_alloc() -> Result<()> {
         let temp_dir = TempDir::new(function_name!())?;
-        let test_file = temp_dir.path().join("db");
-
-        let fio = Fio::builder()
-            .sq(2)
-            .cq(4)
-            .page_buf_pool(2)
-            .path(test_file.clone())
-            .build()
-            .unwrap();
+        let fio = temp_dir.fio("db")?;
         assert_eq!(0, fio.len());
 
         fio.alloc(1).await?;
         assert_eq!(1, fio.len());
-        assert_eq!(fio.page_size(), fs::metadata(&test_file)?.len() as usize);
+        assert_eq!(fio.page_size(), fs::metadata(fio.path())?.len() as usize);
 
         fio.alloc(3).await?;
         assert_eq!(3, fio.len());
         assert_eq!(
             3 * fio.page_size(),
-            fs::metadata(&test_file)?.len() as usize
+            fs::metadata(fio.path())?.len() as usize
         );
 
         Ok(())

@@ -2,6 +2,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
+use crate::fio::Fio;
+
 pub struct TempDir {
     path: PathBuf,
 }
@@ -23,6 +25,15 @@ impl TempDir {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn fio<P: AsRef<Path>>(&self, path: P) -> Result<Fio> {
+        Fio::builder()
+            .sq(2)
+            .cq(4)
+            .page_buf_pool(2)
+            .path(self.path.join(path.as_ref()))
+            .build()
     }
 }
 
