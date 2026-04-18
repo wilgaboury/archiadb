@@ -5,6 +5,7 @@ use zerocopy::{
 
 const MAGIC: u128 = 0xa90e3b4b1b0833499933888e3933af0d; // Random GUID
 const VERSION: u64 = 0;
+const NUM_HEADER_PAGES: u64 = 3;
 
 #[derive(FromBytes, IntoBytes, Debug, KnownLayout, Immutable, Unaligned, Clone)]
 #[repr(C)]
