@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+pub mod alloc;
 pub mod db;
 pub mod fio;
 pub mod intrusive;

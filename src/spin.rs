@@ -29,7 +29,7 @@ impl<T> SpinLock<T> {
     pub fn lock(&self) -> SpinLockGaurd<'_, T> {
         while self
             .locked
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .compare_exchange_weak(false, true, Ordering::AcqRel, Ordering::Relaxed)
             .is_err()
         {
             // perform relaxed read in loop to avoid thrashing cache lines with compare_exchange
