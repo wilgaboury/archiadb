@@ -15,8 +15,7 @@ pub struct SpinLockGaurd<'a, T> {
     lock: &'a SpinLock<T>,
 }
 
-/// A spin lock is used to protect the critical sections that read and write the main lock's state. Critical sections should
-/// be very fast: at worst they are a bounded number of comparisons, math operations, and pointer manipulations.
+// TODO: spin lock is the devil, replace with lock free structures or use mutex
 impl<T> SpinLock<T> {
     pub fn new(val: T) -> Self {
         Self {

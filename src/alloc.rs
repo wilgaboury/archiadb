@@ -1,3 +1,4 @@
+use core::slice;
 use std::{
     cell::UnsafeCell,
     sync::atomic::{AtomicPtr, AtomicU64, Ordering},
@@ -30,6 +31,9 @@ thread_local! {
 }
 
 impl PageAllocator {
+    // TODO: I have my indexes mixed up here. Need to change page indexes to account
+    // for file header and chunk headers, for dirty list should be using chunk index
+
     pub fn alloc(&self) -> u64 {
         loop {
             let loc = LOC.with(|loc| unsafe { *loc.get() });
@@ -91,9 +95,21 @@ impl PageAllocator {
 
     fn flush(&self) {
         for i in 0..DIRTY_MAP_SIZE {
-            let idx = self.dirty[i].load(Ordering::Acquire);
+            let pg_idx = self.dirty[i].load(Ordering::Acquire);
             self.dirty[i].store(OPEN_MASK, Ordering::Release);
-            // TODO: write block to fio
+            let loc = (pg_idx / 64) as usize;
+            let seg_idx = loc / SEGMENT_LEN;
+            let in_seg_byte_idx = 8 * (loc % SEGMENT_LEN);
+            let seg = unsafe {
+                let seg = &self.segments[seg_idx];
+                let ptr = seg.load(Ordering::Acquire) as *const u8;
+                let len = std::mem::size_of_val(&seg);
+                slice::from_raw_parts(ptr, len)
+            };
+            let mut buf = self.fio.get_buf();
+            buf.get_mut()
+                .copy_from_slice(&seg[in_seg_byte_idx..in_seg_byte_idx + self.fio.page_size()]);
+            self.fio.write(pg_idx, buf);
         }
     }
 }

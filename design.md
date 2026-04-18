@@ -4,11 +4,11 @@
 
 ### Strict Serializability
 
-This database will make use of conservative 2-phase locking which allows for strict serializability and no deadlocks; although, it comes at the cost of transaction throughput and requires better upfront planning around data layout and queries. However, due to the use of COW BTrees, users can opt into snapshot isolation for non-blocking read transactions when needed. Users will need to use optimistic concurrency control for implementing transactions that require reading data before it can be determined where to perform writes, as may be the case with highly referential data.
+This database makes use of conservative 2-phase locking which allows for strict serializability and no deadlocks; although, it comes at the cost of transaction throughput and requires better upfront planning around data layout and queries. However, due to the use of COW BTrees, users can opt into snapshot isolation for non-blocking read transactions when needed. Users need to use optimistic concurrency control for implementing certain conditional transactions ory any which require reading data on disk before it can be determined where to perform subsequent reads/writes, as may be the case with references.
 
 ### No Caching
 
-It's a common argument in storage engine design whether it's better to use mmap and let the OS manage caching via pages or use O_DIRECT with bespoke caching strategies. I'll do one better and say that application code should be responsible for what data is on disk and what is in memory. This database intends to be only a transactional ACID storage engine which uses as little memory as possible without sacrificing speed. This philosophy may look bad on benchmarks, but gives more control to client code and leads to simpler overall systems.
+There seems to be continuous debate in database engine design between using mmap and letting the OS manage caching via pages or use O_DIRECT with bespoke caching strategies. I'll do one better, and say that application code should be responsible for determining what data is on disk and what is in memory. This database intends to be only a transactional ACID storage engine which uses as little memory as possible without sacrificing speed. This philosophy may look bad on benchmarks, but gives more control to client code and leads to simpler overall systems.
 
 ### Minimize System Calls
 
