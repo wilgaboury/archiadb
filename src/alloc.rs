@@ -25,6 +25,8 @@ struct Segment {
 }
 
 struct Chunk {
+    // I think this version scheme will help dedup concurrent writes, but I need to think
+    // through the edge cases more. I'm not convinced it may be possible for writes to be missed.
     version: AtomicU64,
     written: AtomicU64,
     write: Mutex<()>,
@@ -185,7 +187,11 @@ impl PageAllocator {
             buf.get_mut()
                 .copy_from_slice(&bitfield[in_seg_idx..in_seg_idx + self.fio.page_size()]);
 
+            // It's important that the write is awaited. The kernel gives no submission queue
+            // ordering garuntees (without special flags), so we must wait to make sure writes
+            // are not submitted concurrently and get clobbered.
             self.fio.write(pg_idx, buf).await?;
+
             chunk.written.store(version, Ordering::Release);
         }
 
