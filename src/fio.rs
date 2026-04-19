@@ -77,8 +77,10 @@ enum ReadState {
 }
 
 struct WriteData {
-    pgidx: u64,
+    pg_idx: u64,
     buf: PageBuf,
+    waker: Waker,
+    state: GenericOpStateRef,
 }
 
 struct CommitData {
@@ -335,10 +337,56 @@ impl Fio {
         .await
     }
 
-    pub fn write(&self, pgidx: u64, buf: PageBuf) {
-        let op = FioOp::Write(WriteData { pgidx, buf });
-        self.inner.queue.push(op);
-        self.join.as_ref().unwrap().thread().unpark();
+    pub async fn write(&self, pg_idx: u64, buf: PageBuf) -> Result<()> {
+        pub struct WriteFuture<'a> {
+            fio: &'a Fio,
+            pg_idx: u64,
+            buf: Option<PageBuf>,
+            result: GenericOpStateRef,
+        }
+
+        impl<'a> Future for WriteFuture<'a> {
+            type Output = Result<()>;
+
+            fn poll(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
+                let state = self
+                    .result
+                    .get()
+                    .load(Ordering::Acquire)
+                    .try_into()
+                    .unwrap();
+                match state {
+                    GenericOpState::Init => {
+                        self.result
+                            .get()
+                            .store(GenericOpState::Pending as u32, Ordering::Release);
+
+                        let op = FioOp::Write(WriteData {
+                            pg_idx: self.pg_idx,
+                            buf: std::mem::replace(&mut self.buf, None).unwrap(),
+                            waker: cx.waker().clone(),
+                            state: self.result.clone(),
+                        });
+                        self.fio.inner.queue.push(op);
+                        self.fio.join.as_ref().unwrap().thread().unpark();
+                        Poll::Pending
+                    }
+                    GenericOpState::Pending => Poll::Pending,
+                    GenericOpState::Ready => Poll::Ready(Ok(())),
+                    GenericOpState::Err => {
+                        Poll::Ready(Err(anyhow!("Failed to perform disk commit")))
+                    }
+                }
+            }
+        }
+
+        WriteFuture {
+            fio: self,
+            pg_idx,
+            buf: Some(buf),
+            result: get_generic_op_state(&self.inner),
+        }
+        .await
     }
 
     pub async fn commit(&self) -> Result<()> {
@@ -657,7 +705,7 @@ impl IoLoop {
                     }
                     FioOp::Write(data) => {
                         let id = ids.pop_front().unwrap();
-                        let offset = data.pgidx * self.page_size as u64;
+                        let offset = data.pg_idx * self.page_size as u64;
 
                         let (buf, len, idx) = match &data.buf {
                             PageBuf::Pool(shared) => (
@@ -764,8 +812,18 @@ impl IoLoop {
                         }
                         waker.wake();
                     }
-                    Some(FioOp::Write(_)) => {
-                        // no-op
+                    Some(FioOp::Write(WriteData { state, waker, .. })) => {
+                        if cqe.result() >= 0 {
+                            state
+                                .get()
+                                .store(GenericOpState::Ready as u32, Ordering::Release);
+                        } else {
+                            eprintln!("Commit failed with error: {}", cqe.result());
+                            state
+                                .get()
+                                .store(GenericOpState::Err as u32, Ordering::Release);
+                        }
+                        waker.wake();
                     }
                     Some(FioOp::Commit(CommitData { state, waker })) => {
                         if cqe.result() >= 0 {
