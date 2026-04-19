@@ -26,7 +26,7 @@ struct Segment {
 
 struct Chunk {
     // I think this version scheme will help dedup concurrent writes, but I need to think
-    // through the edge cases more. I'm not convinced it may be possible for writes to be missed.
+    // through the edge cases more. I'm not fully convinced that writes will not be missed.
     version: AtomicU64,
     written: AtomicU64,
     write: Mutex<()>,
