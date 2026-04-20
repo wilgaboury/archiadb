@@ -79,8 +79,7 @@ enum ReadState {
 struct WriteData {
     pg_idx: u64,
     buf: PageBuf,
-    waker: Waker,
-    state: GenericOpStateRef,
+    waker_state: Option<(Waker, GenericOpStateRef)>,
 }
 
 struct CommitData {
@@ -289,40 +288,40 @@ impl Fio {
         pub struct ReadFuture<'a> {
             fio: &'a Fio,
             idx: u64,
-            result: Arc<Mutex<ReadState>>,
+            state: Arc<Mutex<ReadState>>,
         }
 
         impl<'a> Future for ReadFuture<'a> {
             type Output = Result<PageBuf>;
 
             fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
-                let mut result = self.result.lock().unwrap();
-                let state = std::mem::replace(&mut *result, ReadState::Done);
-                match state {
+                let mut state = self.state.lock().unwrap();
+                let cur = std::mem::replace(&mut *state, ReadState::Done);
+                match cur {
                     ReadState::Init => {
                         let op = FioOp::Read(ReadData {
                             pgidx: self.idx,
                             waker: cx.waker().clone(),
                             buf: self.fio.get_buf(),
-                            state: self.result.clone(),
+                            state: self.state.clone(),
                         });
                         self.fio.inner.queue.push(op);
                         self.fio.join.as_ref().unwrap().thread().unpark();
 
-                        *result = ReadState::Pending;
+                        *state = ReadState::Pending;
                         Poll::Pending
                     }
                     ReadState::Pending => {
-                        *result = state;
+                        *state = cur;
                         Poll::Pending
                     }
                     ReadState::Ready(data) => {
-                        *result = ReadState::Done;
+                        *state = ReadState::Done;
                         Poll::Ready(Ok(data))
                     }
                     ReadState::Done => Poll::Pending,
                     ReadState::Err => {
-                        *result = ReadState::Done;
+                        *state = ReadState::Done;
                         Poll::Ready(Err(anyhow!("Failed to read page")))
                     }
                 }
@@ -332,9 +331,19 @@ impl Fio {
         ReadFuture {
             fio: self,
             idx: pgidx,
-            result: Arc::new(Mutex::new(ReadState::Init)),
+            state: Arc::new(Mutex::new(ReadState::Init)),
         }
         .await
+    }
+
+    pub fn submit_write(&self, pg_idx: u64, buf: PageBuf) {
+        let op = FioOp::Write(WriteData {
+            pg_idx,
+            buf,
+            waker_state: None,
+        });
+        self.inner.queue.push(op);
+        self.join.as_ref().unwrap().thread().unpark();
     }
 
     pub async fn write(&self, pg_idx: u64, buf: PageBuf) -> Result<()> {
@@ -342,30 +351,24 @@ impl Fio {
             fio: &'a Fio,
             pg_idx: u64,
             buf: Option<PageBuf>,
-            result: GenericOpStateRef,
+            state: GenericOpStateRef,
         }
 
         impl<'a> Future for WriteFuture<'a> {
             type Output = Result<()>;
 
             fn poll(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
-                let state = self
-                    .result
-                    .get()
-                    .load(Ordering::Acquire)
-                    .try_into()
-                    .unwrap();
+                let state = self.state.get().load(Ordering::Acquire).try_into().unwrap();
                 match state {
                     GenericOpState::Init => {
-                        self.result
+                        self.state
                             .get()
                             .store(GenericOpState::Pending as u32, Ordering::Release);
 
                         let op = FioOp::Write(WriteData {
                             pg_idx: self.pg_idx,
                             buf: std::mem::replace(&mut self.buf, None).unwrap(),
-                            waker: cx.waker().clone(),
-                            state: self.result.clone(),
+                            waker_state: Some((cx.waker().clone(), self.state.clone())),
                         });
                         self.fio.inner.queue.push(op);
                         self.fio.join.as_ref().unwrap().thread().unpark();
@@ -384,7 +387,7 @@ impl Fio {
             fio: self,
             pg_idx,
             buf: Some(buf),
-            result: get_generic_op_state(&self.inner),
+            state: get_generic_op_state(&self.inner),
         }
         .await
     }
@@ -392,27 +395,22 @@ impl Fio {
     pub async fn commit(&self) -> Result<()> {
         pub struct CommitFuture<'a> {
             fio: &'a Fio,
-            result: GenericOpStateRef,
+            state: GenericOpStateRef,
         }
 
         impl<'a> Future for CommitFuture<'a> {
             type Output = Result<()>;
 
             fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
-                let state = self
-                    .result
-                    .get()
-                    .load(Ordering::Acquire)
-                    .try_into()
-                    .unwrap();
+                let state = self.state.get().load(Ordering::Acquire).try_into().unwrap();
                 match state {
                     GenericOpState::Init => {
-                        self.result
+                        self.state
                             .get()
                             .store(GenericOpState::Pending as u32, Ordering::Release);
 
                         let op = FioOp::Commit(CommitData {
-                            state: self.result.clone(),
+                            state: self.state.clone(),
                             waker: cx.waker().clone(),
                         });
                         self.fio.inner.queue.push(op);
@@ -430,7 +428,7 @@ impl Fio {
 
         CommitFuture {
             fio: self,
-            result: get_generic_op_state(&self.inner),
+            state: get_generic_op_state(&self.inner),
         }
         .await
     }
@@ -439,28 +437,23 @@ impl Fio {
         pub struct AllocFuture<'a> {
             fio: &'a Fio,
             len: u64,
-            result: GenericOpStateRef,
+            state: GenericOpStateRef,
         }
 
         impl<'a> Future for AllocFuture<'a> {
             type Output = Result<()>;
 
             fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
-                let state = self
-                    .result
-                    .get()
-                    .load(Ordering::Acquire)
-                    .try_into()
-                    .unwrap();
+                let state = self.state.get().load(Ordering::Acquire).try_into().unwrap();
                 match state {
                     GenericOpState::Init => {
-                        self.result
+                        self.state
                             .get()
                             .store(GenericOpState::Pending as u32, Ordering::Release);
 
                         let op = FioOp::Alloc(AllocData {
                             len: self.len,
-                            state: self.result.clone(),
+                            state: self.state.clone(),
                             waker: cx.waker().clone(),
                         });
                         self.fio.inner.queue.push(op);
@@ -479,7 +472,7 @@ impl Fio {
         AllocFuture {
             fio: self,
             len,
-            result: get_generic_op_state(&self.inner),
+            state: get_generic_op_state(&self.inner),
         }
         .await
     }
@@ -596,6 +589,15 @@ impl IoLoop {
                     let mut state = state.lock().unwrap();
                     *state = ReadState::Err;
                 }
+                waker.wake();
+            }
+            FioOp::Write(WriteData {
+                waker_state: Some((waker, state)),
+                ..
+            }) => {
+                state
+                    .get()
+                    .store(GenericOpState::Err as u32, Ordering::Release);
                 waker.wake();
             }
             FioOp::Write(_) => {
@@ -812,7 +814,10 @@ impl IoLoop {
                         }
                         waker.wake();
                     }
-                    Some(FioOp::Write(WriteData { state, waker, .. })) => {
+                    Some(FioOp::Write(WriteData {
+                        waker_state: Some((waker, state)),
+                        ..
+                    })) => {
                         if cqe.result() >= 0 {
                             state
                                 .get()
@@ -824,6 +829,9 @@ impl IoLoop {
                                 .store(GenericOpState::Err as u32, Ordering::Release);
                         }
                         waker.wake();
+                    }
+                    Some(FioOp::Write(_)) => {
+                        // no-op
                     }
                     Some(FioOp::Commit(CommitData { state, waker })) => {
                         if cqe.result() >= 0 {
@@ -1012,13 +1020,13 @@ mod tests {
 
     #[named]
     #[tokio::test]
-    async fn test_single_write_page() -> Result<()> {
+    async fn test_single_submit_write_page() -> Result<()> {
         let temp_dir = TempDir::new(function_name!())?;
         let fio = temp_dir.fio("db")?;
 
         let mut buf = fio.get_buf();
         buf.get_mut()[0..].fill(1u8);
-        fio.write(0, buf);
+        fio.submit_write(0, buf);
         fio.commit().await?;
 
         let mut file = OpenOptions::new()
@@ -1035,7 +1043,30 @@ mod tests {
 
     #[named]
     #[tokio::test]
-    async fn test_single_write_page_dynamic() -> Result<()> {
+    async fn test_single_write_page() -> Result<()> {
+        let temp_dir = TempDir::new(function_name!())?;
+        let fio = temp_dir.fio("db")?;
+
+        let mut buf = fio.get_buf();
+        buf.get_mut()[0..].fill(1u8);
+        fio.write(0, buf).await?;
+        fio.commit().await?;
+
+        let mut file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(fio.path())?;
+        let mut buf = vec![0u8; fio.page_size()];
+        file.read_exact(&mut buf)?;
+
+        assert_eq!(vec![1u8; fio.page_size()], buf);
+
+        Ok(())
+    }
+
+    #[named]
+    #[tokio::test]
+    async fn test_single_submit_write_page_dynamic() -> Result<()> {
         let temp_dir = TempDir::new(function_name!())?;
         let test_file = temp_dir.path().join("db");
 
@@ -1047,7 +1078,7 @@ mod tests {
             .build()?;
         let mut buf = fio.get_buf();
         buf.get_mut()[0..].fill(1u8);
-        fio.write(0, buf);
+        fio.submit_write(0, buf);
         fio.commit().await?;
 
         let mut file = OpenOptions::new().read(true).append(true).open(test_file)?;
