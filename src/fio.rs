@@ -26,7 +26,7 @@ use io_uring::IoUring;
 use libc::{O_DIRECT, iovec};
 use rustix::fs::fstatvfs;
 
-pub const MIN_PAGE_SIZE: usize = 4096; // smallest supported page size and most common filesystem block size
+pub const MIN_PAGE_SIZE: u64 = 4096; // smallest supported page size and most common filesystem block size
 
 const DEFAULT_SQ_SIZE: usize = 128;
 const DEFAULT_CQ_SIZE: usize = 256;
@@ -884,13 +884,14 @@ impl IoLoop {
     }
 }
 
+// TODO: change to u64
 pub fn choose_page_size<P: AsRef<Path>>(path: P) -> Result<usize> {
     let file = File::open(path)?;
     let fd = file.as_fd();
     let fstatvfs = fstatvfs(fd)?;
-    let block_size = fstatvfs.f_bsize as usize;
+    let block_size = fstatvfs.f_bsize as u64;
     if MIN_PAGE_SIZE % block_size == 0 || block_size % MIN_PAGE_SIZE == 0 {
-        Ok(cmp::max(block_size, MIN_PAGE_SIZE))
+        Ok(cmp::max(block_size, MIN_PAGE_SIZE) as usize)
     } else {
         // realistically, there should be no linux filesytems that fail this check
         Err(anyhow!("Unsupported filesystem block size: {}", block_size))

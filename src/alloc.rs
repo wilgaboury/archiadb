@@ -12,16 +12,20 @@ use tokio::sync::Mutex;
 
 use crate::fio::{Fio, MIN_PAGE_SIZE};
 
-const CACHE_LINE_SIZE: usize = 64; // standard size on pretty much every system that matters
-const SEGMENTS_LEN: usize = 2048;
-const SEGMENT_LEN: usize = (65536 /* largest supported page size */ * 128 /* just some num */) / 8 /* bytes in 64 bit int */;
-const FLUSH_SERIALIZER_LEN: usize = 1024;
+const CACHE_LINE_SIZE: u64 = 64; // standard size on pretty much every system that matters
+const SEGMENTS_LEN: u64 = 2048;
+const SEGMENT_LEN: u64 = (65536 /* largest supported page size */ * 128 /* just some num */) / 8 /* bytes in 64 bit int */;
+const FLUSH_SERIALIZER_LEN: u64 = 1024;
 const OPEN_SLOT_VALUE: u64 = 1u64 << 63;
 const NUM_HEADER_PAGES: u64 = 3;
+const BITS_IN_BYTE: u64 = 8;
+const BYTES_IN_UNIT: u64 = size_of::<BitfieldUnit>() as u64;
+const BITS_IN_UNIT: u64 = BYTES_IN_UNIT * BITS_IN_BYTE;
 
+type BitfieldUnit = AtomicU64;
 struct Segment {
-    bitfield: [AtomicU64; SEGMENT_LEN], // ~8mb of memory, represents ~274 GB of disk assuming 4kb page
-    chunks: [Chunk; SEGMENT_LEN * 8 / MIN_PAGE_SIZE],
+    bitfield: [BitfieldUnit; SEGMENT_LEN as usize], // ~8mb of memory, represents ~274 GB of disk assuming 4kb page
+    chunks: [Chunk; (SEGMENT_LEN * BYTES_IN_UNIT / MIN_PAGE_SIZE) as usize],
 }
 
 struct Chunk {
@@ -33,7 +37,7 @@ struct Chunk {
 }
 
 struct PageAllocator {
-    segments: [AtomicPtr<Segment>; SEGMENTS_LEN], // maximum of ~17 GB memory, represents ~562 terabytes of disk assuming 4kb page
+    segments: [AtomicPtr<Segment>; SEGMENTS_LEN as usize], // maximum of ~17 GB memory, represents ~562 terabytes of disk assuming 4kb page
     capaticy: AtomicU64,
     allocated: AtomicU64,
     fio: Fio,
@@ -54,7 +58,7 @@ impl<'a> Drop for AllocationSet<'a> {
 }
 
 thread_local! {
-    static LOC: UnsafeCell<usize> = UnsafeCell::new(0);
+    static LOC: UnsafeCell<u64> = UnsafeCell::new(0);
 }
 
 impl Segment {
@@ -91,14 +95,39 @@ impl<'a> AllocationSet<'a> {
 }
 
 impl PageAllocator {
-    pub async fn new(fio: Fio) -> Self {
-        // TODO: scan file and initalize values from disk
-        Self {
+    pub async fn new(fio: Fio) -> Result<Self> {
+        let ret = Self {
             segments: array::from_fn(|_| AtomicPtr::new(ptr::null_mut())),
             capaticy: AtomicU64::new(0),
             allocated: AtomicU64::new(0),
             fio,
+        };
+
+        let len = ret.remove_headers_from_page_index(ret.fio.len());
+        let mut loc = 0;
+        while loc < len {
+            ret.ensure_space(loc);
+
+            let pg_idx = ret.add_headers_to_page_index(loc);
+            let buf = ret.fio.read(pg_idx).await?;
+            let seg_idx = loc / SEGMENT_LEN;
+            let in_seg_idx = 8 * (loc % SEGMENT_LEN);
+
+            let bitfield =
+                unsafe { slice::from_raw_parts((&raw const seg.bitfield) as *const u8, len) };
+
+            loc += ret.fio.page_size() as u64 * BITS_IN_BYTE;
         }
+
+        Ok(ret)
+    }
+
+    fn ensure_space(&self, loc: u64) {
+
+    }
+
+    fn extend(&self) {
+
     }
 
     pub fn alloc_set(&self) -> AllocationSet<'_> {
@@ -112,17 +141,18 @@ impl PageAllocator {
     pub fn alloc(&self, allocs: &mut AllocationSet) -> u64 {
         loop {
             let loc = LOC.with(|loc| unsafe { *loc.get() });
-            let seg_idx = loc / SEGMENT_LEN;
-            let in_seg_idx = loc % SEGMENT_LEN;
+            let seg_idx = (loc / SEGMENT_LEN) as usize;
+            let in_seg_idx = (loc % SEGMENT_LEN) as usize;
             if seg_idx >= self.capaticy.load(Ordering::Relaxed) as usize {
                 LOC.with(|loc| unsafe { *loc.get() = 0 });
                 continue;
             }
-            let seg = &self.segments[seg_idx];
+            let seg = &self.segments[seg_idx as usize];
             let seg = unsafe { &*seg.load(Ordering::Acquire) };
             let word = seg.bitfield[in_seg_idx].load(Ordering::Relaxed);
             let free_idx = word.leading_ones();
             if free_idx == 64 {
+                LOC.with(|location| unsafe { *location.get() = loc+1 });
                 continue;
             }
             let mask = 1u64 << free_idx;
@@ -151,17 +181,17 @@ impl PageAllocator {
 
     pub fn free(&self, pg_idx: u64) {
         let pg_idx = self.remove_headers_from_page_index(pg_idx);
-        let loc = (pg_idx / 64) as usize;
+        let loc = pg_idx / 64;
         let seg_idx = loc / SEGMENT_LEN;
         let in_seg_idx = loc % SEGMENT_LEN;
-        let seg = &self.segments[seg_idx];
+        let seg = &self.segments[seg_idx as usize];
         let seg = unsafe { &*seg.load(Ordering::Acquire) };
         let mask = !(1u64 << (pg_idx % 64));
-        seg.bitfield[in_seg_idx].fetch_and(mask, Ordering::Relaxed);
+        seg.bitfield[in_seg_idx as usize].fetch_and(mask, Ordering::Relaxed);
     }
 
     async fn flush(&self, chunk_idx: u64, version: u64) -> Result<()> {
-        let loc = chunk_idx * self.pages_per_chunk() / 8;
+        let loc = chunk_idx * self.pages_per_chunk() / ;
         let seg_idx = (loc / SEGMENT_LEN as u64) as usize;
         let in_seg_idx = (8 * (loc % SEGMENT_LEN as u64)) as usize;
         let seg = unsafe { &*self.segments[seg_idx].load(Ordering::Acquire) };
@@ -213,5 +243,28 @@ impl PageAllocator {
     fn remove_headers_from_page_index(&self, pg_idx: u64) -> u64 {
         let ret = pg_idx - (NUM_HEADER_PAGES + 1);
         ret - (ret / self.pages_per_chunk())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::Result;
+    use function_name::named;
+
+    use crate::{
+        alloc::{NUM_HEADER_PAGES, PageAllocator},
+        test_util::TempDir,
+    };
+
+    #[named]
+    #[tokio::test]
+    async fn simple_test() -> Result<()> {
+        let temp_dir = TempDir::new(function_name!())?;
+        let fio = temp_dir.fio("file")?;
+        let len = NUM_HEADER_PAGES + 1 + fio.page_size() as u64 * 8;
+        fio.alloc(len).await?;
+        let alloc = PageAllocator::new(fio).await?;
+
+        Ok(())
     }
 }
