@@ -104,16 +104,23 @@ impl PageAllocator {
             fio,
         };
 
-        let len = ret.remove_headers_from_page_index(ret.fio.len());
-        println!("raw len: {}, len: {}", ret.fio.len(), len);
+        let len_pages = ret.remove_headers_from_page_index(ret.fio.len());
+        println!("raw len: {}, len: {}", ret.fio.len(), len_pages);
         let mut x_seg_idx = 0;
-        while x_seg_idx < len {
-            // TODO: just allocate segment
-
-            let pg_idx = ret.add_headers_to_page_index(x_seg_idx);
-            let buf = ret.fio.read(pg_idx).await?;
+        while x_seg_idx < len_pages {
             let seg_idx = x_seg_idx / SEGMENT_LEN;
+            ret.check_num_segments(seg_idx)?;
             let in_seg_idx = x_seg_idx % SEGMENT_LEN;
+
+            if in_seg_idx == 0 {
+                let new_seg = Box::into_raw(Box::new(Segment::new()));
+                let seg_ptr = &ret.segments[seg_idx as usize];
+                seg_ptr.store(new_seg, Ordering::Release);
+                ret.num_segs.store(seg_idx + 1, Ordering::Release);
+            }
+
+            let pg_idx = ret.(x_seg_idx);
+            let buf = ret.fio.read(pg_idx).await?;
             let seg = &ret.segments[seg_idx as usize];
             let seg = unsafe { &*seg.load(Ordering::Acquire) };
             let len = std::mem::size_of_val(&seg.bitfield);
@@ -126,10 +133,20 @@ impl PageAllocator {
                 bitfield[start..end].copy_from_slice(buf.get());
             }
 
-            x_seg_idx += ret.fio.page_size() as u64 * BITS_PER_BYTE;
+            x_seg_idx += (ret.fio.page_size() as u64 * BITS_PER_BYTE)/(BITS_PER_UNIT);
         }
 
         Ok(ret)
+    }
+
+    fn check_num_segments(&self, segs: u64) -> Result<()> {
+        if segs >= SEGMENTS_LEN {
+            Err(anyhow!(
+                "How in the world did you create a 562 terrabyte file and not run into any other issues!"
+            ))
+        } else {
+            Ok(())
+        }
     }
 
     async fn extend(&self) -> Result<()> {
@@ -137,11 +154,7 @@ impl PageAllocator {
 
         loop {
             let num_segs = self.num_segs.load(Ordering::Acquire);
-            if num_segs >= SEGMENTS_LEN {
-                return Err(anyhow!(
-                    "How in the world did you create a 562 terrabyte file and not run into any other issues!"
-                ));
-            }
+            self.check_num_segments(num_segs)?;
 
             let num_allocs = self.num_allocs.load(Ordering::Acquire);
 
@@ -305,7 +318,7 @@ mod tests {
     use function_name::named;
 
     use crate::{
-        alloc::{NUM_HEADER_PAGES, PageAllocator},
+        alloc::{BITS_PER_BYTE, NUM_HEADER_PAGES, PageAllocator},
         test_util::TempDir,
     };
 
@@ -314,7 +327,11 @@ mod tests {
     async fn simple_test() -> Result<()> {
         let temp_dir = TempDir::new(function_name!())?;
         let fio = temp_dir.fio("file")?;
-        let len = NUM_HEADER_PAGES + 1 + fio.page_size() as u64 * 8;
+
+        assert_eq!(0, fio.len());
+
+        let len = NUM_HEADER_PAGES + 1 + fio.page_size() as u64 * BITS_PER_BYTE;
+        println!("setting fio len: {}", len);
         fio.alloc(len).await?;
         let alloc = PageAllocator::new(fio).await?;
 

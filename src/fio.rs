@@ -109,7 +109,7 @@ struct Inner {
     file: File,
 
     page_size: usize,
-    len: AtomicU64,
+    len: AtomicU64, // number of pages
     stop: AtomicBool,
     queue: SegQueue<FioOp>,
 
@@ -229,8 +229,7 @@ impl Fio {
         let page_size = choose_page_size(path.as_ref())?;
 
         let fd = file.as_raw_fd();
-        // TODO: filesystem is stupid, it is opening brand new files and saying the size > 0, need to figure out work around
-        let len = file.metadata()?.len() as usize / page_size;
+        let len = file.metadata()?.len() / page_size as u64;
 
         let stop = AtomicBool::new(false);
         let queue = SegQueue::new();
