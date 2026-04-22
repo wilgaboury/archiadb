@@ -3,6 +3,8 @@ use std::{
     array,
     cell::UnsafeCell,
     collections::{HashMap, HashSet},
+    io::Write,
+    mem::MaybeUninit,
     ptr,
     sync::atomic::{AtomicPtr, AtomicU64, Ordering, fence},
 };
@@ -63,11 +65,29 @@ thread_local! {
 }
 
 impl Segment {
-    fn new() -> Self {
-        Self {
-            bitfield: array::from_fn(|_| AtomicU64::new(0)),
-            chunks: array::from_fn(|_| Chunk::new()),
-        }
+    fn new() -> Box<Self> {
+        let boxed = Box::<Segment>::new_zeroed();
+        unsafe { boxed.assume_init() }
+
+        // unsafe {
+        //     // Get raw pointer to the box's contents
+        //     let ptr = boxed.as_mut_ptr();
+
+        //     // Initialize bitfield elements
+        //     let bitfield_ptr = std::ptr::addr_of_mut!((*ptr).bitfield) as *mut BitfieldUnit;
+        //     for i in 0..SEGMENT_LEN as usize {
+        //         std::ptr::write(bitfield_ptr.add(i), AtomicU64::new(0));
+        //     }
+
+        //     // Initialize chunks elements
+        //     let chunks_ptr = std::ptr::addr_of_mut!((*ptr).chunks) as *mut Chunk;
+        //     let chunks_len = (SEGMENT_LEN * BYTES_PER_UNIT / MIN_PAGE_SIZE) as usize;
+        //     for i in 0..chunks_len {
+        //         std::ptr::write(chunks_ptr.add(i), Chunk::new());
+        //     }
+
+        //     boxed.assume_init()
+        // }
     }
 }
 
@@ -97,6 +117,8 @@ impl<'a> AllocationSet<'a> {
 
 impl PageAllocator {
     pub async fn new(fio: Fio) -> Result<Self> {
+        println!("getting here 2?");
+
         let ret = Self {
             segments: array::from_fn(|_| AtomicPtr::new(ptr::null_mut())),
             num_segs: AtomicU64::new(0),
@@ -104,22 +126,27 @@ impl PageAllocator {
             fio,
         };
 
+        println!("getting here 3?");
+
         let len_pages = ret.remove_headers_from_page_index(ret.fio.len());
         println!("raw len: {}, len: {}", ret.fio.len(), len_pages);
         let mut x_seg_idx = 0;
-        while x_seg_idx < len_pages {
+        while x_seg_idx < (len_pages / BITS_PER_BYTE) {
+            println!("x_seg_idx: {}", x_seg_idx);
+            std::io::stdout().flush().unwrap();
             let seg_idx = x_seg_idx / SEGMENT_LEN;
             ret.check_num_segments(seg_idx)?;
             let in_seg_idx = x_seg_idx % SEGMENT_LEN;
 
             if in_seg_idx == 0 {
-                let new_seg = Box::into_raw(Box::new(Segment::new()));
+                let new_seg = Box::into_raw(Segment::new());
                 let seg_ptr = &ret.segments[seg_idx as usize];
                 seg_ptr.store(new_seg, Ordering::Release);
                 ret.num_segs.store(seg_idx + 1, Ordering::Release);
             }
 
-            let pg_idx = ret.(x_seg_idx);
+            let pg_idx = ret.add_headers_to_page_index(x_seg_idx * BITS_PER_UNIT);
+            println!("attempting to read: {}, fio len, {}", pg_idx, ret.fio.len());
             let buf = ret.fio.read(pg_idx).await?;
             let seg = &ret.segments[seg_idx as usize];
             let seg = unsafe { &*seg.load(Ordering::Acquire) };
@@ -133,7 +160,7 @@ impl PageAllocator {
                 bitfield[start..end].copy_from_slice(buf.get());
             }
 
-            x_seg_idx += (ret.fio.page_size() as u64 * BITS_PER_BYTE)/(BITS_PER_UNIT);
+            x_seg_idx += (ret.fio.page_size() as u64 * BITS_PER_BYTE) / (BITS_PER_UNIT);
         }
 
         Ok(ret)
@@ -161,7 +188,7 @@ impl PageAllocator {
             if (num_allocs as f32 / (num_segs * BITS_PER_UNIT) as f32) < EXPAND_FRACTION {
                 return Ok(());
             } else {
-                let new_seg = Box::into_raw(Box::new(Segment::new()));
+                let new_seg = Box::into_raw(Segment::new());
                 let seg_ptr = &self.segments[num_segs as usize];
                 if let Err(_) = seg_ptr.compare_exchange(
                     ptr::null_mut(),
@@ -314,6 +341,8 @@ impl PageAllocator {
 
 #[cfg(test)]
 mod tests {
+    use core::alloc;
+
     use anyhow::Result;
     use function_name::named;
 
@@ -333,7 +362,16 @@ mod tests {
         let len = NUM_HEADER_PAGES + 1 + fio.page_size() as u64 * BITS_PER_BYTE;
         println!("setting fio len: {}", len);
         fio.alloc(len).await?;
+        println!("getting here?");
         let alloc = PageAllocator::new(fio).await?;
+        let mut allocs = alloc.alloc_set();
+        let pg_idx = alloc.alloc(&mut allocs);
+
+        assert_eq!(4, pg_idx);
+
+        let pg_idx = alloc.alloc(&mut allocs);
+
+        assert_eq!(5, pg_idx);
 
         Ok(())
     }

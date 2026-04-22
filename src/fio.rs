@@ -125,11 +125,10 @@ struct Inner {
 
 #[derive(Clone)]
 enum GenericOpStateRef {
-    Pool(PoolGenericOpState),
+    Pool(Arc<PoolGenericOpState>),
     Dynamic(Arc<AtomicU32>),
 }
 
-#[derive(Clone)]
 struct PoolGenericOpState {
     idx: usize,
     fio: Arc<Inner>,
@@ -146,10 +145,11 @@ impl GenericOpStateRef {
 
 impl Drop for PoolGenericOpState {
     fn drop(&mut self) {
-        if let Err(e) = self.fio.free_generic_op_states.push(self.idx) {
+        println!("pushing free generic op state: {}", self.idx);
+        if let Err(_) = self.fio.free_generic_op_states.push(self.idx) {
             eprintln!(
-                "Failed to return buffer idx {} to free pool: {}",
-                self.idx, e
+                "Failed to return generic op state {} to free pool",
+                self.idx
             );
         }
     }
@@ -195,11 +195,8 @@ impl PoolBuf {
 
 impl Drop for PoolBuf {
     fn drop(&mut self) {
-        if let Err(e) = self.fio.free_bufs.push(self.idx) {
-            eprintln!(
-                "Failed to return buffer idx {} to free pool: {}",
-                self.idx, e
-            );
+        if let Err(_) = self.fio.free_bufs.push(self.idx) {
+            eprintln!("Failed to return buffer idx {} to free pool", self.idx);
         }
     }
 }
@@ -244,10 +241,14 @@ impl Fio {
         let free_generic_op_states = ArrayQueue::new(cmp::max(1, generic_op_state_pool as usize));
         for idx in 0usize..(generic_op_state_pool as usize) {
             generic_op_states.push(AtomicU32::new(GenericOpState::Init as u32));
-            free_generic_op_states
-                .push(idx)
-                .map_err(|idx| anyhow!("Failed to initialize idx {} in free buffer pool", idx))?;
+            free_generic_op_states.push(idx).map_err(|idx| {
+                anyhow!(
+                    "Failed to initialize idx {} in free generic ops state pool",
+                    idx
+                )
+            })?;
         }
+        println!("Ops state pool size: {}", free_generic_op_states.len());
         let generic_op_states = generic_op_states.into_boxed_slice();
 
         let inner = Arc::new(Inner {
@@ -391,7 +392,7 @@ impl Fio {
                     GenericOpState::Pending => Poll::Pending,
                     GenericOpState::Ready => Poll::Ready(Ok(())),
                     GenericOpState::Err => {
-                        Poll::Ready(Err(anyhow!("Failed to perform disk commit")))
+                        Poll::Ready(Err(anyhow!("Failed to perform disk write")))
                     }
                 }
             }
@@ -477,7 +478,7 @@ impl Fio {
                     GenericOpState::Pending => Poll::Pending,
                     GenericOpState::Ready => Poll::Ready(Ok(())),
                     GenericOpState::Err => {
-                        Poll::Ready(Err(anyhow!("Failed to perform disk commit")))
+                        Poll::Ready(Err(anyhow!("Failed to perform disk alloc")))
                     }
                 }
             }
@@ -489,6 +490,18 @@ impl Fio {
             state: get_generic_op_state(&self.inner),
         }
         .await
+
+        // TODO: fix so that this doesn't overwrit. Doesn't matter for current tests
+        // for i in 0..len {
+        //     println!("submitting write for page: {}", i);
+        //     let mut buf = self.get_buf();
+        //     buf.get_mut().fill(0);
+        //     self.submit_write(i, buf);
+        // }
+
+        // self.commit().await?;
+        // self.inner.len.store(len, Ordering::Release);
+        // Ok(())
     }
 }
 
@@ -510,10 +523,11 @@ fn get_generic_op_state(inner: &Arc<Inner>) -> GenericOpStateRef {
         .free_generic_op_states
         .pop()
         .map(|idx| {
-            GenericOpStateRef::Pool(PoolGenericOpState {
+            println!("popped free generic op state: {}", idx);
+            GenericOpStateRef::Pool(Arc::new(PoolGenericOpState {
                 idx,
                 fio: inner.clone(),
-            })
+            }))
         })
         .unwrap_or_else(|| {
             GenericOpStateRef::Dynamic(Arc::new(AtomicU32::new(GenericOpState::Init as u32)))
@@ -698,7 +712,7 @@ impl IoLoop {
                             PageBuf::Pool(shared) => (
                                 shared.ptr(),
                                 self.page_size as u32,
-                                (self.cq_size + id) as u16,
+                                (self.cq_size + shared.idx) as u16,
                             ),
                             PageBuf::Dynamic(_) => (
                                 self.bufs[id * self.page_size..].as_mut_ptr(),
@@ -732,7 +746,7 @@ impl IoLoop {
                             PageBuf::Pool(shared) => (
                                 shared.ptr(),
                                 self.page_size as u32,
-                                (self.cq_size + id) as u16,
+                                (self.cq_size + shared.idx) as u16,
                             ),
                             PageBuf::Dynamic(vec) => {
                                 self.bufs[id * self.page_size..(id + 1) * self.page_size]
@@ -784,6 +798,7 @@ impl IoLoop {
                             io_uring::types::Fd(self.fd),
                             data.len * self.page_size as u64,
                         )
+                        .mode(libc::FALLOC_FL_ZERO_RANGE)
                         .build()
                         .user_data(id as u64);
                         unsafe {
@@ -1121,12 +1136,16 @@ mod tests {
         assert_eq!(1, fio.len());
         assert_eq!(fio.page_size(), fs::metadata(fio.path())?.len() as usize);
 
-        fio.alloc(3).await?;
-        assert_eq!(3, fio.len());
+        let _read_test = fio.read(0).await?;
+
+        fio.alloc(1000).await?;
+        assert_eq!(1000, fio.len());
         assert_eq!(
-            3 * fio.page_size(),
+            1000 * fio.page_size(),
             fs::metadata(fio.path())?.len() as usize
         );
+
+        let _read_test = fio.read(5).await?;
 
         Ok(())
     }
