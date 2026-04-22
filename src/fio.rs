@@ -93,14 +93,21 @@ struct AllocData {
     state: GenericOpStateRef,
 }
 
+pub struct IoLoopHandle {
+    join: Option<JoinHandle<()>>,
+    inner: Arc<Inner>,
+}
+
+#[derive(Clone)]
 pub struct Fio {
     path: PathBuf,
-    file: File,
     inner: Arc<Inner>,
-    join: Option<JoinHandle<()>>,
+    join: Arc<IoLoopHandle>,
 }
 
 struct Inner {
+    file: File,
+
     page_size: usize,
     len: AtomicU64,
     stop: AtomicBool,
@@ -222,6 +229,7 @@ impl Fio {
         let page_size = choose_page_size(path.as_ref())?;
 
         let fd = file.as_raw_fd();
+        // TODO: filesystem is stupid, it is opening brand new files and saying the size > 0, need to figure out work around
         let len = file.metadata()?.len() as usize / page_size;
 
         let stop = AtomicBool::new(false);
@@ -244,6 +252,7 @@ impl Fio {
         let generic_op_states = generic_op_states.into_boxed_slice();
 
         let inner = Arc::new(Inner {
+            file,
             page_size,
             len: AtomicU64::new(len as u64),
             stop,
@@ -262,9 +271,11 @@ impl Fio {
 
         Ok(Self {
             path: path.as_ref().to_path_buf(),
-            file,
-            inner,
-            join: Some(join),
+            inner: inner.clone(),
+            join: Arc::new(IoLoopHandle {
+                join: Some(join),
+                inner,
+            }),
         })
     }
 
@@ -284,7 +295,11 @@ impl Fio {
         get_buf(&self.inner)
     }
 
-    pub async fn read(&self, pgidx: u64) -> Result<PageBuf> {
+    fn join(&self) -> &JoinHandle<()> {
+        self.join.as_ref().join.as_ref().unwrap()
+    }
+
+    pub async fn read(&self, pg_idx: u64) -> Result<PageBuf> {
         pub struct ReadFuture<'a> {
             fio: &'a Fio,
             idx: u64,
@@ -306,7 +321,7 @@ impl Fio {
                             state: self.state.clone(),
                         });
                         self.fio.inner.queue.push(op);
-                        self.fio.join.as_ref().unwrap().thread().unpark();
+                        self.fio.join().thread().unpark();
 
                         *state = ReadState::Pending;
                         Poll::Pending
@@ -330,7 +345,7 @@ impl Fio {
 
         ReadFuture {
             fio: self,
-            idx: pgidx,
+            idx: pg_idx,
             state: Arc::new(Mutex::new(ReadState::Init)),
         }
         .await
@@ -343,7 +358,7 @@ impl Fio {
             waker_state: None,
         });
         self.inner.queue.push(op);
-        self.join.as_ref().unwrap().thread().unpark();
+        self.join().thread().unpark();
     }
 
     pub async fn write(&self, pg_idx: u64, buf: PageBuf) -> Result<()> {
@@ -371,7 +386,7 @@ impl Fio {
                             waker_state: Some((cx.waker().clone(), self.state.clone())),
                         });
                         self.fio.inner.queue.push(op);
-                        self.fio.join.as_ref().unwrap().thread().unpark();
+                        self.fio.join().thread().unpark();
                         Poll::Pending
                     }
                     GenericOpState::Pending => Poll::Pending,
@@ -414,7 +429,7 @@ impl Fio {
                             waker: cx.waker().clone(),
                         });
                         self.fio.inner.queue.push(op);
-                        self.fio.join.as_ref().unwrap().thread().unpark();
+                        self.fio.join().thread().unpark();
                         Poll::Pending
                     }
                     GenericOpState::Pending => Poll::Pending,
@@ -457,7 +472,7 @@ impl Fio {
                             waker: cx.waker().clone(),
                         });
                         self.fio.inner.queue.push(op);
-                        self.fio.join.as_ref().unwrap().thread().unpark();
+                        self.fio.join().thread().unpark();
                         Poll::Pending
                     }
                     GenericOpState::Pending => Poll::Pending,
@@ -506,11 +521,16 @@ fn get_generic_op_state(inner: &Arc<Inner>) -> GenericOpStateRef {
         })
 }
 
-impl Drop for Fio {
+impl Drop for Inner {
     fn drop(&mut self) {
         if let Err(e) = self.file.unlock() {
             eprintln!("Failed to unlock file: {}", e);
         }
+    }
+}
+
+impl Drop for IoLoopHandle {
+    fn drop(&mut self) {
         self.inner.stop.store(true, Ordering::Release);
         let join = self.join.take().unwrap();
         join.thread().unpark();
