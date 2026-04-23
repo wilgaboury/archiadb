@@ -295,6 +295,10 @@ impl Fio {
         get_buf(&self.inner)
     }
 
+    pub fn get_dyn_buf(&self) -> PageBuf {
+        get_dyn_buf(&self.inner)
+    }
+
     fn join(&self) -> &JoinHandle<()> {
         self.join.as_ref().join.as_ref().unwrap()
     }
@@ -515,7 +519,11 @@ fn get_buf(inner: &Arc<Inner>) -> PageBuf {
                 fio: inner.clone(),
             })
         })
-        .unwrap_or_else(|| PageBuf::Dynamic(vec![0u8; inner.page_size as usize].into_boxed_slice()))
+        .unwrap_or_else(|| get_dyn_buf(&inner))
+}
+
+fn get_dyn_buf(inner: &Inner) -> PageBuf {
+    PageBuf::Dynamic(vec![0u8; inner.page_size as usize].into_boxed_slice())
 }
 
 fn get_generic_op_state(inner: &Arc<Inner>) -> GenericOpStateRef {

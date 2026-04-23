@@ -24,11 +24,12 @@ const BITS_PER_BYTE: u64 = 8;
 const BYTES_PER_UNIT: u64 = size_of::<BitfieldUnit>() as u64;
 const BITS_PER_UNIT: u64 = BYTES_PER_UNIT * BITS_PER_BYTE;
 const EXPAND_FRACTION: f32 = 0.7;
+const CHUNKS_LEN: usize = (SEGMENT_LEN * BYTES_PER_UNIT / MIN_PAGE_SIZE) as usize;
 
 type BitfieldUnit = AtomicU64;
 struct Segment {
     bitfield: [BitfieldUnit; SEGMENT_LEN as usize], // ~8mb of memory, represents ~274 GB of disk assuming 4kb page
-    chunks: [Chunk; (SEGMENT_LEN * BYTES_PER_UNIT / MIN_PAGE_SIZE) as usize],
+    chunks: [Chunk; CHUNKS_LEN],
 }
 
 struct Chunk {
@@ -66,28 +67,20 @@ thread_local! {
 
 impl Segment {
     fn new() -> Box<Self> {
-        let boxed = Box::<Segment>::new_zeroed();
-        unsafe { boxed.assume_init() }
+        let mut boxed = Box::<Segment>::new_zeroed();
+        // unsafe { boxed.assume_init() }
 
-        // unsafe {
-        //     // Get raw pointer to the box's contents
-        //     let ptr = boxed.as_mut_ptr();
+        unsafe {
+            // Get raw pointer to the box's contents
+            let ptr = boxed.as_mut_ptr();
 
-        //     // Initialize bitfield elements
-        //     let bitfield_ptr = std::ptr::addr_of_mut!((*ptr).bitfield) as *mut BitfieldUnit;
-        //     for i in 0..SEGMENT_LEN as usize {
-        //         std::ptr::write(bitfield_ptr.add(i), AtomicU64::new(0));
-        //     }
+            let chunks_ptr = std::ptr::addr_of_mut!((*ptr).chunks) as *mut Chunk;
+            for i in 0..CHUNKS_LEN {
+                std::ptr::write(chunks_ptr.add(i), Chunk::new());
+            }
 
-        //     // Initialize chunks elements
-        //     let chunks_ptr = std::ptr::addr_of_mut!((*ptr).chunks) as *mut Chunk;
-        //     let chunks_len = (SEGMENT_LEN * BYTES_PER_UNIT / MIN_PAGE_SIZE) as usize;
-        //     for i in 0..chunks_len {
-        //         std::ptr::write(chunks_ptr.add(i), Chunk::new());
-        //     }
-
-        //     boxed.assume_init()
-        // }
+            boxed.assume_init()
+        }
     }
 }
 
@@ -223,7 +216,7 @@ impl PageAllocator {
         }
     }
 
-    pub fn alloc_set(&self) -> AllocationSet<'_> {
+    pub fn create_set(&self) -> AllocationSet<'_> {
         AllocationSet {
             alloc: &self,
             allocations: HashSet::new(),
@@ -243,7 +236,7 @@ impl PageAllocator {
             let seg = &self.segments[seg_idx as usize];
             let seg = unsafe { &*seg.load(Ordering::Acquire) };
             let word = seg.bitfield[in_seg_idx].load(Ordering::Relaxed);
-            let free_idx = word.leading_ones();
+            let free_idx = word.trailing_ones();
             if free_idx == 64 {
                 CROSS_SEG_IDX.with(|idx| unsafe { *idx.get() = x_seg_idx + 1 });
                 continue;
@@ -341,8 +334,6 @@ impl PageAllocator {
 
 #[cfg(test)]
 mod tests {
-    use core::alloc;
-
     use anyhow::Result;
     use function_name::named;
 
@@ -363,8 +354,8 @@ mod tests {
         println!("setting fio len: {}", len);
         fio.alloc(len).await?;
         println!("getting here?");
-        let alloc = PageAllocator::new(fio).await?;
-        let mut allocs = alloc.alloc_set();
+        let alloc = PageAllocator::new(fio.clone()).await?;
+        let mut allocs = alloc.create_set();
         let pg_idx = alloc.alloc(&mut allocs);
 
         assert_eq!(4, pg_idx);
@@ -373,6 +364,41 @@ mod tests {
 
         assert_eq!(5, pg_idx);
 
+        let pg_idx = alloc.alloc(&mut allocs);
+
+        assert_eq!(6, pg_idx);
+
+        allocs.flush().await?;
+
+        let buf = fio.read(3).await?;
+        // only works on little endian systems
+        assert_eq!(0b111, buf.get()[0]);
+
+        assert_eq!(7, alloc.alloc(&mut allocs));
+
+        drop(allocs);
+
+        let mut allocs = alloc.create_set();
+        assert_eq!(7, alloc.alloc(&mut allocs));
+
         Ok(())
     }
+
+    // #[named]
+    // #[tokio::test]
+    // async fn many_allocs() -> Result<()> {
+    //     let temp_dir = TempDir::new(function_name!())?;
+    //     let fio = temp_dir.fio("file")?;
+
+    //     let num_allocs = fio.page_size() as u64 * BITS_PER_BYTE * 3;
+
+    //     let alloc = PageAllocator::new(fio.clone()).await?;
+    //     let mut allocs = alloc.create_set();
+
+    //     for _ in 0..num_allocs {
+    //         alloc.alloc(&mut allocs);
+    //     }
+
+    //     Ok(())
+    // }
 }
