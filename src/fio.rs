@@ -865,7 +865,7 @@ impl IoLoop {
                                 .get()
                                 .store(GenericOpState::Ready as u32, Ordering::Release);
                         } else {
-                            eprintln!("Commit failed with error: {}", cqe.result());
+                            eprintln!("Write failed with error: {}", cqe.result());
                             state
                                 .get()
                                 .store(GenericOpState::Err as u32, Ordering::Release);
@@ -895,7 +895,7 @@ impl IoLoop {
                                 .get()
                                 .store(GenericOpState::Ready as u32, Ordering::Release);
                         } else {
-                            eprintln!("Commit failed with error: {}", cqe.result());
+                            eprintln!("Alloc failed with error: {}", cqe.result());
                             state
                                 .get()
                                 .store(GenericOpState::Err as u32, Ordering::Release);

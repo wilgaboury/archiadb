@@ -121,6 +121,10 @@ impl PageAllocator {
 
         println!("getting here 3?");
 
+        if ret.fio.len() <= NUM_HEADER_PAGES + 1 {
+            return Ok(ret);
+        }
+
         let len_pages = ret.remove_headers_from_page_index(ret.fio.len());
         println!("raw len: {}, len: {}", ret.fio.len(), len_pages);
         let mut x_seg_idx = 0;
@@ -207,7 +211,7 @@ impl PageAllocator {
                     self.num_segs.fetch_add(1, Ordering::AcqRel);
                     return Ok(());
                 } else {
-                    // TODO: could probably just reuse this at the expense of making the logic more complex
+                    // TODO: could just reuse this allocation at the expense of making the logic more complex
                     unsafe {
                         drop(Box::from_raw(new_seg));
                     }
@@ -224,8 +228,22 @@ impl PageAllocator {
         }
     }
 
-    pub fn alloc(&self, allocs: &mut AllocationSet) -> u64 {
+    pub async fn alloc(&self, allocs: &mut AllocationSet<'_>) -> Result<u64> {
+        let mut attempts = 0;
+
         loop {
+            if attempts > SEGMENT_LEN || self.fio.len() == 0 {
+                let len = self.fio.len();
+                let new_len = len + 1 + self.fio.page_size() as u64 * BITS_PER_BYTE;
+                println!("len: {}; new len: {}, attempts: {}", len, new_len, attempts);
+                self.fio.alloc(new_len).await?;
+                if len / BITS_PER_UNIT > self.num_segs.load(Ordering::Acquire) {
+                    self.extend().await?;
+                }
+                attempts = 0;
+            }
+            attempts += 1;
+
             let x_seg_idx = CROSS_SEG_IDX.with(|idx| unsafe { *idx.get() });
             let seg_idx = (x_seg_idx / SEGMENT_LEN) as usize;
             let in_seg_idx = (x_seg_idx % SEGMENT_LEN) as usize;
@@ -238,7 +256,9 @@ impl PageAllocator {
             let word = seg.bitfield[in_seg_idx].load(Ordering::Relaxed);
             let free_idx = word.trailing_ones();
             if free_idx == 64 {
-                CROSS_SEG_IDX.with(|idx| unsafe { *idx.get() = x_seg_idx + 1 });
+                CROSS_SEG_IDX.with(|idx| unsafe {
+                    *idx.get() = (x_seg_idx + 1) % (self.fio.len() / BITS_PER_UNIT)
+                });
                 continue;
             }
             let mask = 1u64 << free_idx;
@@ -257,7 +277,7 @@ impl PageAllocator {
                     .version
                     .fetch_add(1, Ordering::AcqRel);
                 allocs.dirty.insert(chunk_idx, version + 1);
-                return pg_idx;
+                return Ok(pg_idx);
             } else {
                 // there was conflict move forward one cache line
                 CROSS_SEG_IDX.with(|idx| unsafe { *idx.get() = x_seg_idx + CACHE_LINE_SIZE });
@@ -356,15 +376,15 @@ mod tests {
         println!("getting here?");
         let alloc = PageAllocator::new(fio.clone()).await?;
         let mut allocs = alloc.create_set();
-        let pg_idx = alloc.alloc(&mut allocs);
+        let pg_idx = alloc.alloc(&mut allocs).await?;
 
         assert_eq!(4, pg_idx);
 
-        let pg_idx = alloc.alloc(&mut allocs);
+        let pg_idx = alloc.alloc(&mut allocs).await?;
 
         assert_eq!(5, pg_idx);
 
-        let pg_idx = alloc.alloc(&mut allocs);
+        let pg_idx = alloc.alloc(&mut allocs).await?;
 
         assert_eq!(6, pg_idx);
 
@@ -374,31 +394,31 @@ mod tests {
         // only works on little endian systems
         assert_eq!(0b111, buf.get()[0]);
 
-        assert_eq!(7, alloc.alloc(&mut allocs));
+        assert_eq!(7, alloc.alloc(&mut allocs).await?);
 
         drop(allocs);
 
         let mut allocs = alloc.create_set();
-        assert_eq!(7, alloc.alloc(&mut allocs));
+        assert_eq!(7, alloc.alloc(&mut allocs).await?);
 
         Ok(())
     }
 
-    // #[named]
-    // #[tokio::test]
-    // async fn many_allocs() -> Result<()> {
-    //     let temp_dir = TempDir::new(function_name!())?;
-    //     let fio = temp_dir.fio("file")?;
+    #[named]
+    #[tokio::test]
+    async fn many_allocs() -> Result<()> {
+        let temp_dir = TempDir::new(function_name!())?;
+        let fio = temp_dir.fio("file")?;
 
-    //     let num_allocs = fio.page_size() as u64 * BITS_PER_BYTE * 3;
+        let num_allocs = fio.page_size() as u64 * BITS_PER_BYTE * 3;
 
-    //     let alloc = PageAllocator::new(fio.clone()).await?;
-    //     let mut allocs = alloc.create_set();
+        let alloc = PageAllocator::new(fio.clone()).await?;
+        let mut allocs = alloc.create_set();
 
-    //     for _ in 0..num_allocs {
-    //         alloc.alloc(&mut allocs);
-    //     }
+        for _ in 0..num_allocs {
+            alloc.alloc(&mut allocs).await?;
+        }
 
-    //     Ok(())
-    // }
+        Ok(())
+    }
 }
