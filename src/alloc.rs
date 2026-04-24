@@ -16,6 +16,7 @@ use crate::fio::{Fio, MIN_PAGE_SIZE};
 
 const CACHE_LINE_SIZE: u64 = 64; // standard size on pretty much every system that matters
 const SEGMENTS_LEN: u64 = 2048;
+// TODO: test with small segment length
 const SEGMENT_LEN: u64 = (65536 /* largest supported page size */ * 128 /* just some num */) / 8 /* bytes in 64 bit int */;
 const FLUSH_SERIALIZER_LEN: u64 = 1024;
 const OPEN_SLOT_VALUE: u64 = 1u64 << 63;
@@ -110,8 +111,6 @@ impl<'a> AllocationSet<'a> {
 
 impl PageAllocator {
     pub async fn new(fio: Fio) -> Result<Self> {
-        println!("getting here 2?");
-
         let ret = Self {
             segments: array::from_fn(|_| AtomicPtr::new(ptr::null_mut())),
             num_segs: AtomicU64::new(0),
@@ -187,27 +186,27 @@ impl PageAllocator {
             } else {
                 let new_seg = Box::into_raw(Segment::new());
                 let seg_ptr = &self.segments[num_segs as usize];
-                if let Err(_) = seg_ptr.compare_exchange(
+                if let Ok(_) = seg_ptr.compare_exchange(
                     ptr::null_mut(),
                     new_seg,
                     Ordering::AcqRel,
                     Ordering::Acquire,
                 ) {
-                    let result = self
-                        .fio
-                        .alloc(
-                            self.fio.len()
-                                + (SEGMENT_LEN * BITS_PER_UNIT * self.fio.page_size() as u64),
-                        )
-                        .await;
-                    if let Err(e) = result {
-                        // we don't want to leak memory or prevent other threads from making progress
-                        seg_ptr.swap(ptr::null_mut(), Ordering::AcqRel);
-                        unsafe {
-                            drop(Box::from_raw(new_seg));
-                        }
-                        Err(e)?
-                    }
+                    // let result = self
+                    //     .fio
+                    //     .alloc(
+                    //         self.fio.len()
+                    //             + (SEGMENT_LEN * BITS_PER_UNIT * self.fio.page_size() as u64),
+                    //     )
+                    //     .await;
+                    // if let Err(e) = result {
+                    //     // we don't want to leak memory or prevent other threads from making progress
+                    //     seg_ptr.swap(ptr::null_mut(), Ordering::AcqRel);
+                    //     unsafe {
+                    //         drop(Box::from_raw(new_seg));
+                    //     }
+                    //     Err(e)?
+                    // }
                     self.num_segs.fetch_add(1, Ordering::AcqRel);
                     return Ok(());
                 } else {
@@ -237,7 +236,7 @@ impl PageAllocator {
                 let new_len = len + 1 + self.fio.page_size() as u64 * BITS_PER_BYTE;
                 println!("len: {}; new len: {}, attempts: {}", len, new_len, attempts);
                 self.fio.alloc(new_len).await?;
-                if len / BITS_PER_UNIT > self.num_segs.load(Ordering::Acquire) {
+                if (len / BITS_PER_UNIT) / SEGMENT_LEN >= self.num_segs.load(Ordering::Acquire) {
                     self.extend().await?;
                 }
                 attempts = 0;
@@ -410,12 +409,13 @@ mod tests {
         let temp_dir = TempDir::new(function_name!())?;
         let fio = temp_dir.fio("file")?;
 
-        let num_allocs = fio.page_size() as u64 * BITS_PER_BYTE * 3;
+        let num_allocs = fio.page_size() as u64 * BITS_PER_BYTE * 6;
 
         let alloc = PageAllocator::new(fio.clone()).await?;
         let mut allocs = alloc.create_set();
 
-        for _ in 0..num_allocs {
+        for i in 0..num_allocs {
+            // println!("alloc #, {}", i);
             alloc.alloc(&mut allocs).await?;
         }
 
