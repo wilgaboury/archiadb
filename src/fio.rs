@@ -27,6 +27,7 @@ use libc::{O_DIRECT, iovec};
 use rustix::fs::fstatvfs;
 
 pub const MIN_PAGE_SIZE: u64 = 4096; // smallest supported page size and most common filesystem block size
+pub const MAX_PAGE_SIZE: u64 = 65536;
 
 const DEFAULT_SQ_SIZE: usize = 128;
 const DEFAULT_CQ_SIZE: usize = 256;

@@ -12,20 +12,22 @@ use std::{
 use anyhow::{Result, anyhow};
 use tokio::sync::Mutex;
 
-use crate::fio::{Fio, MIN_PAGE_SIZE};
+use crate::fio::{Fio, MAX_PAGE_SIZE, MIN_PAGE_SIZE};
 
 const CACHE_LINE_SIZE: u64 = 64; // standard size on pretty much every system that matters
 const SEGMENTS_LEN: u64 = 2048;
-// TODO: test with small segment length
-const SEGMENT_LEN: u64 = (65536 /* largest supported page size */ * 128 /* just some num */) / 8 /* bytes in 64 bit int */;
-const FLUSH_SERIALIZER_LEN: u64 = 1024;
-const OPEN_SLOT_VALUE: u64 = 1u64 << 63;
+
+#[cfg(not(test))]
+const SEGMENT_LEN: u64 = (MAX_PAGE_SIZE * 1024/* magic num */) / BITS_PER_UNIT;
+#[cfg(test)]
+const SEGMENT_LEN: u64 = (MIN_PAGE_SIZE * 2/* magic num */) / BITS_PER_UNIT;
+
 const NUM_HEADER_PAGES: u64 = 3;
 const BITS_PER_BYTE: u64 = 8;
 const BYTES_PER_UNIT: u64 = size_of::<BitfieldUnit>() as u64;
 const BITS_PER_UNIT: u64 = BYTES_PER_UNIT * BITS_PER_BYTE;
 const EXPAND_FRACTION: f32 = 0.7;
-const CHUNKS_LEN: usize = (SEGMENT_LEN * BYTES_PER_UNIT / MIN_PAGE_SIZE) as usize;
+const CHUNKS_LEN: usize = (SEGMENT_LEN * BITS_PER_UNIT / MIN_PAGE_SIZE) as usize;
 
 type BitfieldUnit = AtomicU64;
 struct Segment {
@@ -34,8 +36,6 @@ struct Segment {
 }
 
 struct Chunk {
-    // I think this version scheme will help dedup concurrent writes, but I need to think
-    // through the edge cases more. I'm not fully convinced that writes will not be missed.
     version: AtomicU64,
     written: AtomicU64,
     write: Mutex<()>,
@@ -51,7 +51,7 @@ struct PageAllocator {
 pub struct AllocationSet<'a> {
     alloc: &'a PageAllocator,
     allocations: HashSet<u64>, // page index
-    dirty: HashMap<u64, u64>,  // chunk index
+    dirty: HashMap<u64, u64>,  // chunk index, version
 }
 
 impl<'a> Drop for AllocationSet<'a> {
@@ -192,21 +192,6 @@ impl PageAllocator {
                     Ordering::AcqRel,
                     Ordering::Acquire,
                 ) {
-                    // let result = self
-                    //     .fio
-                    //     .alloc(
-                    //         self.fio.len()
-                    //             + (SEGMENT_LEN * BITS_PER_UNIT * self.fio.page_size() as u64),
-                    //     )
-                    //     .await;
-                    // if let Err(e) = result {
-                    //     // we don't want to leak memory or prevent other threads from making progress
-                    //     seg_ptr.swap(ptr::null_mut(), Ordering::AcqRel);
-                    //     unsafe {
-                    //         drop(Box::from_raw(new_seg));
-                    //     }
-                    //     Err(e)?
-                    // }
                     self.num_segs.fetch_add(1, Ordering::AcqRel);
                     return Ok(());
                 } else {
@@ -357,7 +342,7 @@ mod tests {
     use function_name::named;
 
     use crate::{
-        alloc::{BITS_PER_BYTE, NUM_HEADER_PAGES, PageAllocator},
+        alloc::{BITS_PER_BYTE, CHUNKS_LEN, NUM_HEADER_PAGES, PageAllocator},
         test_util::TempDir,
     };
 
@@ -406,10 +391,12 @@ mod tests {
     #[named]
     #[tokio::test]
     async fn many_allocs() -> Result<()> {
+        println!("CHUNKS_LEN: {}", CHUNKS_LEN);
+
         let temp_dir = TempDir::new(function_name!())?;
         let fio = temp_dir.fio("file")?;
 
-        let num_allocs = fio.page_size() as u64 * BITS_PER_BYTE * 6;
+        let num_allocs = fio.page_size() as u64 * BITS_PER_BYTE * 7;
 
         let alloc = PageAllocator::new(fio.clone()).await?;
         let mut allocs = alloc.create_set();
