@@ -135,6 +135,13 @@ struct PoolGenericOpState {
     fio: Arc<Inner>,
 }
 
+impl PoolGenericOpState {
+    fn new(idx: usize, fio: Arc<Inner>) -> Self {
+        fio.generic_op_states[idx].store(GenericOpState::Init as u32, Ordering::Release);
+        Self { idx, fio }
+    }
+}
+
 impl GenericOpStateRef {
     pub fn get(&self) -> &AtomicU32 {
         match &self {
@@ -146,7 +153,6 @@ impl GenericOpStateRef {
 
 impl Drop for PoolGenericOpState {
     fn drop(&mut self) {
-        println!("pushing free generic op state: {}", self.idx);
         if let Err(_) = self.fio.free_generic_op_states.push(self.idx) {
             eprintln!(
                 "Failed to return generic op state {} to free pool",
@@ -249,7 +255,6 @@ impl Fio {
                 )
             })?;
         }
-        println!("Ops state pool size: {}", free_generic_op_states.len());
         let generic_op_states = generic_op_states.into_boxed_slice();
 
         let inner = Arc::new(Inner {
@@ -531,13 +536,7 @@ fn get_generic_op_state(inner: &Arc<Inner>) -> GenericOpStateRef {
     inner
         .free_generic_op_states
         .pop()
-        .map(|idx| {
-            println!("popped free generic op state: {}", idx);
-            GenericOpStateRef::Pool(Arc::new(PoolGenericOpState {
-                idx,
-                fio: inner.clone(),
-            }))
-        })
+        .map(|idx| GenericOpStateRef::Pool(Arc::new(PoolGenericOpState::new(idx, inner.clone()))))
         .unwrap_or_else(|| {
             GenericOpStateRef::Dynamic(Arc::new(AtomicU32::new(GenericOpState::Init as u32)))
         })
