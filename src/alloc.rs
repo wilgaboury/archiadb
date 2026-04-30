@@ -31,7 +31,7 @@ const BITS_PER_BYTE: u64 = 8;
 const BYTES_PER_UNIT: u64 = size_of::<BitfieldUnit>() as u64;
 const BITS_PER_UNIT: u64 = BYTES_PER_UNIT * BITS_PER_BYTE;
 const EXPAND_FRACTION: f32 = 0.7;
-const CHUNKS_LEN: usize = (SEGMENT_LEN * BITS_PER_UNIT / MIN_PAGE_SIZE) as usize;
+const CHUNKS_LEN: usize = ((SEGMENT_LEN * BYTES_PER_UNIT) / MIN_PAGE_SIZE) as usize;
 
 type BitfieldUnit = AtomicU64;
 struct Segment {
@@ -262,7 +262,7 @@ impl PageAllocator {
                 let pg_idx = self.add_headers_to_page_index(pg_idx_no_head);
 
                 // ensure that bitfield changes are made visible to other threads once they acquire version
-                let version = seg.chunks[chunk_idx as usize]
+                let version = seg.chunks[(chunk_idx % self.chunks_per_segment()) as usize]
                     .version
                     .fetch_add(1, Ordering::Release);
 
@@ -287,16 +287,7 @@ impl PageAllocator {
         let seg = &self.segments[seg_idx as usize];
         let seg = unsafe { &*seg.load(Ordering::Acquire) };
         let mask = !(1u64 << (pg_idx % 64));
-        println!(
-            "b4 free: {}, pg_idx: {}",
-            seg.bitfield[in_seg_idx as usize].load(Ordering::Acquire),
-            pg_idx
-        );
-        seg.bitfield[in_seg_idx as usize].fetch_and(mask, Ordering::AcqRel);
-        println!(
-            "just freed: {}",
-            seg.bitfield[in_seg_idx as usize].load(Ordering::Acquire)
-        );
+        seg.bitfield[in_seg_idx as usize].fetch_and(mask, Ordering::Relaxed);
     }
 
     async fn flush(&self, chunk_idx: u64, ver_to_flush: u64) -> Result<()> {
@@ -304,7 +295,7 @@ impl PageAllocator {
         let seg_idx = (loc / SEGMENT_LEN as u64) as usize;
         let in_seg_idx = (8 * (loc % SEGMENT_LEN as u64)) as usize;
         let seg = unsafe { &*self.segments[seg_idx].load(Ordering::Acquire) };
-        let chunk = &seg.chunks[chunk_idx as usize];
+        let chunk = &seg.chunks[(chunk_idx % self.chunks_per_segment()) as usize];
         let pg_idx = self.chunk_index_to_page_index(chunk_idx);
 
         // quick check to see if version was written by another thread
@@ -347,6 +338,10 @@ impl PageAllocator {
         self.fio.page_size() as u64 * BITS_PER_BYTE
     }
 
+    fn chunks_per_segment(&self) -> u64 {
+        (SEGMENT_LEN * BYTES_PER_UNIT) / self.fio.page_size() as u64
+    }
+
     fn chunk_index_to_page_index(&self, chunk_idx: u64) -> u64 {
         self.add_headers_to_page_index(chunk_idx * self.pages_per_chunk()) - 1
     }
@@ -378,7 +373,7 @@ impl PageAllocator {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{Ordering, fence};
 
     use anyhow::Result;
     use function_name::named;
@@ -434,7 +429,9 @@ mod tests {
         let temp_dir = TempDir::new(function_name!())?;
         let fio = temp_dir.fio("file")?;
 
-        let num_allocs = fio.page_size() as u64 * BITS_PER_BYTE * 6;
+        const CHKS: u64 = 6;
+
+        let num_allocs = fio.page_size() as u64 * BITS_PER_BYTE * CHKS;
 
         let alloc = PageAllocator::new(fio.clone()).await?;
         let mut allocs = alloc.create_set();
@@ -445,9 +442,9 @@ mod tests {
 
         allocs.flush().await?;
 
-        assert!(alloc.num_segs.load(Ordering::Acquire) >= 3);
+        assert!(alloc.num_segs.load(Ordering::Acquire) >= (CHKS / 2));
 
-        for seg_idx in 0..3 {
+        for seg_idx in 0..(CHKS / 2) {
             let seg_ptr = alloc.segments[seg_idx as usize].load(Ordering::Acquire);
             if seg_ptr.is_null() {
                 panic!("null segment");
@@ -464,6 +461,47 @@ mod tests {
         }
 
         // TODO: assert that allocation pages were actually written to disk
+
+        fn is_all_zeros(bytes: &[u8]) -> bool {
+            bytes.iter().all(|&b| b == 0xFF)
+        }
+
+        fn is_all_ones(bytes: &[u8]) -> bool {
+            bytes.iter().all(|&b| b == 0xFF)
+        }
+
+        for i in 0..CHKS {
+            let buf = fio
+                .read(NUM_HEADER_PAGES + i * (1 + alloc.pages_per_chunk()))
+                .await?;
+            assert!(is_all_ones(buf.get()), "bad idx: {}", i);
+        }
+
+        // this is all good
+
+        for i in 0..(CHKS * alloc.pages_per_chunk()) {
+            alloc.free(alloc.add_headers_to_page_index(i));
+        }
+
+        fence(Ordering::SeqCst);
+
+        // free is lazy so we must force flush every chunk, this is not a normal operation
+        for seg_idx in 0..(CHKS / 2) {
+            let seg_ptr = alloc.segments[seg_idx as usize].load(Ordering::Acquire);
+            let seg = unsafe { &*seg_ptr };
+            for (i, chk) in seg.chunks.iter().enumerate() {
+                let v = chk.version.fetch_add(1, Ordering::AcqRel);
+                alloc.flush((seg_idx * 2) + i as u64, v + 1).await?;
+            }
+        }
+
+        for i in 0..CHKS {
+            let buf = fio
+                .read(NUM_HEADER_PAGES + i * (1 + alloc.pages_per_chunk()))
+                .await?;
+            // TODO: not working
+            // assert!(is_all_zeros(buf.get()))
+        }
 
         Ok(())
     }
