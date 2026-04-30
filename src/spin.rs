@@ -3,6 +3,7 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
+#[deprecated]
 pub struct SpinLock<T> {
     locked: AtomicBool,
     data: UnsafeCell<T>,
@@ -15,7 +16,6 @@ pub struct SpinLockGaurd<'a, T> {
     lock: &'a SpinLock<T>,
 }
 
-// TODO: spin lock is the devil, replace with lock free structures or use mutex
 impl<T> SpinLock<T> {
     pub fn new(val: T) -> Self {
         Self {
@@ -58,3 +58,35 @@ impl<T> Drop for SpinLockGaurd<'_, T> {
         self.lock.locked.store(false, Ordering::Release);
     }
 }
+
+// #[test]
+// fn check_for_spin_lock_overlap() -> Result<()> {
+//     let lock = Arc::new(Mutex::new(0));
+//     let mut threads = Vec::new();
+
+//     const THREAD_COUNT: i32 = 10;
+//     const INC_COUNT: i32 = 100;
+
+//     for _ in 0..THREAD_COUNT {
+//         let lock_clone = lock.clone();
+//         threads.push(std::thread::spawn(move || {
+//             let mut gaurd = lock_clone.lock();
+//             for _ in 0..INC_COUNT {
+//                 let val = *gaurd;
+//                 std::thread::yield_now();
+//                 *gaurd = val + 1;
+//             }
+//         }));
+//     }
+
+//     for thread in threads {
+//         thread
+//             .join()
+//             .map_err(|e| anyhow!("Thread panicked: {:?}", e))?;
+//     }
+
+//     let gaurd = lock.lock();
+//     assert_eq!(THREAD_COUNT * INC_COUNT, *gaurd);
+
+//     Ok(())
+// }

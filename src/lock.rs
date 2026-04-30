@@ -2,14 +2,11 @@ use std::{
     marker::PhantomPinned,
     pin::Pin,
     ptr,
-    sync::Arc,
+    sync::{Arc, Mutex},
     task::{Context, Poll, Waker},
 };
 
-use crate::{
-    intrusive::{IntrusiveList, IntrusiveListNode},
-    spin::SpinLock,
-};
+use crate::intrusive::{IntrusiveList, IntrusiveListNode};
 
 #[derive(Debug, Clone, Copy)]
 #[repr(u16)]
@@ -45,7 +42,7 @@ impl LockType {
 
 #[derive(Clone)]
 struct Lock {
-    inner: Arc<SpinLock<LockInner>>,
+    inner: Arc<Mutex<LockInner>>,
 }
 
 unsafe impl Send for Lock {}
@@ -54,7 +51,7 @@ unsafe impl Sync for Lock {}
 impl Lock {
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(SpinLock::new(LockInner::new())),
+            inner: Arc::new(Mutex::new(LockInner::new())),
         }
     }
 
@@ -120,7 +117,7 @@ impl<'a> Future for LockFuture {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this_ptr = unsafe { self.get_unchecked_mut() } as *mut Self;
-        let mut inner = unsafe { &*this_ptr }.lock.inner.lock();
+        let mut inner = unsafe { &*this_ptr }.lock.inner.lock().unwrap();
         let this = unsafe { &mut *this_ptr };
         match &this.state {
             LockFutureState::Init => {
@@ -161,7 +158,7 @@ impl<'a> Future for LockFuture {
 
 impl Drop for LockFuture {
     fn drop(&mut self) {
-        let mut inner = unsafe { &*(self as *mut Self) }.lock.inner.lock();
+        let mut inner = unsafe { &*(self as *mut Self) }.lock.inner.lock().unwrap();
         self.remove(&inner);
         if matches!(self.state, LockFutureState::Acquired) {
             // lock was acquired but future was dropped before being polled
@@ -181,14 +178,14 @@ impl Drop for LockGuard {
     fn drop(&mut self) {
         {
             // quickly decrement lock count
-            let mut inner = self.lock.inner.lock();
+            let mut inner = self.lock.inner.lock().unwrap();
             inner.locked -= 1;
         }
 
         // in a loop, first acquire spin lock then check if next future in queue can aquire lock
         loop {
             let waker: Waker = {
-                let mut inner = self.lock.inner.lock();
+                let mut inner = self.lock.inner.lock().unwrap();
                 if let Some(head) = inner.peek() {
                     let head = unsafe { &mut *head };
                     let next_lock_type = if inner.locked == 0 {
@@ -344,38 +341,6 @@ mod tests {
         t1.await??;
         t2.await??;
         t3.await??;
-
-        Ok(())
-    }
-
-    #[test]
-    fn check_for_spin_lock_overlap() -> Result<()> {
-        let lock = Arc::new(SpinLock::new(0));
-        let mut threads = Vec::new();
-
-        const THREAD_COUNT: i32 = 10;
-        const INC_COUNT: i32 = 100;
-
-        for _ in 0..THREAD_COUNT {
-            let lock_clone = lock.clone();
-            threads.push(std::thread::spawn(move || {
-                let mut gaurd = lock_clone.lock();
-                for _ in 0..INC_COUNT {
-                    let val = *gaurd;
-                    std::thread::yield_now();
-                    *gaurd = val + 1;
-                }
-            }));
-        }
-
-        for thread in threads {
-            thread
-                .join()
-                .map_err(|e| anyhow!("Thread panicked: {:?}", e))?;
-        }
-
-        let gaurd = lock.lock();
-        assert_eq!(THREAD_COUNT * INC_COUNT, *gaurd);
 
         Ok(())
     }

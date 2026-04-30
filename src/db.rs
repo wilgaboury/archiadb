@@ -175,8 +175,8 @@ impl Db {
         Ok(())
     }
 
-    async fn commit_alloc_to_disc(&self, idx: usize, alloc: bool) -> Result<()> {
-        let buf = self.alloc_vec_block_buf();
+    async fn commit_alloc_to_disc(&self, idx: usize, _alloc: bool) -> Result<()> {
+        let _buf = self.alloc_vec_block_buf();
 
         let chunks = self.inner.chunks.read().await;
         let _header = chunks[self.block_idx_to_chunk_idx(idx)]
@@ -223,7 +223,7 @@ impl Inner {
         &self,
         canon: &mut u64,
         prev: &mut u64,
-        block: Vec<u8>,
+        _block: Vec<u8>,
     ) -> Result<()> {
         // self.file
         //     .write_all_at(block, *prev)

@@ -6,7 +6,7 @@ use std::{
     io::Write,
     mem::MaybeUninit,
     ptr,
-    sync::atomic::{AtomicPtr, AtomicU64, Ordering, fence},
+    sync::atomic::{AtomicPtr, AtomicU64, Ordering},
 };
 
 use anyhow::{Result, anyhow};
@@ -120,9 +120,10 @@ impl PageAllocator {
 
         println!("getting here 3?");
 
-        if ret.fio.len() <= NUM_HEADER_PAGES + 1 {
-            return Ok(ret);
-        }
+        // TODO: not sure if needed
+        // if ret.fio.len() <= NUM_HEADER_PAGES + 1 {
+        //     return Ok(ret);
+        // }
 
         let len_pages = ret.remove_headers_from_page_index(ret.fio.len());
         println!("raw len: {}, len: {}", ret.fio.len(), len_pages);
@@ -179,7 +180,7 @@ impl PageAllocator {
             let num_segs = self.num_segs.load(Ordering::Acquire);
             self.check_num_segments(num_segs)?;
 
-            let num_allocs = self.num_allocs.load(Ordering::Acquire);
+            let num_allocs = self.num_allocs.load(Ordering::Relaxed);
 
             if (num_allocs as f32 / (num_segs * BITS_PER_UNIT) as f32) < EXPAND_FRACTION {
                 return Ok(());
@@ -192,7 +193,7 @@ impl PageAllocator {
                     Ordering::AcqRel,
                     Ordering::Acquire,
                 ) {
-                    self.num_segs.fetch_add(1, Ordering::AcqRel);
+                    self.num_segs.fetch_add(1, Ordering::Release);
                     return Ok(());
                 } else {
                     // TODO: could just reuse this allocation at the expense of making the logic more complex
@@ -216,12 +217,17 @@ impl PageAllocator {
         let mut attempts = 0;
 
         loop {
-            if attempts > SEGMENT_LEN || self.fio.len() == 0 {
+            if (attempts > SEGMENT_LEN
+                && (self.num_allocs.load(Ordering::Relaxed) as f32
+                    / self.remove_headers_from_page_index(self.fio.len()) as f32)
+                    >= EXPAND_FRACTION)
+                || self.fio.len() == 0
+            {
                 let len = self.fio.len();
                 let new_len = len + 1 + self.fio.page_size() as u64 * BITS_PER_BYTE;
                 println!("len: {}; new len: {}, attempts: {}", len, new_len, attempts);
                 self.fio.alloc(new_len).await?;
-                if (len / BITS_PER_UNIT) / SEGMENT_LEN >= self.num_segs.load(Ordering::Acquire) {
+                if (len / BITS_PER_UNIT) / SEGMENT_LEN >= self.num_segs.load(Ordering::Relaxed) {
                     self.extend().await?;
                 }
                 attempts = 0;
@@ -236,7 +242,7 @@ impl PageAllocator {
                 continue;
             }
             let seg = &self.segments[seg_idx as usize];
-            let seg = unsafe { &*seg.load(Ordering::Acquire) };
+            let seg = unsafe { &*seg.load(Ordering::Relaxed) };
             let word = seg.bitfield[in_seg_idx].load(Ordering::Relaxed);
             let free_idx = word.trailing_ones();
             if free_idx == 64 {
@@ -246,7 +252,7 @@ impl PageAllocator {
                 continue;
             }
             let mask = 1u64 << free_idx;
-            let old = seg.bitfield[in_seg_idx].fetch_or(mask, Ordering::AcqRel);
+            let old = seg.bitfield[in_seg_idx].fetch_or(mask, Ordering::Relaxed);
             if old & mask == 0 {
                 let old = self.num_allocs.fetch_add(1, Ordering::Relaxed);
                 // TODO: .len is not accurate, need to adjust for header and bitmap blocks
@@ -256,10 +262,13 @@ impl PageAllocator {
                 let pg_idx_no_head = free_idx as u64 + (x_seg_idx as u64 * 64);
                 let chunk_idx = pg_idx_no_head / self.pages_per_chunk();
                 let pg_idx = self.add_headers_to_page_index(pg_idx_no_head);
-                allocs.allocations.insert(pg_idx);
+
+                // ensure that bitfield changes are made visible to other threads once they acquire version
                 let version = seg.chunks[chunk_idx as usize]
                     .version
-                    .fetch_add(1, Ordering::AcqRel);
+                    .fetch_add(1, Ordering::Release);
+
+                allocs.allocations.insert(pg_idx);
                 allocs.dirty.insert(chunk_idx, version + 1);
                 return Ok(pg_idx);
             } else {
@@ -280,7 +289,7 @@ impl PageAllocator {
         seg.bitfield[in_seg_idx as usize].fetch_and(mask, Ordering::Relaxed);
     }
 
-    async fn flush(&self, chunk_idx: u64, version: u64) -> Result<()> {
+    async fn flush(&self, chunk_idx: u64, ver_to_flush: u64) -> Result<()> {
         let loc = chunk_idx * self.pages_per_chunk() / BITS_PER_UNIT;
         let seg_idx = (loc / SEGMENT_LEN as u64) as usize;
         let in_seg_idx = (8 * (loc % SEGMENT_LEN as u64)) as usize;
@@ -288,19 +297,25 @@ impl PageAllocator {
         let chunk = &seg.chunks[chunk_idx as usize];
         let pg_idx = self.chunk_index_to_page_index(chunk_idx);
 
-        if chunk.written.load(Ordering::Acquire) >= version {
-            // some other thread wrote this version, we all good
+        // quick check to see if version was written by another thread
+        if chunk.written.load(Ordering::Relaxed) >= ver_to_flush {
             return Ok(());
         }
 
         let mut buf = self.fio.get_buf();
         {
             let _gaurd = chunk.write.lock().await;
-            let version = chunk.version.load(Ordering::Acquire);
-            let len = std::mem::size_of_val(&seg.bitfield);
 
-            // we stan doing evil things in this code base :D
-            fence(Ordering::Acquire);
+            // acquire ordering on version pairs with previous store release
+            // means we can safely read bitfield memory and be sure that we have seen at least this version's updates
+            let version = chunk.version.load(Ordering::Acquire);
+
+            // official check to see if version was written by another thread
+            if chunk.written.load(Ordering::Acquire) >= version {
+                return Ok(());
+            }
+
+            let len = std::mem::size_of_val(&seg.bitfield);
             let bitfield =
                 unsafe { slice::from_raw_parts((&raw const seg.bitfield) as *const u8, len) };
 
@@ -331,6 +346,9 @@ impl PageAllocator {
     }
 
     fn remove_headers_from_page_index(&self, pg_idx: u64) -> u64 {
+        if pg_idx <= NUM_HEADER_PAGES + 1 {
+            return 0;
+        }
         let ret = pg_idx - (NUM_HEADER_PAGES + 1);
         ret - (ret / self.pages_per_chunk())
     }
@@ -402,7 +420,7 @@ mod tests {
         let mut allocs = alloc.create_set();
 
         for i in 0..num_allocs {
-            // println!("alloc #, {}", i);
+            println!("alloc #, {}", i);
             alloc.alloc(&mut allocs).await?;
         }
 
