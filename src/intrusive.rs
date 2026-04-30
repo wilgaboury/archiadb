@@ -1,6 +1,3 @@
-// intrusive list lock futures with spin lock to protect list is honestly a load of crap
-// A better scheme is to use crossbeam SegQueue in combination with a lock per shared state
-
 use std::ptr;
 
 pub(crate) trait IntrusiveList {

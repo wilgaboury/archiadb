@@ -15,12 +15,16 @@ use tokio::sync::Mutex;
 use crate::fio::{Fio, MAX_PAGE_SIZE, MIN_PAGE_SIZE};
 
 const CACHE_LINE_SIZE: u64 = 64; // standard size on pretty much every system that matters
-const SEGMENTS_LEN: u64 = 2048;
 
 #[cfg(not(test))]
-const SEGMENT_LEN: u64 = (MAX_PAGE_SIZE * 1024/* magic num */) / BITS_PER_UNIT;
+const SEGMENTS_LEN: u64 = 2048;
 #[cfg(test)]
-const SEGMENT_LEN: u64 = (MIN_PAGE_SIZE * 2/* magic num */) / BITS_PER_UNIT;
+const SEGMENTS_LEN: u64 = 4;
+
+#[cfg(not(test))]
+const SEGMENT_LEN: u64 = (MAX_PAGE_SIZE * 128/* magic num */) / BYTES_PER_UNIT;
+#[cfg(test)]
+const SEGMENT_LEN: u64 = (MIN_PAGE_SIZE * 2/* magic num */) / BYTES_PER_UNIT;
 
 const NUM_HEADER_PAGES: u64 = 3;
 const BITS_PER_BYTE: u64 = 8;
@@ -148,6 +152,7 @@ impl PageAllocator {
             let seg = &ret.segments[seg_idx as usize];
             let seg = unsafe { &*seg.load(Ordering::Acquire) };
             let len = std::mem::size_of_val(&seg.bitfield);
+            println!("len: {}, actual: {}", SEGMENT_LEN * BYTES_PER_UNIT, len);
             let bitfield = unsafe {
                 slice::from_raw_parts_mut((&raw const seg.bitfield) as *const u8 as *mut u8, len)
             };
@@ -164,6 +169,7 @@ impl PageAllocator {
     }
 
     fn check_num_segments(&self, segs: u64) -> Result<()> {
+        println!("seg check: {}", segs);
         if segs >= SEGMENTS_LEN {
             Err(anyhow!(
                 "How in the world did you create a 562 terrabyte file and not run into any other issues!"
@@ -175,6 +181,8 @@ impl PageAllocator {
 
     async fn extend(&self) -> Result<()> {
         // lock free routine for allocation of new segment
+
+        println!("extend called?");
 
         loop {
             let num_segs = self.num_segs.load(Ordering::Acquire);
@@ -217,17 +225,39 @@ impl PageAllocator {
         let mut attempts = 0;
 
         loop {
+            // println!(
+            //     "allocs: {}, len: {}",
+            //     self.num_allocs.load(Ordering::Relaxed),
+            //     self.remove_headers_from_page_index(self.fio.len())
+            // );
+
             if (attempts > SEGMENT_LEN
                 && (self.num_allocs.load(Ordering::Relaxed) as f32
                     / self.remove_headers_from_page_index(self.fio.len()) as f32)
                     >= EXPAND_FRACTION)
                 || self.fio.len() == 0
             {
+                if self.num_allocs.load(Ordering::Relaxed) >= 2 {
+                    println!("test");
+                }
                 let len = self.fio.len();
-                let new_len = len + 1 + self.fio.page_size() as u64 * BITS_PER_BYTE;
-                println!("len: {}; new len: {}, attempts: {}", len, new_len, attempts);
+                // TODO: this is fucked. headers need to be allocated on initalization
+                let headers = if len == 0 { NUM_HEADER_PAGES } else { 0 };
+                let new_len = len + headers + 1 + self.pages_per_chunk();
                 self.fio.alloc(new_len).await?;
-                if (len / BITS_PER_UNIT) / SEGMENT_LEN >= self.num_segs.load(Ordering::Relaxed) {
+                let adj_len = self.remove_headers_from_page_index(new_len);
+                println!(
+                    "allocs: {}, len: {}, new len: {}, adjusted len (fio pages): {}, segment len: {}, pper: {}, segs: {}",
+                    self.num_allocs.load(Ordering::Relaxed),
+                    len,
+                    new_len,
+                    adj_len,
+                    SEGMENT_LEN,
+                    self.pages_per_chunk(),
+                    self.num_segs.load(Ordering::Relaxed)
+                );
+                if (adj_len / BITS_PER_UNIT) / SEGMENT_LEN >= self.num_segs.load(Ordering::Relaxed)
+                {
                     self.extend().await?;
                 }
                 attempts = 0;
@@ -349,13 +379,15 @@ impl PageAllocator {
         if pg_idx <= NUM_HEADER_PAGES + 1 {
             return 0;
         }
-        let ret = pg_idx - (NUM_HEADER_PAGES + 1);
-        ret - (ret / self.pages_per_chunk())
+        let ret = pg_idx - NUM_HEADER_PAGES;
+        ret - (ret / (1 + self.pages_per_chunk()))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::Ordering;
+
     use anyhow::Result;
     use function_name::named;
 
@@ -414,15 +446,34 @@ mod tests {
         let temp_dir = TempDir::new(function_name!())?;
         let fio = temp_dir.fio("file")?;
 
-        let num_allocs = fio.page_size() as u64 * BITS_PER_BYTE * 7;
+        // TODO: cannot increase this to 6
+        let num_allocs = fio.page_size() as u64 * BITS_PER_BYTE * 5;
 
         let alloc = PageAllocator::new(fio.clone()).await?;
         let mut allocs = alloc.create_set();
 
         for i in 0..num_allocs {
-            println!("alloc #, {}", i);
             alloc.alloc(&mut allocs).await?;
         }
+
+        // assert_eq!(2, alloc.num_segs.load(Ordering::Acquire));
+
+        // for seg_idx in 0..alloc.num_segs.load(Ordering::Acquire) {
+        //     let seg_ptr = alloc.segments[seg_idx as usize].load(Ordering::Acquire);
+        //     if seg_ptr.is_null() {
+        //         panic!("null segment");
+        //     }
+
+        //     let seg = unsafe { &*seg_ptr };
+
+        //     // Scan each BitfieldUnit (AtomicU64) in the segment
+        //     for unit in seg.bitfield.iter() {
+        //         let value = unit.load(Ordering::Relaxed);
+        //         if value != u64::MAX {
+        //             panic!("found zero bit");
+        //         }
+        //     }
+        // }
 
         Ok(())
     }
