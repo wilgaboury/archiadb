@@ -4,7 +4,6 @@ use std::{
     cell::UnsafeCell,
     collections::{HashMap, HashSet},
     io::Write,
-    mem::MaybeUninit,
     ptr,
     sync::atomic::{AtomicPtr, AtomicU64, Ordering},
 };
@@ -12,7 +11,10 @@ use std::{
 use anyhow::{Result, anyhow};
 use tokio::sync::Mutex;
 
-use crate::fio::{Fio, MAX_PAGE_SIZE, MIN_PAGE_SIZE};
+#[cfg(not(test))]
+use crate::fio::MAX_PAGE_SIZE;
+
+use crate::fio::{Fio, MIN_PAGE_SIZE};
 
 const CACHE_LINE_SIZE: u64 = 64; // standard size on pretty much every system that matters
 
@@ -463,7 +465,7 @@ mod tests {
         // TODO: assert that allocation pages were actually written to disk
 
         fn is_all_zeros(bytes: &[u8]) -> bool {
-            bytes.iter().all(|&b| b == 0xFF)
+            bytes.iter().all(|&b| b == 0)
         }
 
         fn is_all_ones(bytes: &[u8]) -> bool {
@@ -499,8 +501,7 @@ mod tests {
             let buf = fio
                 .read(NUM_HEADER_PAGES + i * (1 + alloc.pages_per_chunk()))
                 .await?;
-            // TODO: not working
-            // assert!(is_all_zeros(buf.get()))
+            assert!(is_all_zeros(buf.get()))
         }
 
         Ok(())
