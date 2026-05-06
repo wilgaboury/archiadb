@@ -29,19 +29,21 @@ pub fn pick_block_size<P: AsRef<Path>>(path: P) -> Result<u64> {
     }
 }
 
+pub const CHECKSUM_SIZE: usize = size_of::<u32>();
+
 pub fn update_checksum(buf: &mut [u8]) {
     let len = buf.len();
-    let checksum = crc32c::crc32c(&buf[..len - size_of::<u32>()]);
-    buf[len - size_of::<u32>()..].clone_from_slice(&checksum.to_ne_bytes());
+    let checksum = crc32c::crc32c(&buf[..len - CHECKSUM_SIZE]);
+    buf[len - CHECKSUM_SIZE..].clone_from_slice(&checksum.to_ne_bytes());
 }
 
 fn has_valid_checksum(buf: &[u8]) -> bool {
     let len = buf.len();
-    let checksum_bytes: [u8; 4] = buf[len - size_of::<u32>()..]
+    let checksum_bytes: [u8; 4] = buf[len - CHECKSUM_SIZE..]
         .try_into()
         .expect("buffer cannot fit checksum");
     let checksum = u32::from_ne_bytes(checksum_bytes);
-    let content_checksum = crc32c::crc32c(&buf[..len - size_of::<u32>()]);
+    let content_checksum = crc32c::crc32c(&buf[..len - CHECKSUM_SIZE]);
     content_checksum == checksum
 }
 
