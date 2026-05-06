@@ -37,7 +37,7 @@ pub fn update_checksum(buf: &mut [u8]) {
     buf[len - CHECKSUM_SIZE..].clone_from_slice(&checksum.to_ne_bytes());
 }
 
-fn has_valid_checksum(buf: &[u8]) -> bool {
+pub fn has_valid_checksum(buf: &[u8]) -> bool {
     let len = buf.len();
     let checksum_bytes: [u8; 4] = buf[len - CHECKSUM_SIZE..]
         .try_into()
@@ -45,6 +45,14 @@ fn has_valid_checksum(buf: &[u8]) -> bool {
     let checksum = u32::from_ne_bytes(checksum_bytes);
     let content_checksum = crc32c::crc32c(&buf[..len - CHECKSUM_SIZE]);
     content_checksum == checksum
+}
+
+pub fn validate_checksum(buf: &[u8]) -> Result<()> {
+    if has_valid_checksum(buf) {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("invalid checksum"))
+    }
 }
 
 #[cfg(test)]
@@ -61,9 +69,12 @@ mod tests {
     fn test_checksum() {
         let mut content: [u8; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0];
         assert!(!has_valid_checksum(&content));
+        assert!(validate_checksum(&content).is_err());
         update_checksum(&mut content);
         assert!(has_valid_checksum(&content));
+        assert!(validate_checksum(&content).is_ok());
         content[0] = 0;
         assert!(!has_valid_checksum(&content));
+        assert!(validate_checksum(&content).is_err());
     }
 }
