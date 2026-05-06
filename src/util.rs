@@ -3,6 +3,13 @@ use std::{fs::File, os::fd::AsFd, path::Path};
 
 use anyhow::Result;
 
+#[macro_export]
+macro_rules! const_assert {
+    ($($arg:tt)*) => {
+        const _: () = assert!($($arg)*);
+    };
+}
+
 const MIN_BLOCK_SIZE: u64 = 4096; // 4kb
 const MAX_BLOCK_SIZE: u64 = 65536; // 64kb
 
@@ -22,6 +29,22 @@ pub fn pick_block_size<P: AsRef<Path>>(path: P) -> Result<u64> {
     }
 }
 
+pub fn update_checksum(buf: &mut [u8]) {
+    let len = buf.len();
+    let checksum = crc32c::crc32c(&buf[..len - size_of::<u32>()]);
+    buf[len - size_of::<u32>()..].clone_from_slice(&checksum.to_ne_bytes());
+}
+
+fn has_valid_checksum(buf: &[u8]) -> bool {
+    let len = buf.len();
+    let checksum_bytes: [u8; 4] = buf[len - size_of::<u32>()..]
+        .try_into()
+        .expect("buffer cannot fit checksum");
+    let checksum = u32::from_ne_bytes(checksum_bytes);
+    let content_checksum = crc32c::crc32c(&buf[..len - size_of::<u32>()]);
+    content_checksum == checksum
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -30,5 +53,15 @@ mod tests {
     fn test_pick_block_size() {
         let block_size = pick_block_size(Path::new("/")).unwrap();
         println!("Auto picked size: {}", block_size);
+    }
+
+    #[test]
+    fn test_checksum() {
+        let mut content: [u8; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0];
+        assert!(!has_valid_checksum(&content));
+        update_checksum(&mut content);
+        assert!(has_valid_checksum(&content));
+        content[0] = 0;
+        assert!(!has_valid_checksum(&content));
     }
 }

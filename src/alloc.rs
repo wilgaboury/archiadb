@@ -47,7 +47,7 @@ struct Chunk {
     write: Mutex<()>,
 }
 
-struct PageAllocator {
+pub struct PageAllocator {
     segments: [AtomicPtr<Segment>; SEGMENTS_LEN as usize], // maximum of ~17 GB memory, represents ~562 terrabytes of disk assuming 4kb page
     num_segs: AtomicU64,
     num_allocs: AtomicU64,
