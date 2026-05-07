@@ -1,7 +1,11 @@
 [package]
 name = "archiadb"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2024"
+rust-version = "1.94"
+description = "hierarchical embedded database"
+repository = "https://github.com/wilgaboury/archiadb"
+license = "MIT"
 
 [lib]
 name = "archiadb"
