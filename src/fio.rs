@@ -363,6 +363,7 @@ impl Fio {
         .await
     }
 
+    /// this function is fire-and-forget, the only way to wait for completion is using commit_flush
     pub fn submit_write(&self, pg_idx: u64, buf: PageBuf) {
         let op = FioOp::Write(WriteData {
             pg_idx,
@@ -543,18 +544,6 @@ impl Fio {
             state: get_generic_op_state(&self.inner),
         }
         .await
-
-        // TODO: fix so that this doesn't overwrit. Doesn't matter for current tests
-        // for i in 0..len {
-        //     println!("submitting write for page: {}", i);
-        //     let mut buf = self.get_buf();
-        //     buf.get_mut().fill(0);
-        //     self.submit_write(i, buf);
-        // }
-
-        // self.commit().await?;
-        // self.inner.len.store(len, Ordering::Release);
-        // Ok(())
     }
 }
 
@@ -1171,7 +1160,7 @@ mod tests {
         let mut buf = fio.get_buf();
         buf.get_mut()[0..].fill(1u8);
         fio.submit_write(0, buf);
-        fio.commit().await?;
+        fio.commit_flush().await?;
 
         let mut file = OpenOptions::new()
             .read(true)
@@ -1223,7 +1212,7 @@ mod tests {
         let mut buf = fio.get_buf();
         buf.get_mut()[0..].fill(1u8);
         fio.submit_write(0, buf);
-        fio.commit().await?;
+        fio.commit_flush().await?;
 
         let mut file = OpenOptions::new().read(true).append(true).open(test_file)?;
         let mut buf = vec![0u8; fio.page_size()];
