@@ -1,5 +1,6 @@
 use rustix::fs::fstatvfs;
 use std::{fs::File, os::fd::AsFd, path::Path};
+use xxhash_rust::xxh3::xxh3_64;
 
 use anyhow::Result;
 
@@ -29,21 +30,22 @@ pub fn pick_block_size<P: AsRef<Path>>(path: P) -> Result<u64> {
     }
 }
 
-pub const CHECKSUM_SIZE: usize = size_of::<u32>();
+pub type Checksum = u64;
+pub const CHECKSUM_SIZE: usize = size_of::<Checksum>();
 
 pub fn update_checksum(buf: &mut [u8]) {
     let len = buf.len();
-    let checksum = crc32c::crc32c(&buf[..len - CHECKSUM_SIZE]);
+    let checksum = xxh3_64(&buf[..len - CHECKSUM_SIZE]);
     buf[len - CHECKSUM_SIZE..].clone_from_slice(&checksum.to_ne_bytes());
 }
 
 pub fn has_valid_checksum(buf: &[u8]) -> bool {
     let len = buf.len();
-    let checksum_bytes: [u8; 4] = buf[len - CHECKSUM_SIZE..]
+    let checksum_bytes: [u8; CHECKSUM_SIZE] = buf[len - CHECKSUM_SIZE..]
         .try_into()
         .expect("buffer cannot fit checksum");
-    let checksum = u32::from_ne_bytes(checksum_bytes);
-    let content_checksum = crc32c::crc32c(&buf[..len - CHECKSUM_SIZE]);
+    let checksum = Checksum::from_ne_bytes(checksum_bytes);
+    let content_checksum = xxh3_64(&buf[..len - CHECKSUM_SIZE]);
     content_checksum == checksum
 }
 
@@ -67,13 +69,13 @@ mod tests {
 
     #[test]
     fn test_checksum() {
-        let mut content: [u8; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0];
+        let mut content: [u8; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0, 0, 0, 0, 0];
         assert!(!has_valid_checksum(&content));
         assert!(validate_checksum(&content).is_err());
         update_checksum(&mut content);
         assert!(has_valid_checksum(&content));
         assert!(validate_checksum(&content).is_ok());
-        content[0] = 0;
+        content.fill(1);
         assert!(!has_valid_checksum(&content));
         assert!(validate_checksum(&content).is_err());
     }
