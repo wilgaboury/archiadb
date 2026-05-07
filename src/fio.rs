@@ -37,6 +37,8 @@ enum FioOp {
     Read(ReadData),
     Write(WriteData),
     Commit(CommitData),
+    CommitFlush(CommitData),
+    CommitBatch(Vec<CommitData>),
     Alloc(AllocData),
 }
 
@@ -458,6 +460,47 @@ impl Fio {
         .await
     }
 
+    pub async fn commit_flush(&self) -> Result<()> {
+        pub struct CommitFuture<'a> {
+            fio: &'a Fio,
+            state: GenericOpStateRef,
+        }
+
+        impl<'a> Future for CommitFuture<'a> {
+            type Output = Result<()>;
+
+            fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
+                let state = self.state.get().load(Ordering::Acquire).try_into().unwrap();
+                match state {
+                    GenericOpState::Init => {
+                        self.state
+                            .get()
+                            .store(GenericOpState::Pending as u32, Ordering::Release);
+
+                        let op = FioOp::CommitFlush(CommitData {
+                            state: self.state.clone(),
+                            waker: cx.waker().clone(),
+                        });
+                        self.fio.inner.queue.push(op);
+                        self.fio.join().thread().unpark();
+                        Poll::Pending
+                    }
+                    GenericOpState::Pending => Poll::Pending,
+                    GenericOpState::Ready => Poll::Ready(Ok(())),
+                    GenericOpState::Err => {
+                        Poll::Ready(Err(anyhow!("Failed to perform disk commit")))
+                    }
+                }
+            }
+        }
+
+        CommitFuture {
+            fio: self,
+            state: get_generic_op_state(&self.inner),
+        }
+        .await
+    }
+
     pub async fn alloc(&self, len: u64) -> Result<()> {
         pub struct AllocFuture<'a> {
             fio: &'a Fio,
@@ -644,11 +687,20 @@ impl IoLoop {
             FioOp::Write(_) => {
                 // no-op
             }
-            FioOp::Commit(CommitData { waker, state, .. }) => {
+            FioOp::Commit(CommitData { waker, state, .. })
+            | FioOp::CommitFlush(CommitData { waker, state, .. }) => {
                 state
                     .get()
                     .store(GenericOpState::Err as u32, Ordering::Release);
                 waker.wake();
+            }
+            FioOp::CommitBatch(data) => {
+                for CommitData { waker, state, .. } in data {
+                    state
+                        .get()
+                        .store(GenericOpState::Err as u32, Ordering::Release);
+                    waker.wake();
+                }
             }
             FioOp::Alloc(AllocData { waker, state, .. }) => {
                 state
@@ -695,6 +747,9 @@ impl IoLoop {
 
         let mut spins = 0;
 
+        // could potentially remove this dynamic allocation
+        let mut commit_batch = Vec::new();
+
         loop {
             let mut submitted = 0;
 
@@ -710,9 +765,10 @@ impl IoLoop {
                 && submitted + pending < self.cq_size
                 && let Some(op) = self.inner.queue.pop()
             {
-                submitted += 1;
                 match op {
                     FioOp::Read(data) => {
+                        submitted += 1;
+
                         let id = ids.pop_front().unwrap();
                         let offset = data.pgidx * self.page_size as u64;
 
@@ -747,6 +803,8 @@ impl IoLoop {
                         self.ops[id] = Some(FioOp::Read(data));
                     }
                     FioOp::Write(data) => {
+                        submitted += 1;
+
                         let id = ids.pop_front().unwrap();
                         let offset = data.pg_idx * self.page_size as u64;
 
@@ -785,13 +843,19 @@ impl IoLoop {
                         self.ops[id] = Some(FioOp::Write(data));
                     }
                     FioOp::Commit(data) => {
-                        // TODO: combine fsyncs and move to back of batch
+                        if commit_batch.is_empty() {
+                            submitted += 1;
+                        }
+                        commit_batch.push(data);
+                    }
+                    FioOp::CommitFlush(data) => {
+                        submitted += 1;
 
                         let id = ids.pop_front().unwrap();
                         let fsync = io_uring::opcode::Fsync::new(io_uring::types::Fd(self.fd))
                             .build()
                             .user_data(id as u64)
-                            .flags(io_uring::squeue::Flags::IO_DRAIN);
+                            .flags(io_uring::squeue::Flags::IO_DRAIN); // wait for all pending operations
                         unsafe {
                             self.ring
                                 .submission()
@@ -800,7 +864,12 @@ impl IoLoop {
                         }
                         self.ops[id] = Some(FioOp::Commit(data));
                     }
+                    FioOp::CommitBatch(_) => {
+                        eprintln!("CommitBatch should never be submitted to queue directly");
+                    }
                     FioOp::Alloc(data) => {
+                        submitted += 1;
+
                         let id = ids.pop_front().unwrap();
                         let alloc = io_uring::opcode::Fallocate::new(
                             io_uring::types::Fd(self.fd),
@@ -818,6 +887,22 @@ impl IoLoop {
                         self.ops[id] = Some(FioOp::Alloc(data));
                     }
                 }
+            }
+
+            if !commit_batch.is_empty() {
+                let taken_batch = std::mem::take(&mut commit_batch);
+
+                let id = ids.pop_front().unwrap();
+                let fsync = io_uring::opcode::Fsync::new(io_uring::types::Fd(self.fd))
+                    .build()
+                    .user_data(id as u64);
+                unsafe {
+                    self.ring
+                        .submission()
+                        .push(&fsync)
+                        .context("Failed to push fsync entry onto submission queue")?;
+                }
+                self.ops[id] = Some(FioOp::CommitBatch(taken_batch));
             }
 
             if !self.ring.submission().is_empty() {
@@ -875,7 +960,8 @@ impl IoLoop {
                     Some(FioOp::Write(_)) => {
                         // no-op
                     }
-                    Some(FioOp::Commit(CommitData { state, waker })) => {
+                    Some(FioOp::Commit(CommitData { state, waker }))
+                    | Some(FioOp::CommitFlush(CommitData { state, waker })) => {
                         if cqe.result() >= 0 {
                             state
                                 .get()
@@ -887,6 +973,21 @@ impl IoLoop {
                                 .store(GenericOpState::Err as u32, Ordering::Release);
                         }
                         waker.wake();
+                    }
+                    Some(FioOp::CommitBatch(data)) => {
+                        for CommitData { state, waker } in data {
+                            if cqe.result() >= 0 {
+                                state
+                                    .get()
+                                    .store(GenericOpState::Ready as u32, Ordering::Release);
+                            } else {
+                                eprintln!("Commit failed with error: {}", cqe.result());
+                                state
+                                    .get()
+                                    .store(GenericOpState::Err as u32, Ordering::Release);
+                            }
+                            waker.wake();
+                        }
                     }
                     Some(FioOp::Alloc(AllocData { len, waker, state })) => {
                         if cqe.result() >= 0 {
