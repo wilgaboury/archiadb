@@ -29,8 +29,8 @@ use rustix::fs::fstatvfs;
 pub const MIN_PAGE_SIZE: u64 = 4096; // smallest supported page size and most common filesystem block size
 pub const MAX_PAGE_SIZE: u64 = 65536;
 
-const DEFAULT_SQ_SIZE: usize = 128;
-const DEFAULT_CQ_SIZE: usize = 256;
+pub const DEFAULT_SQ_SIZE: usize = 128;
+pub const DEFAULT_CQ_SIZE: usize = 256;
 const IO_URING_SPIN_LIMIT: u64 = 32;
 
 enum FioOp {
@@ -213,10 +213,20 @@ impl Drop for PoolBuf {
 #[bon]
 impl Fio {
     #[builder]
-    pub fn new<P: AsRef<Path>>(
+    pub fn builder<P: AsRef<Path>>(
         path: P,
         #[builder(default = DEFAULT_SQ_SIZE)] sq: usize,
         #[builder(default = DEFAULT_CQ_SIZE)] cq: usize,
+        page_buf_pool: Option<usize>,
+        generic_op_state_pool: Option<usize>,
+    ) -> Result<Self> {
+        Self::new(path, sq, cq, page_buf_pool, generic_op_state_pool)
+    }
+
+    pub fn new<P: AsRef<Path>>(
+        path: P,
+        sq: usize,
+        cq: usize,
         page_buf_pool: Option<usize>,
         generic_op_state_pool: Option<usize>,
     ) -> Result<Self> {
