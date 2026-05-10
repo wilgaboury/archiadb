@@ -8,8 +8,9 @@ use std::{
 
 use crate::alloc::PageAllocator;
 
+/// Tracks all currently running transactions and ensures that freeing of pages is deferred until no transactions reference them.
 struct TxnMap {
-    next: AtomicU64,
+    next: AtomicU64, // TODO: does not need to be an atomic
     defer: Mutex<BTreeMap<u64, Vec<u64>>>,
     alloc: Arc<PageAllocator>,
 }
@@ -51,7 +52,7 @@ impl Drop for TxnMapGuard<'_> {
     fn drop(&mut self) {
         let free_pgs = {
             let mut defer_map = self.map.defer.lock().unwrap();
-            // Add blocks to last transaction, since we can garuntee there will be no references to freed blocks after it finishes
+            // Add pages to last transaction, since we can garuntee there will be no references to freed pages after it finishes
             let last_txn = defer_map.iter_mut().next_back();
             match last_txn {
                 Some((_, defer)) => defer.append(&mut self.free),
@@ -67,12 +68,12 @@ impl Drop for TxnMapGuard<'_> {
                 let next_back = defer_map.range_mut(..self.id).next_back();
                 match next_back {
                     Some((_, prev_defer)) => {
-                        // Move blocks to previous transaction, so they can be freed when it finishes
+                        // Move pages to previous transaction, so they can be freed when it finishes
                         prev_defer.append(&mut defer);
                         None
                     }
                     None => {
-                        // No previous transactions exist which could reference these blocks, so we can free them
+                        // No previous transactions exist which could reference these pages, so we can free them
                         Some(defer)
                     }
                 }
