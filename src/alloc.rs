@@ -292,6 +292,17 @@ impl PageAllocator {
         seg.bitfield[in_seg_idx as usize].fetch_and(mask, Ordering::Relaxed);
     }
 
+    pub fn is_free(&self, pg_idx: u64) -> bool {
+        let pg_idx = self.remove_headers_from_page_index(pg_idx);
+        let x_seg_idx = pg_idx / BITS_PER_UNIT;
+        let seg_idx = x_seg_idx / SEGMENT_LEN;
+        let in_seg_idx = x_seg_idx % SEGMENT_LEN;
+        let seg = &self.segments[seg_idx as usize];
+        let seg = unsafe { &*seg.load(Ordering::Acquire) };
+        let mask = 1u64 << (pg_idx % 64);
+        (seg.bitfield[in_seg_idx as usize].load(Ordering::Acquire) & mask) == 0
+    }
+
     async fn flush(&self, chunk_idx: u64, ver_to_flush: u64) -> Result<()> {
         let loc = chunk_idx * self.pages_per_chunk() / BITS_PER_UNIT;
         let seg_idx = (loc / SEGMENT_LEN as u64) as usize;

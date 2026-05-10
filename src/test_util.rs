@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
-use crate::fio::Fio;
+use crate::{alloc::PageAllocator, fio::Fio};
 
 pub struct TempDir {
     path: PathBuf,
@@ -34,6 +34,10 @@ impl TempDir {
             .page_buf_pool(2)
             .path(self.path.join(path.as_ref()))
             .build()
+    }
+
+    pub async fn alloc<P: AsRef<Path>>(&self, path: P) -> Result<PageAllocator> {
+        PageAllocator::new(self.fio(path)?).await
     }
 }
 
