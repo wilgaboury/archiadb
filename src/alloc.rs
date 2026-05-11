@@ -254,7 +254,7 @@ impl PageAllocator {
             let mask = 1u64 << free_idx;
             let old = seg.bitfield[in_seg_idx].fetch_or(mask, Ordering::Relaxed);
             if old & mask == 0 {
-                let old = self.num_allocs.fetch_add(1, Ordering::Relaxed);
+                self.num_allocs.fetch_add(1, Ordering::Relaxed);
                 let pg_idx_no_head = free_idx as u64 + (x_seg_idx as u64 * 64);
                 let chunk_idx = pg_idx_no_head / self.pages_per_chunk();
                 let pg_idx = self.add_headers_to_page_index(pg_idx_no_head);
