@@ -1026,7 +1026,6 @@ impl IoLoop {
     }
 }
 
-// TODO: change to u64
 pub fn choose_page_size<P: AsRef<Path>>(path: P) -> Result<usize> {
     let file = File::open(path)?;
     let fd = file.as_fd();
