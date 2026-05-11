@@ -87,11 +87,7 @@ where
 {
     fn clone(&self) -> Self {
         let inner = unsafe { self.inner.as_ref() };
-        inner
-            .maps
-            .counts
-            .entry(inner.key.clone())
-            .and_modify(|c| *c += 1);
+        inner.maps.counts.alter(&inner.key, |_, c| c + 1);
         self.raw_clone()
     }
 }
@@ -128,17 +124,18 @@ where
             .maps
             .values
             .remove_if(&inner.key, |k, _| {
-                inner
-                    .maps
-                    .counts
-                    .get(&k)
-                    .map(|r| *r.value() == 1)
-                    .unwrap_or(false)
+                if let Some(mut v) = inner.maps.counts.get_mut(&k) {
+                    *v -= 1;
+                    *v == 0
+                } else {
+                    eprintln!("Warning: ConCache count missing for during drop");
+                    false
+                }
             })
             .is_some();
 
         if removed {
-            inner.maps.counts.remove_if(&inner.key, |_, v| *v == 1);
+            inner.maps.counts.remove_if(&inner.key, |_, v| *v == 0);
             let owned = unsafe { Box::from_raw(self.inner.as_ptr()) };
             drop(owned);
         }
