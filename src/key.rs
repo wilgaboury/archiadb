@@ -16,7 +16,7 @@ impl KeyPathBuf {
     pub fn append(&mut self, slice: &[u8]) {
         let len = slice.len();
         if len > MAX_KEY_SIZE {
-            eprintln!("Cannot add slice that is larger than key simit to buffer");
+            eprintln!("Cannot add slice that is larger than key limit to buffer");
         } else {
             self.data.push(len as u8);
             self.data.extend_from_slice(slice);
