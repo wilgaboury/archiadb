@@ -1,5 +1,6 @@
 use crate::util::MAX_KEY_SIZE;
 
+/// Simple encoding of a key path as a sequence of length-prefixed byte slices
 #[derive(Debug, PartialEq, Eq, Hash, Clone, PartialOrd, Ord)]
 struct KeyPathBuf {
     data: Vec<u8>,

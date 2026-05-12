@@ -11,7 +11,7 @@ macro_rules! const_assert {
     };
 }
 
-pub const MAX_KEY_SIZE: usize = 255;
+pub const MAX_KEY_SIZE: usize = u8::MAX as usize;
 pub const MIN_PAGE_SIZE: u64 = 4096; // 4kb
 pub const MAX_PAGE_SIZE: u64 = 65536; // 64kb
 
