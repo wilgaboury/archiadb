@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{clone, path::Path, sync::Arc};
 
 use anyhow::Result;
 use bon::bon;
@@ -8,7 +8,12 @@ use crate::{
     fio::{DEFAULT_CQ_SIZE, DEFAULT_SQ_SIZE, Fio},
 };
 
+#[derive(Clone)]
 struct Db {
+    inner: Arc<Inner>,
+}
+
+struct Inner {
     alloc: PageAllocator,
     fio: Fio,
 }
@@ -25,6 +30,16 @@ impl Db {
     ) -> Result<Self> {
         let fio = Fio::new(path, sq, cq, page_buf_pool, generic_op_state_pool)?;
         let alloc = PageAllocator::new(fio.clone()).await?;
-        Ok(Self { alloc, fio })
+        Ok(Self {
+            inner: Arc::new(Inner { alloc, fio }),
+        })
     }
+
+    pub fn txn(&self) -> TxnBuilder {
+        TxnBuilder { db: self.clone() }
+    }
+}
+
+struct TxnBuilder {
+    db: Db,
 }
