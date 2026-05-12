@@ -1,8 +1,10 @@
+use std::borrow::Borrow;
+
 use crate::util::MAX_KEY_SIZE;
 
 /// Simple encoding of a key path as a sequence of length-prefixed byte slices
 #[derive(Debug, PartialEq, Eq, Hash, Clone, PartialOrd, Ord)]
-struct KeyPathBuf {
+pub struct KeyPathBuf {
     data: Vec<u8>,
 }
 
@@ -26,21 +28,49 @@ impl KeyPathBuf {
     }
 }
 
+impl AsRef<KeyPath> for KeyPathBuf {
+    fn as_ref(&self) -> &KeyPath {
+        self.as_path()
+    }
+}
+
+impl Borrow<KeyPath> for KeyPathBuf {
+    fn borrow(&self) -> &KeyPath {
+        self.as_path()
+    }
+}
+
+impl Default for KeyPathBuf {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[repr(transparent)]
+pub struct KeyPath {
+    data: [u8],
+}
+
+impl KeyPath {
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.data
+    }
+}
+
 impl AsRef<KeyPath> for KeyPath {
     fn as_ref(&self) -> &KeyPath {
         self
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-#[repr(transparent)]
-struct KeyPath {
-    data: [u8],
-}
+impl ToOwned for KeyPath {
+    type Owned = KeyPathBuf;
 
-impl Default for KeyPathBuf {
-    fn default() -> Self {
-        Self::new()
+    fn to_owned(&self) -> Self::Owned {
+        KeyPathBuf {
+            data: self.data.to_vec(),
+        }
     }
 }
 
@@ -83,10 +113,68 @@ impl<'a> IntoIterator for &'a KeyPathBuf {
     }
 }
 
-impl AsRef<KeyPath> for KeyPathBuf {
-    fn as_ref(&self) -> &KeyPath {
-        self.as_path()
+impl<'a> IntoIterator for &'a KeyPath {
+    type Item = &'a [u8];
+    type IntoIter = KeyPathIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        KeyPathIter {
+            data: &self.data,
+            index: 0,
+        }
     }
+}
+
+/// Creates a `&'static KeyPath` from a list of byte slices.
+///
+/// ```
+/// # use archiadb::key_path;
+/// # use archiadb::key::KeyPath;
+/// let path = key_path![b"hello", b"world", b"!"];
+/// ```
+///
+/// ```compile_fail
+/// # use archiadb::key_path;
+/// # use archiadb::key::KeyPath;
+/// // This should fail because the slice is longer than MAX_KEY_SIZE
+/// const LONG: &[u8] = &[0u8; 256];
+/// let path = key_path![LONG];
+/// ```
+#[macro_export]
+macro_rules! key_path {
+    ($($slice:expr),* $(,)?) => {{
+        const INPUTS: &[&[u8]] = &[$($slice),*];
+        const TOTAL_LEN: usize = {
+            let mut sum = 0;
+            let mut i = 0;
+            while i < INPUTS.len() {
+                let len = INPUTS[i].len();
+                assert!(len <= $crate::util::MAX_KEY_SIZE);
+                sum += 1 + len;
+                i += 1;
+            }
+            sum
+        };
+        const PACKED: [u8; TOTAL_LEN] = {
+            let mut arr = [0u8; TOTAL_LEN];
+            let mut pos = 0;
+            let mut i = 0;
+            while i < INPUTS.len() {
+                let slice = INPUTS[i];
+                arr[pos] = slice.len() as u8;
+                pos += 1;
+                let mut j = 0;
+                while j < slice.len() {
+                    arr[pos + j] = slice[j];
+                    j += 1;
+                }
+                pos += slice.len();
+                i += 1;
+            }
+            arr
+        };
+        unsafe { &*(&PACKED as *const [u8] as *const KeyPath) }
+    }};
 }
 
 #[cfg(test)]
@@ -103,6 +191,9 @@ mod tests {
         buf.append(b"rust");
 
         let slices: Vec<&[u8]> = buf.into_iter().collect();
+        assert_eq!(slices, vec![b"hello" as &[u8], b"world", b"rust"]);
+
+        let slices: Vec<&[u8]> = buf.as_path().into_iter().collect();
         assert_eq!(slices, vec![b"hello" as &[u8], b"world", b"rust"]);
 
         let path_ref: &KeyPath = buf.as_ref();
@@ -134,5 +225,34 @@ mod tests {
         // Empty buffer iteration
         let empty_buf = KeyPathBuf::new();
         assert!(empty_buf.into_iter().next().is_none());
+    }
+
+    #[test]
+    fn test_key_path_macro() {
+        const PATH: &KeyPath = key_path![b"hello", b"world", b"!"];
+
+        // Expected packed format:
+        // len=5, b'h','e','l','l','o'
+        // len=5, b'w','o','r','l','d'
+        // len=1, b'!'
+        let expected_bytes: &[u8] = &[
+            5, b'h', b'e', b'l', b'l', b'o', 5, b'w', b'o', b'r', b'l', b'd', 1, b'!',
+        ];
+
+        assert_eq!(PATH.as_bytes(), expected_bytes);
+    }
+
+    #[test]
+    fn test_to_owned() {
+        let static_path = key_path![b"foo", b"bar"];
+        let owned: KeyPathBuf = static_path.to_owned();
+
+        // The owned path should contain the same packed data
+        assert_eq!(owned.data, static_path.as_bytes());
+
+        // Iteration over both should yield the same segments
+        let static_segments: Vec<&[u8]> = static_path.into_iter().collect();
+        let owned_segments: Vec<&[u8]> = owned.into_iter().collect();
+        assert_eq!(static_segments, owned_segments);
     }
 }
