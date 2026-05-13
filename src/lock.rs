@@ -10,7 +10,7 @@ use crate::intrusive::{IntrusiveList, IntrusiveListNode};
 
 #[derive(Debug, Clone, Copy)]
 #[repr(u16)]
-enum LockType {
+pub(crate) enum LockType {
     Read = 0,       // acquire node for reading
     ReadChildWrite, // acquire node for reading with intent to modify child/descendant nodes
     ReadRecursive, // acquire exclusively for reading and prevent any write or child write aquisitions

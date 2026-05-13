@@ -2,6 +2,8 @@ use std::borrow::Borrow;
 
 use crate::util::MAX_KEY_SIZE;
 
+// TODO: implement an KeyPathIdxBuf, that has indexes so that pushing and popping is more efficient.
+
 /// Simple encoding of a key path as a sequence of length-prefixed byte slices
 #[derive(Debug, PartialEq, Eq, Hash, Clone, PartialOrd, Ord)]
 pub struct KeyPathBuf {

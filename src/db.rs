@@ -1,11 +1,13 @@
-use std::{path::Path, sync::Arc};
+use std::{collections::BTreeMap, path::Path, sync::Arc};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use bon::bon;
 
 use crate::{
     alloc::PageAllocator,
     fio::{DEFAULT_CQ_SIZE, DEFAULT_SQ_SIZE, Fio},
+    key::KeyPath,
+    lock::LockType,
 };
 
 #[derive(Clone)]
@@ -36,10 +38,90 @@ impl Db {
     }
 
     pub fn txn(&self) -> TxnBuilder {
-        TxnBuilder { db: self.clone() }
+        TxnBuilder {
+            db: self.clone(),
+            ops: TxnKeyTrie::Leaf,
+        }
     }
 }
 
 struct TxnBuilder {
     db: Db,
+    ops: TxnKeyTrie,
+}
+
+impl TxnBuilder {
+    pub fn read(mut self, path: &KeyPath) -> Result<Self> {
+        self.ops.insert(path, LockType::Read, LockType::Read);
+        Ok(self)
+    }
+
+    pub fn write(mut self, path: &KeyPath) -> Result<Self> {
+        self.ops
+            .insert(path, LockType::ReadChildWrite, LockType::Write);
+        Ok(self)
+    }
+
+    pub fn read_recur(mut self, path: &KeyPath) -> Self {
+        self.ops
+            .insert(path, LockType::Read, LockType::ReadRecursive);
+        self
+    }
+}
+
+// TODO: implement an iterator
+
+/// Benefit of tries is that it automatically merges common prefixes, detects conflicts, and is correctly sorted for locking.
+enum TxnKeyTrie {
+    Inner(TxnKeyTrieInner),
+    Leaf,
+}
+
+struct TxnKeyTrieInner {
+    children: BTreeMap<Vec<u8>, (LockType, TxnKeyTrie)>,
+}
+
+impl TxnKeyTrie {
+    fn insert(&mut self, path: &KeyPath, inner_lock_type: LockType, leaf_lock_type: LockType) {
+        let mut node = self;
+        let mut iter = path.into_iter().peekable();
+        while let Some(key) = iter.next() {
+            let lock_type = if iter.peek().is_none() {
+                leaf_lock_type
+            } else {
+                inner_lock_type
+            };
+
+            let content: &mut TxnKeyTrieInner = match node {
+                TxnKeyTrie::Inner(content) => content,
+                TxnKeyTrie::Leaf => {
+                    *node = TxnKeyTrie::Inner(TxnKeyTrieInner {
+                        children: BTreeMap::new(),
+                    });
+                    match node {
+                        TxnKeyTrie::Inner(content) => content,
+                        TxnKeyTrie::Leaf => unreachable!(),
+                    }
+                }
+            };
+
+            if content.children.contains_key(key) {
+                let (existing_lock_type, child) = content.children.get_mut(key).unwrap();
+                // TODO: add full key path to error message
+                *existing_lock_type = existing_lock_type
+                    .is_compatible(&lock_type)
+                    .context(format!(
+                        "Lock type conflict for key {:?}: existing {:?}, new {:?}",
+                        key, existing_lock_type, lock_type
+                    ))
+                    .unwrap();
+                node = child;
+            } else {
+                content
+                    .children
+                    .insert(key.to_owned(), (lock_type, TxnKeyTrie::Leaf));
+                node = &mut content.children.get_mut(key).unwrap().1;
+            }
+        }
+    }
 }
