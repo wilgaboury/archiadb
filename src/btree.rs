@@ -50,7 +50,7 @@ const_assert!(size_of::<BtreeRootHeader>() + CHECKSUM_SIZE < MIN_PAGE_SIZE as us
 /// Leaf node layout:
 /// - header
 /// - slots: [u32; len]
-/// - data: [u8], grows backward, interleaved (key_len, key, value)
+/// - data: [u8], grows backward, interleaved key and value
 /// - checksum: u32
 
 #[derive(Unaligned, FromBytes, IntoBytes, Debug, KnownLayout, Immutable, Clone)]
