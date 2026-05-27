@@ -1,32 +1,51 @@
 use std::borrow::Borrow;
 
-use crate::util::MAX_KEY_SIZE;
-
-// TODO: implement an KeyPathIdxBuf, that has indexes so that pushing and popping is more efficient.
+use crate::util::{MAX_KEY_PATH_LEN, MAX_KEY_SIZE};
 
 /// Simple encoding of a key path as a sequence of length-prefixed byte slices
-#[derive(Debug, PartialEq, Eq, Hash, Clone, PartialOrd, Ord)]
+///
+/// first byte is length
+#[derive(Debug, Hash, Clone, PartialEq, Eq)]
 pub struct KeyPathBuf {
     data: Vec<u8>,
 }
 
 impl KeyPathBuf {
     pub fn new() -> Self {
-        Self { data: Vec::new() }
+        Self { data: vec![0] }
     }
 
     pub fn append(&mut self, slice: &[u8]) {
-        let len = slice.len();
-        if len > MAX_KEY_SIZE {
+        let part_len = slice.len();
+        if self.len() == MAX_KEY_PATH_LEN {
+            eprintln!("Key path is at limit of length")
+        } else if part_len > MAX_KEY_SIZE {
             eprintln!("Cannot add slice that is larger than key limit to buffer");
         } else {
-            self.data.push(len as u8);
+            self.data[0] += 1;
+            self.data.push(part_len as u8);
             self.data.extend_from_slice(slice);
         }
     }
 
     pub fn as_path(&self) -> &KeyPath {
         unsafe { &*(self.data.as_slice() as *const [u8] as *const KeyPath) }
+    }
+
+    pub fn len(&self) -> usize {
+        self.data[0] as usize
+    }
+}
+
+impl Ord for KeyPathBuf {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.as_path().cmp(other.as_path())
+    }
+}
+
+impl PartialOrd for KeyPathBuf {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -48,15 +67,33 @@ impl Default for KeyPathBuf {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 #[repr(transparent)]
 pub struct KeyPath {
     data: [u8],
 }
 
 impl KeyPath {
+    pub fn len(&self) -> usize {
+        self.data[0] as usize
+    }
+
     pub fn as_bytes(&self) -> &[u8] {
         &self.data
+    }
+}
+
+impl Ord for KeyPath {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.len()
+            .cmp(&other.len())
+            .then_with(|| self.into_iter().cmp(other.into_iter()))
+    }
+}
+
+impl PartialOrd for KeyPath {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -110,7 +147,7 @@ impl<'a> IntoIterator for &'a KeyPathBuf {
     fn into_iter(self) -> Self::IntoIter {
         KeyPathIter {
             data: &self.data,
-            index: 0,
+            index: 1,
         }
     }
 }
@@ -122,7 +159,7 @@ impl<'a> IntoIterator for &'a KeyPath {
     fn into_iter(self) -> Self::IntoIter {
         KeyPathIter {
             data: &self.data,
-            index: 0,
+            index: 1,
         }
     }
 }
@@ -155,11 +192,13 @@ macro_rules! key_path {
                 sum += 1 + len;
                 i += 1;
             }
-            sum
+            sum + 1
         };
         const PACKED: [u8; TOTAL_LEN] = {
             let mut arr = [0u8; TOTAL_LEN];
-            let mut pos = 0;
+            arr[0] = INPUTS.len() as u8;
+
+            let mut pos = 1;
             let mut i = 0;
             while i < INPUTS.len() {
                 let slice = INPUTS[i];
@@ -186,7 +225,8 @@ mod tests {
     #[test]
     fn test_happy_path_and_asref() {
         let mut buf = KeyPathBuf::new();
-        assert!(buf.data.is_empty());
+        assert_eq!(0, buf.len());
+        assert_eq!(1, buf.data.len());
 
         buf.append(b"hello");
         buf.append(b"world");
@@ -203,7 +243,8 @@ mod tests {
         assert_eq!(path_ref as *const _, same_path_ref as *const _);
 
         let default_buf = KeyPathBuf::default();
-        assert!(default_buf.data.is_empty());
+        assert_eq!(0, default_buf.len());
+        assert_eq!(1, default_buf.data.len());
     }
 
     #[test]
@@ -212,13 +253,14 @@ mod tests {
 
         let large_slice = vec![0u8; 300];
         buf.append(&large_slice);
-        assert!(buf.data.is_empty());
+        assert_eq!(0, buf.len());
+        assert_eq!(1, buf.data.len());
 
         buf.append(b"ok");
-        assert_eq!(buf.data, vec![2, b'o', b'k']);
+        assert_eq!(buf.data, vec![1, 2, b'o', b'k']);
 
         // Corrupt by changing the first length byte to 100
-        buf.data[0] = 100;
+        buf.data[1] = 100;
 
         let iter = buf.into_iter();
         // The iterator should detect corruption and return None (and print a warning).
@@ -234,11 +276,12 @@ mod tests {
         const PATH: &KeyPath = key_path![b"hello", b"world", b"!"];
 
         // Expected packed format:
+        // path len=3
         // len=5, b'h','e','l','l','o'
         // len=5, b'w','o','r','l','d'
         // len=1, b'!'
         let expected_bytes: &[u8] = &[
-            5, b'h', b'e', b'l', b'l', b'o', 5, b'w', b'o', b'r', b'l', b'd', 1, b'!',
+            3, 5, b'h', b'e', b'l', b'l', b'o', 5, b'w', b'o', b'r', b'l', b'd', 1, b'!',
         ];
 
         assert_eq!(PATH.as_bytes(), expected_bytes);
