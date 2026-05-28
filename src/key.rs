@@ -220,6 +220,8 @@ macro_rules! key_path {
 
 #[cfg(test)]
 mod tests {
+    use std::cmp::Ordering;
+
     use super::*;
 
     #[test]
@@ -299,5 +301,48 @@ mod tests {
         let static_segments: Vec<&[u8]> = static_path.into_iter().collect();
         let owned_segments: Vec<&[u8]> = owned.into_iter().collect();
         assert_eq!(static_segments, owned_segments);
+    }
+
+    #[test]
+    fn test_key_path_ordering_comprehensive() {
+        // Create various paths for testing
+        let path_a1 = key_path![b"a"];
+        let path_a2 = key_path![b"a"];
+        let path_b = key_path![b"b"];
+        let path_ab = key_path![b"a", b"b"];
+        let path_ac = key_path![b"a", b"c"];
+        let path_aba = key_path![b"a", b"b", b"a"];
+        let path_abb = key_path![b"a", b"b", b"b"];
+
+        // Test KeyPath ordering
+        assert_eq!(path_a1.cmp(path_a2), Ordering::Equal);
+        assert_eq!(path_a1.cmp(path_b), Ordering::Less);
+        assert_eq!(path_b.cmp(path_a1), Ordering::Greater);
+        assert_eq!(path_a1.cmp(path_ab), Ordering::Less);
+        assert_eq!(path_ab.cmp(path_a1), Ordering::Greater);
+        assert_eq!(path_ab.cmp(path_ac), Ordering::Less);
+        assert_eq!(path_ab.cmp(path_aba), Ordering::Less);
+        assert_eq!(path_aba.cmp(path_abb), Ordering::Less);
+
+        // Test KeyPathBuf ordering (delegates to KeyPath)
+        let mut buf_a1 = KeyPathBuf::new();
+        let mut buf_a2 = KeyPathBuf::new();
+        let mut buf_b = KeyPathBuf::new();
+        let mut buf_ab = KeyPathBuf::new();
+
+        buf_a1.append(b"a");
+        buf_a2.append(b"a");
+        buf_b.append(b"b");
+        buf_ab.append(b"a");
+        buf_ab.append(b"b");
+
+        assert_eq!(buf_a1.cmp(&buf_a2), Ordering::Equal);
+        assert_eq!(buf_a1.cmp(&buf_b), Ordering::Less);
+        assert_eq!(buf_a1.cmp(&buf_ab), Ordering::Less);
+        assert_eq!(buf_ab.cmp(&buf_a1), Ordering::Greater);
+
+        // Test PartialOrd
+        assert_eq!(path_a1.partial_cmp(path_a2), Some(Ordering::Equal));
+        assert_eq!(buf_a1.partial_cmp(&buf_a2), Some(Ordering::Equal));
     }
 }
