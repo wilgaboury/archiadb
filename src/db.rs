@@ -241,6 +241,17 @@ mod tests {
         ];
 
         assert_eq!(expected.to_vec(), results);
+
+        let expected_keys = [
+            key_path![].to_owned(),
+            key_path![b"a"].to_owned(),
+            key_path![b"b"].to_owned(),
+            key_path![b"a", b"b"].to_owned(),
+            key_path![b"a", b"c"].to_owned(),
+        ];
+        let mut keys: Vec<KeyPathBuf> = results.iter().map(|(key, _)| key.clone()).collect();
+        keys.sort();
+        assert_eq!(expected_keys.to_vec(), keys);
     }
 
     // #[test]
