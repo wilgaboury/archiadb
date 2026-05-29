@@ -88,9 +88,9 @@ impl TxnKeyTrie {
         Self { root: None }
     }
 
-    // fn level_order_iter(&self) -> TxnKeyTrieLevelIterator<'_> {
-    //     TxnKeyTrieLevelIterator::new(self)
-    // }
+    fn level_order_iter(&self) -> TxnKeyTrieLevelIterator<'_> {
+        TxnKeyTrieLevelIterator::new(self)
+    }
 }
 
 struct TxnKeyTrieInner {
@@ -142,7 +142,7 @@ impl TxnKeyTrie {
 
             node = if node.children.contains_key(key) {
                 let next = node.children.get_mut(key).unwrap();
-                node.lock_type = node
+                next.lock_type = next
                     .lock_type
                     .is_compatible(&next_lock_type)
                     .context("incompatible lock types")?;
@@ -163,43 +163,38 @@ impl TxnKeyTrie {
     }
 }
 
-// struct TxnKeyTrieLevelIterator<'a> {
-//     queue: VecDeque<(KeyPathBuf, &'a TxnKeyTrie)>,
-// }
+struct TxnKeyTrieLevelIterator<'a> {
+    queue: VecDeque<(KeyPathBuf, &'a TxnKeyTrieNode)>,
+}
 
-// impl<'a> TxnKeyTrieLevelIterator<'a> {
-//     fn new(root: &'a TxnKeyTrie) -> Self {
-//         let mut queue = VecDeque::new();
-//         queue.push_back((KeyPathBuf::new(), root));
-//         Self { queue }
-//     }
-// }
+impl<'a> TxnKeyTrieLevelIterator<'a> {
+    fn new(trie: &'a TxnKeyTrie) -> Self {
+        let mut queue = VecDeque::new();
+        if let Some(root) = trie.root.as_ref() {
+            queue.push_back((KeyPathBuf::new(), root));
+        }
+        Self { queue }
+    }
+}
 
-// impl<'a> Iterator for TxnKeyTrieLevelIterator<'a> {
-//     type Item = (KeyPathBuf, LockType);
+impl<'a> Iterator for TxnKeyTrieLevelIterator<'a> {
+    type Item = (KeyPathBuf, LockType);
 
-//     fn next(&mut self) -> Option<Self::Item> {
-//         while let Some((path, node)) = self.queue.pop_front() {
-//             match node {
-//                 TxnKeyTrie::Node(lock_type, inner) => {
-//                     let result = Some((path.clone(), *lock_type));
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some((path, node)) = self.queue.pop_front() {
+            let result = Some((path.clone(), node.lock_type));
 
-//                     for (key_segment, child_node) in &inner.children {
-//                         let mut child_path = path.clone();
-//                         child_path.append(key_segment);
-//                         self.queue.push_back((child_path, child_node));
-//                     }
+            for (key_segment, child_node) in &node.children {
+                let mut child_path = path.clone();
+                child_path.append(key_segment);
+                self.queue.push_back((child_path, child_node));
+            }
 
-//                     return result;
-//                 }
-//                 TxnKeyTrie::None => {
-//                     // no-op
-//                 }
-//             }
-//         }
-//         None
-//     }
-// }
+            return result;
+        }
+        None
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -226,41 +221,26 @@ mod tests {
         .unwrap();
         trie.insert(key_path![b"b"], LockType::Read, LockType::Read)
             .unwrap();
-        trie.insert(
-            key_path![b"a", b"b", b"d"],
-            LockType::ReadChildWrite,
-            LockType::Write,
-        )
-        .unwrap();
 
-        // let results: Vec<(Vec<Vec<u8>>, LockType)> = trie
-        //     .level_order_iter()
-        //     .map(|(path, lock_type)| {
-        //         let segments: Vec<Vec<u8>> = path.into_iter().map(|s| s.to_vec()).collect();
-        //         (segments, lock_type)
-        //     })
-        //     .collect();
+        assert!(matches!(
+            trie.insert(
+                key_path![b"a", b"b", b"d"],
+                LockType::ReadChildWrite,
+                LockType::Write,
+            ),
+            Err(_)
+        ));
 
-        // Level order should be:
-        // Level 0: empty path (LockType::Read from root)
-        // Level 1: [b"b"]
-        // Level 2: [b"a", b"b"], [b"a", b"c"]
-        // Level 3: [b"a", b"b", b"d"]
-        // assert_eq!(results.len(), 5);
+        let results: Vec<(KeyPathBuf, LockType)> = trie.level_order_iter().collect();
+        let expected = [
+            (key_path![].to_owned(), LockType::ReadChildWrite),
+            (key_path![b"a"].to_owned(), LockType::ReadChildWrite),
+            (key_path![b"b"].to_owned(), LockType::Read),
+            (key_path![b"a", b"b"].to_owned(), LockType::Write),
+            (key_path![b"a", b"c"].to_owned(), LockType::Write),
+        ];
 
-        // // Check empty path first
-        // assert_eq!(results[0].0, Vec::<Vec<u8>>::new());
-
-        // // Check first level (b)
-        // assert_eq!(results[1].0, vec![vec![b'b']]);
-
-        // // Check second level (a/b and a/c) - order depends on BTreeMap key ordering
-        // let second_level_paths: Vec<_> = results[2..4].iter().map(|(p, _)| p.clone()).collect();
-        // assert!(second_level_paths.contains(&vec![vec![b'a'], vec![b'b']]));
-        // assert!(second_level_paths.contains(&vec![vec![b'a'], vec![b'c']]));
-
-        // // Check third level
-        // assert_eq!(results[4].0, vec![vec![b'a'], vec![b'b'], vec![b'd']]);
+        assert_eq!(expected.to_vec(), results);
     }
 
     // #[test]
