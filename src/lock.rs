@@ -8,7 +8,7 @@ use std::{
 
 use crate::intrusive::{IntrusiveList, IntrusiveListNode};
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
 pub(crate) enum LockType {
     Read = 0,       // acquire node for reading
