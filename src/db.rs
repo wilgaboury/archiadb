@@ -56,20 +56,20 @@ struct TxnBuilder {
 
 impl TxnBuilder {
     pub fn read(mut self, path: &KeyPath) -> Result<Self> {
-        self.ops.insert(path, LockType::Read, LockType::Read);
+        self.ops.insert(path, LockType::Read, LockType::Read)?;
         Ok(self)
     }
 
     pub fn write(mut self, path: &KeyPath) -> Result<Self> {
         self.ops
-            .insert(path, LockType::ReadChildWrite, LockType::Write);
+            .insert(path, LockType::ReadChildWrite, LockType::Write)?;
         Ok(self)
     }
 
-    pub fn read_recur(mut self, path: &KeyPath) -> Self {
+    pub fn read_recur(mut self, path: &KeyPath) -> Result<Self> {
         self.ops
-            .insert(path, LockType::Read, LockType::ReadRecursive);
-        self
+            .insert(path, LockType::Read, LockType::ReadRecursive)?;
+        Ok(self)
     }
 }
 
