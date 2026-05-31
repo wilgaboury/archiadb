@@ -10,6 +10,7 @@ use crate::{
     fio::{DEFAULT_CQ_SIZE, DEFAULT_SQ_SIZE, Fio},
     key::{KeyPath, KeyPathBuf},
     lock::{Lock, LockGuard, LockType},
+    meta::MetaHandler,
     trie::TxnKeyTrie,
 };
 
@@ -19,6 +20,7 @@ struct Db {
 }
 
 struct Inner {
+    meta: MetaHandler,
     alloc: PageAllocator,
     fio: Fio,
     read_locks: ConCache<KeyPathBuf, Lock>,
@@ -99,6 +101,32 @@ impl TxnBuilder {
 struct Txn {
     db: Db,
     guards: Vec<LockGuard>,
+}
+
+impl Txn {
+    pub async fn read(&self, path: &KeyPath) -> &[u8] {
+        todo!()
+    }
+
+    pub async fn scan(
+        &self,
+        root: &KeyPath,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+    ) -> impl Iterator<Item = (KeyPathBuf, Vec<u8>)> {
+        todo!();
+        #[allow(unreachable_code)]
+        std::iter::empty()
+    }
+
+    pub async fn write(&mut self, path: &KeyPath, value: &[u8]) {
+        todo!()
+    }
+
+    pub async fn commit(&mut self) {
+        // collect write paths and then acquire in reverse/bottom-up order
+        todo!()
+    }
 }
 
 #[cfg(test)]
