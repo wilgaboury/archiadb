@@ -875,7 +875,6 @@ impl IoLoop {
                             io_uring::types::Fd(self.fd),
                             data.len * self.page_size as u64,
                         )
-                        .mode(libc::FALLOC_FL_ZERO_RANGE) // TODO: this doesn't work on btrfs, need to zero the chunk headers manually
                         .build()
                         .user_data(id as u64);
                         unsafe {

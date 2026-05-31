@@ -223,6 +223,11 @@ impl PageAllocator {
                 let headers = if len == 0 { NUM_HEADER_PAGES } else { 0 };
                 let new_len = len + headers + 1 + self.pages_per_chunk();
                 self.fio.alloc(new_len).await?;
+                {
+                    let mut buf = self.fio.get_buf();
+                    buf.get_mut().fill(0);
+                    self.fio.write(len + headers, buf).await?;
+                }
                 let adj_len = self.remove_headers_from_pages_len(new_len);
                 if (adj_len / BITS_PER_UNIT) / SEGMENT_LEN >= self.num_segs.load(Ordering::Relaxed)
                 {

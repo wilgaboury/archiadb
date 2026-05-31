@@ -1,10 +1,6 @@
-use std::{
-    collections::{BTreeMap, VecDeque},
-    path::Path,
-    sync::Arc,
-};
+use std::{path::Path, sync::Arc};
 
-use anyhow::{Context, Result, bail};
+use anyhow::Result;
 use bon::bon;
 use parking_lot::Mutex;
 
@@ -119,7 +115,7 @@ mod tests {
         let dir = TempDir::new(function_name!()).unwrap();
         let db = Db::builder().path(dir.path().join("file")).build().await?;
         {
-            let t1 = db.txn().read(key_path![b"key1"])?.begin().await;
+            let _t1 = db.txn().read(key_path![b"key1"])?.begin().await;
         }
 
         Ok(())
