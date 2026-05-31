@@ -20,6 +20,7 @@ function_name = "0.3.0"
 io-uring = "0.7"
 rustix = { version = "1.1.4", features = ["fs", "io_uring"] }
 libc = "0.2"
+parking_lot = "0.12.5"
 tokio = { version = "1", features = ["sync"] }
 zerocopy = { version = "0.8", features = ["derive"] }
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }

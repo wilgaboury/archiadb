@@ -19,6 +19,7 @@ dependencies = [
  "function_name",
  "io-uring",
  "libc",
+ "parking_lot",
  "rustix",
  "tokio",
  "xxhash-rust",

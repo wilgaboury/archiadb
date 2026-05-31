@@ -1,10 +1,12 @@
 use std::{
     collections::BTreeMap,
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicU64, Ordering},
     },
 };
+
+use parking_lot::Mutex;
 
 use crate::alloc::PageAllocator;
 
@@ -25,7 +27,7 @@ impl TxnMap {
     }
 
     fn begin(&self) -> TxnMapGuard<'_> {
-        let mut defer = self.defer.lock().unwrap();
+        let mut defer = self.defer.lock();
         let id = self.next.fetch_add(1, Ordering::AcqRel);
         defer.insert(id, Vec::with_capacity(0));
         TxnMapGuard {
@@ -51,7 +53,7 @@ impl TxnMapGuard<'_> {
 impl Drop for TxnMapGuard<'_> {
     fn drop(&mut self) {
         let free_pgs = {
-            let mut defer_map = self.map.defer.lock().unwrap();
+            let mut defer_map = self.map.defer.lock();
             // Add pages to last transaction, since we can garuntee there will be no references to freed pages after it finishes
             let last_txn = defer_map.iter_mut().next_back();
             match last_txn {
@@ -103,7 +105,7 @@ mod tests {
     use function_name::named;
 
     fn snapshot(map: &TxnMap) -> BTreeMap<u64, Vec<u64>> {
-        map.defer.lock().unwrap().clone()
+        map.defer.lock().clone()
     }
 
     #[named]

@@ -11,7 +11,7 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
     task::{self, Poll, Waker},
@@ -24,6 +24,7 @@ use bon::bon;
 use crossbeam::queue::{ArrayQueue, SegQueue};
 use io_uring::IoUring;
 use libc::{O_DIRECT, iovec};
+use parking_lot::Mutex;
 use rustix::fs::fstatvfs;
 
 pub const MIN_PAGE_SIZE: u64 = 4096; // smallest supported page size and most common filesystem block size
@@ -332,7 +333,7 @@ impl Fio {
             type Output = Result<PageBuf>;
 
             fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
-                let mut state = self.state.lock().unwrap();
+                let mut state = self.state.lock();
                 let cur = std::mem::replace(&mut *state, ReadState::Done);
                 match cur {
                     ReadState::Init => {
@@ -669,7 +670,7 @@ impl IoLoop {
         match op {
             FioOp::Read(ReadData { waker, state, .. }) => {
                 {
-                    let mut state = state.lock().unwrap();
+                    let mut state = state.lock();
                     *state = ReadState::Err;
                 }
                 waker.wake();
@@ -874,7 +875,7 @@ impl IoLoop {
                             io_uring::types::Fd(self.fd),
                             data.len * self.page_size as u64,
                         )
-                        .mode(libc::FALLOC_FL_ZERO_RANGE)
+                        .mode(libc::FALLOC_FL_ZERO_RANGE) // TODO: this doesn't work on btrfs, need to zero the chunk headers manually
                         .build()
                         .user_data(id as u64);
                         unsafe {
@@ -925,7 +926,7 @@ impl IoLoop {
                         state: result,
                     })) => {
                         {
-                            let mut inner = result.lock().unwrap();
+                            let mut inner = result.lock();
                             if cqe.result() >= 0 {
                                 if let PageBuf::Dynamic(buf) = &mut buf {
                                     buf.copy_from_slice(

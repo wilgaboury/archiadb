@@ -5,12 +5,11 @@ use dashmap::DashMap;
 /// Can be thought of like a keyed Arc. Values are retained in cache so long as there is
 /// at least one reference to it, and removed when no longer referenced. The effect is that
 /// for a given key, there is always exactly one value that all concurrent operation reference.
-struct ConCache<K, V, F>
+pub struct ConCache<K, V>
 where
     K: Hash + Eq + Clone,
-    F: Fn() -> V,
 {
-    create: F,
+    create: Box<dyn Fn() -> V>,
     maps: Arc<Maps<K, V>>,
 }
 
@@ -22,12 +21,11 @@ where
     values: DashMap<K, Carc<K, V>>,
 }
 
-impl<K, V, F> ConCache<K, V, F>
+impl<K, V> ConCache<K, V>
 where
     K: Hash + Eq + Clone,
-    F: Fn() -> V,
 {
-    pub fn new(create: F) -> Self {
+    pub fn new(create: Box<dyn Fn() -> V>) -> Self {
         Self {
             create,
             maps: Arc::new(Maps {
@@ -149,11 +147,14 @@ mod tests {
 
     #[test]
     fn single_key_lifecycle() {
-        let create_count = AtomicUsize::new(0);
-        let cache = ConCache::new(|| {
-            create_count.fetch_add(1, Ordering::SeqCst);
-            100
-        });
+        let create_count = Arc::new(AtomicUsize::new(0));
+        let cache = {
+            let create_count = create_count.clone();
+            ConCache::new(Box::new(move || {
+                create_count.fetch_add(1, Ordering::SeqCst);
+                100
+            }))
+        };
 
         let key = "test";
 

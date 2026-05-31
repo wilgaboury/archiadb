@@ -2,9 +2,11 @@ use std::{
     marker::PhantomPinned,
     pin::Pin,
     ptr,
-    sync::{Arc, Mutex},
+    sync::Arc,
     task::{Context, Poll, Waker},
 };
+
+use parking_lot::Mutex;
 
 use crate::intrusive::{IntrusiveList, IntrusiveListNode};
 
@@ -38,10 +40,19 @@ impl LockType {
             (Self::Write, Self::Write) => None,
         }
     }
+
+    pub fn inner_node_type(&self) -> Self {
+        match self {
+            Self::Read => Self::Read,
+            Self::ReadChildWrite => Self::ReadChildWrite,
+            Self::ReadRecursive => Self::Read,
+            Self::Write => Self::ReadChildWrite,
+        }
+    }
 }
 
 #[derive(Clone)]
-struct Lock {
+pub struct Lock {
     inner: Arc<Mutex<LockInner>>,
 }
 
@@ -67,7 +78,7 @@ enum LockFutureState {
     Gaurded,
 }
 
-struct LockFuture {
+pub struct LockFuture {
     lock: Lock,
     lock_type: LockType,
 
@@ -117,7 +128,7 @@ impl<'a> Future for LockFuture {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this_ptr = unsafe { self.get_unchecked_mut() } as *mut Self;
-        let mut inner = unsafe { &*this_ptr }.lock.inner.lock().unwrap();
+        let mut inner = unsafe { &*this_ptr }.lock.inner.lock();
         let this = unsafe { &mut *this_ptr };
         match &this.state {
             LockFutureState::Init => {
@@ -158,7 +169,7 @@ impl<'a> Future for LockFuture {
 
 impl Drop for LockFuture {
     fn drop(&mut self) {
-        let mut inner = unsafe { &*(self as *mut Self) }.lock.inner.lock().unwrap();
+        let mut inner = unsafe { &*(self as *mut Self) }.lock.inner.lock();
         self.remove(&inner);
         if matches!(self.state, LockFutureState::Acquired) {
             // lock was acquired but future was dropped before being polled
@@ -167,7 +178,7 @@ impl Drop for LockFuture {
     }
 }
 
-struct LockGuard {
+pub struct LockGuard {
     lock: Lock,
 }
 
@@ -178,14 +189,14 @@ impl Drop for LockGuard {
     fn drop(&mut self) {
         {
             // quickly decrement lock count
-            let mut inner = self.lock.inner.lock().unwrap();
+            let mut inner = self.lock.inner.lock();
             inner.locked -= 1;
         }
 
         // in a loop, first acquire spin lock then check if next future in queue can aquire lock
         loop {
             let waker: Waker = {
-                let mut inner = self.lock.inner.lock().unwrap();
+                let mut inner = self.lock.inner.lock();
                 if let Some(head) = inner.peek() {
                     let head = unsafe { &mut *head };
                     let next_lock_type = if inner.locked == 0 {
@@ -222,7 +233,7 @@ impl Drop for LockGuard {
     }
 }
 
-struct LockInner {
+pub struct LockInner {
     lock_type: LockType,
     locked: u32,
 
