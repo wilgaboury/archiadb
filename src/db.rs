@@ -20,7 +20,7 @@ struct Db {
 }
 
 struct Inner {
-    meta: MetaHandler,
+    // meta: MetaHandler,
     alloc: PageAllocator,
     fio: Fio,
     read_locks: ConCache<KeyPathBuf, Lock>,
@@ -37,10 +37,13 @@ impl Db {
         page_buf_pool: Option<usize>,
         generic_op_state_pool: Option<usize>,
     ) -> Result<Self> {
+        // TODO: add back once meta handler supports initialization
+        // let meta = MetaHandler::new(&path)?;
         let fio = Fio::new(path, sq, cq, page_buf_pool, generic_op_state_pool)?;
         let alloc = PageAllocator::new(fio.clone()).await?;
         Ok(Self {
             inner: Arc::new(Inner {
+                // meta,
                 alloc,
                 fio,
                 read_locks: ConCache::new(Box::new(|| Lock::new())),

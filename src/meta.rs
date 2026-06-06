@@ -1,54 +1,124 @@
-use std::path::Path;
+use std::{fs::File, os::unix::fs::FileExt, path::Path};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use tokio::sync::Mutex;
-use zerocopy::{
-    FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned,
-    native_endian::{U64, U128},
+
+use crate::{
+    const_assert,
+    fio::MIN_PAGE_SIZE,
+    util::{CHECKSUM_SIZE, has_valid_checksum},
 };
 
-use crate::{const_assert, fio::MIN_PAGE_SIZE, util::CHECKSUM_SIZE};
-
-const MAGIC: u128 = 0xa90e3b4b1b0833499933888e3933af0d; // Random GUID
-const FMT_VERSION: u64 = 0;
+type MagicType = u128;
+const MAGIC: MagicType = 0xa90e3b4b1b0833499933888e3933af0d; // Random GUID
+type FmtVersionType = u64;
+const FMT_VERSION: FmtVersionType = 0;
 const NUM_HEADER_PAGES: u64 = 2;
 
-#[derive(FromBytes, IntoBytes, Debug, KnownLayout, Immutable, Unaligned, Clone)]
-#[repr(C)]
+#[repr(C, packed)]
 pub struct Meta {
-    magic: U128,
+    magic: MagicType,
 
-    fmt_version: U64,
-    page_size: U64,
-    root1: U64,
-    root2: U64,
+    fmt_version: FmtVersionType,
+    page_size: u64,
+    root1: u64,
+    root2: u64,
 
-    version: U64,
+    version: u64,
     open: u8,
-    len: U64,
+    len: u64,
 }
 
 const_assert!(size_of::<Meta>() + CHECKSUM_SIZE < MIN_PAGE_SIZE as usize);
 
 pub struct MetaHandler {
-    fmt_version: U64,
-    page_size: U64,
-    root1: U64,
-    root2: U64,
+    fmt_version: FmtVersionType,
+    page_size: u64,
+    root1: u64,
+    root2: u64,
 
     inner: Mutex<Inner>,
 }
 
 struct Inner {
-    version: U64,
-    idx: usize,
-    front: Vec<u8>,
-    back: Vec<u8>,
+    version: u64,
+    index: usize,
+    front: Box<[u8]>,
+    back: Box<[u8]>,
 }
 
 impl MetaHandler {
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
-        // read from disk or init
-        todo!()
+        let file = File::open(path)?;
+
+        // TODO: if file does not exist, create it and write initial metadata
+        // let page_size = choose_page_size(path.as_ref())?;
+
+        let page_size = Self::read_page_size(&file)?;
+        let buf1 = Self::read_buf(&file, page_size, 0)?;
+        let buf2 = Self::read_buf(&file, page_size, page_size)?;
+        let (front, back) = Self::choose_front_back(buf1, buf2)?;
+        let meta = Self::read_meta_from_buf(&front);
+
+        Ok(Self {
+            fmt_version: meta.fmt_version,
+            page_size: meta.page_size,
+            root1: meta.root1,
+            root2: meta.root2,
+            inner: Mutex::new(Inner {
+                version: 0,
+                index: 0,
+                front,
+                back,
+            }),
+        })
+    }
+
+    fn read_page_size(file: &File) -> Result<u64> {
+        let offset: u64 = (size_of::<MagicType>() + size_of::<FmtVersionType>()) as u64;
+        let mut buf = [0u8; size_of::<u64>()];
+        let read = file.read_at(&mut buf, offset)?;
+        if read < size_of::<u64>() {
+            bail!("File too small to contain metadata");
+        }
+        Ok(u64::from_ne_bytes(buf))
+    }
+
+    fn read_buf(file: &File, page_size: u64, offset: u64) -> Result<Box<[u8]>> {
+        let mut buf = vec![0u8; page_size as usize];
+        let read = file.read_at(&mut buf, offset)?;
+        if read < size_of::<Meta>() {
+            bail!("File too small to contain metadata");
+        }
+        Ok(buf.into())
+    }
+
+    fn read_meta_from_buf(buf: &[u8]) -> &Meta {
+        unsafe { &*(buf.as_ptr() as *const Meta) }
+    }
+
+    fn choose_front_back(buf1: Box<[u8]>, buf2: Box<[u8]>) -> Result<(Box<[u8]>, Box<[u8]>)> {
+        let buf1_checksum_valid = has_valid_checksum(&buf1);
+        let buf2_checksum_valid = has_valid_checksum(&buf2);
+
+        if !buf1_checksum_valid && !buf2_checksum_valid {
+            bail!("File corrupted, both metadata pages have invalid checksums");
+        } else if buf1_checksum_valid && !buf2_checksum_valid {
+            Ok((buf1, buf2))
+        } else if !buf1_checksum_valid && buf2_checksum_valid {
+            Ok((buf2, buf1))
+        } else {
+            // Both checksums are valid, choose the one with higher version
+            let keep_order = {
+                let meta1 = Self::read_meta_from_buf(&buf1);
+                let meta2 = Self::read_meta_from_buf(&buf2);
+                meta1.version >= meta2.version
+            };
+            if keep_order {
+                Ok((buf1, buf2))
+            } else {
+                Ok((buf2, buf1))
+            }
+        }
     }
 }

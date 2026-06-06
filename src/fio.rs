@@ -243,6 +243,7 @@ impl Fio {
 
         file.try_lock()?; // prevent multiple instances from opening the same file
 
+        // TODO: page_size will be passed in
         let page_size = choose_page_size(path.as_ref())?;
 
         let fd = file.as_raw_fd();
