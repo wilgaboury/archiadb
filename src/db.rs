@@ -7,10 +7,10 @@ use parking_lot::Mutex;
 use crate::{
     alloc::PageAllocator,
     concache::ConCache,
+    file::DbFile,
     fio::{DEFAULT_CQ_SIZE, DEFAULT_SQ_SIZE, Fio},
     key::{KeyPath, KeyPathBuf},
     lock::{Lock, LockGuard, LockType},
-    meta::MetaHandler,
     trie::TxnKeyTrie,
 };
 
@@ -37,9 +37,10 @@ impl Db {
         page_buf_pool: Option<usize>,
         generic_op_state_pool: Option<usize>,
     ) -> Result<Self> {
+        let file = Arc::new(DbFile::open(path)?);
         // TODO: add back once meta handler supports initialization
         // let meta = MetaHandler::new(&path)?;
-        let fio = Fio::new(path, sq, cq, page_buf_pool, generic_op_state_pool)?;
+        let fio = Fio::new(file, sq, cq, page_buf_pool, generic_op_state_pool)?;
         let alloc = PageAllocator::new(fio.clone()).await?;
         Ok(Self {
             inner: Arc::new(Inner {
@@ -57,6 +58,10 @@ impl Db {
             db: self.clone(),
             ops: TxnKeyTrie::new(),
         }
+    }
+
+    pub fn close(self) {
+        drop(self)
     }
 }
 

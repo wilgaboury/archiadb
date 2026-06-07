@@ -3,6 +3,7 @@ pub mod alloc;
 pub mod btree;
 pub mod concache;
 pub mod db;
+pub mod file;
 pub mod fio;
 pub mod intrusive;
 pub mod key;

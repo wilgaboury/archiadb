@@ -5,8 +5,8 @@ use tokio::sync::Mutex;
 
 use crate::{
     const_assert,
-    fio::MIN_PAGE_SIZE,
-    util::{CHECKSUM_SIZE, has_valid_checksum},
+    fio::{MAX_PAGE_SIZE, MIN_PAGE_SIZE},
+    util::{CHECKSUM_SIZE, from_bytes, has_valid_checksum},
 };
 
 type MagicType = u128;
@@ -58,7 +58,7 @@ impl MetaHandler {
         let buf1 = Self::read_buf(&file, page_size, 0)?;
         let buf2 = Self::read_buf(&file, page_size, page_size)?;
         let (front, back) = Self::choose_front_back(buf1, buf2)?;
-        let meta = Self::read_meta_from_buf(&front);
+        let meta = from_bytes::<Meta>(&front);
 
         Ok(Self {
             fmt_version: meta.fmt_version,
@@ -81,7 +81,12 @@ impl MetaHandler {
         if read < size_of::<u64>() {
             bail!("File too small to contain metadata");
         }
-        Ok(u64::from_ne_bytes(buf))
+        let page_size = u64::from_ne_bytes(buf);
+        if page_size < MIN_PAGE_SIZE || page_size % MIN_PAGE_SIZE != 0 || page_size > MAX_PAGE_SIZE
+        {
+            bail!("Invalid page size in metadata");
+        }
+        Ok(page_size)
     }
 
     fn read_buf(file: &File, page_size: u64, offset: u64) -> Result<Box<[u8]>> {

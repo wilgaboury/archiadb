@@ -27,6 +27,8 @@ use libc::{O_DIRECT, iovec};
 use parking_lot::Mutex;
 use rustix::fs::fstatvfs;
 
+use crate::file::DbFile;
+
 pub const MIN_PAGE_SIZE: u64 = 4096; // smallest supported page size and most common filesystem block size
 pub const MAX_PAGE_SIZE: u64 = 65536;
 
@@ -104,13 +106,13 @@ pub struct IoLoopHandle {
 
 #[derive(Clone)]
 pub struct Fio {
-    path: PathBuf,
     inner: Arc<Inner>,
     join: Arc<IoLoopHandle>,
 }
 
 struct Inner {
-    file: File,
+    fio_file: File,
+    file: Arc<DbFile>,
 
     page_size: usize,
     len: AtomicU64, // number of pages
@@ -214,18 +216,18 @@ impl Drop for PoolBuf {
 #[bon]
 impl Fio {
     #[builder]
-    pub fn builder<P: AsRef<Path>>(
-        path: P,
+    pub fn builder(
+        file: Arc<DbFile>,
         #[builder(default = DEFAULT_SQ_SIZE)] sq: usize,
         #[builder(default = DEFAULT_CQ_SIZE)] cq: usize,
         page_buf_pool: Option<usize>,
         generic_op_state_pool: Option<usize>,
     ) -> Result<Self> {
-        Self::new(path, sq, cq, page_buf_pool, generic_op_state_pool)
+        Self::new(file, sq, cq, page_buf_pool, generic_op_state_pool)
     }
 
-    pub fn new<P: AsRef<Path>>(
-        path: P,
+    pub fn new(
+        file: Arc<DbFile>,
         sq: usize,
         cq: usize,
         page_buf_pool: Option<usize>,
@@ -234,20 +236,20 @@ impl Fio {
         let page_buf_pool = page_buf_pool.unwrap_or_else(|| 2 * cq);
         let generic_op_state_pool = generic_op_state_pool.unwrap_or_else(|| cq);
 
-        let file = OpenOptions::new()
+        let fio_file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .custom_flags(O_DIRECT) // TODO: if filesystem block size does not match db page (the file was moved to another computers/filesystem), O_DIRECT will not work
-            .open(path.as_ref())?;
+            .open(file.path())?;
 
-        file.try_lock()?; // prevent multiple instances from opening the same file
+        fio_file.try_lock()?; // prevent multiple instances from opening the same file
 
         // TODO: page_size will be passed in
-        let page_size = choose_page_size(path.as_ref())?;
+        let page_size = choose_page_size(file.path())?;
 
-        let fd = file.as_raw_fd();
-        let len = file.metadata()?.len() / page_size as u64;
+        let fd = fio_file.as_raw_fd();
+        let len = fio_file.metadata()?.len() / page_size as u64;
 
         let stop = AtomicBool::new(false);
         let queue = SegQueue::new();
@@ -272,6 +274,7 @@ impl Fio {
         let generic_op_states = generic_op_states.into_boxed_slice();
 
         let inner = Arc::new(Inner {
+            fio_file,
             file,
             page_size,
             len: AtomicU64::new(len as u64),
@@ -290,7 +293,6 @@ impl Fio {
         };
 
         Ok(Self {
-            path: path.as_ref().to_path_buf(),
             inner: inner.clone(),
             join: Arc::new(IoLoopHandle {
                 join: Some(join),
@@ -299,8 +301,8 @@ impl Fio {
         })
     }
 
-    pub fn path(&self) -> &PathBuf {
-        &self.path
+    pub fn file(&self) -> &Arc<DbFile> {
+        &self.inner.file
     }
 
     pub fn page_size(&self) -> usize {
@@ -588,7 +590,7 @@ fn get_generic_op_state(inner: &Arc<Inner>) -> GenericOpStateRef {
 
 impl Drop for Inner {
     fn drop(&mut self) {
-        if let Err(e) = self.file.unlock() {
+        if let Err(e) = self.fio_file.unlock() {
             eprintln!("Failed to unlock file: {}", e);
         }
     }
@@ -1080,13 +1082,14 @@ mod tests {
     #[test]
     fn test_buf() -> Result<()> {
         let temp_dir = TempDir::new(function_name!())?;
-        let test_file = temp_dir.path().join("db");
+        let test_file_path = temp_dir.path().join("db");
+        let test_file = Arc::new(DbFile::open(test_file_path.clone())?);
 
         let fio = Fio::builder()
             .sq(2)
             .cq(4)
             .page_buf_pool(2)
-            .path(test_file.clone())
+            .file(test_file)
             .build()?;
         let mut buf = fio.get_buf();
         assert!(matches!(buf, PageBuf::Pool(_)));
@@ -1105,7 +1108,7 @@ mod tests {
         let mut file = OpenOptions::new()
             .write(true)
             .append(true)
-            .open(fio.path())?;
+            .open(fio.file().path())?;
         file.write_all(&vec![1u8; fio.page_size()])?;
         file.flush()?;
         file.sync_all()?;
@@ -1129,19 +1132,20 @@ mod tests {
     #[tokio::test]
     async fn test_single_read_page_dynamic() -> Result<()> {
         let temp_dir = TempDir::new(function_name!())?;
-        let test_file = temp_dir.path().join("db");
+        let test_file_path = temp_dir.path().join("db");
+        let test_file = Arc::new(DbFile::open(test_file_path.clone())?);
 
         let fio = Fio::builder()
             .sq(2)
             .cq(4)
             .page_buf_pool(0)
-            .path(test_file.clone())
+            .file(test_file)
             .build()
             .unwrap();
         let mut file = OpenOptions::new()
             .write(true)
             .append(true)
-            .open(test_file)?;
+            .open(test_file_path)?;
         file.write_all(&vec![1u8; fio.page_size()])?;
         file.flush()?;
         file.sync_all()?;
@@ -1175,7 +1179,7 @@ mod tests {
         let mut file = OpenOptions::new()
             .read(true)
             .append(true)
-            .open(fio.path())?;
+            .open(fio.file().path())?;
         let mut buf = vec![0u8; fio.page_size()];
         file.read_exact(&mut buf)?;
 
@@ -1198,7 +1202,7 @@ mod tests {
         let mut file = OpenOptions::new()
             .read(true)
             .append(true)
-            .open(fio.path())?;
+            .open(fio.file().path())?;
         let mut buf = vec![0u8; fio.page_size()];
         file.read_exact(&mut buf)?;
 
@@ -1211,20 +1215,24 @@ mod tests {
     #[tokio::test]
     async fn test_single_submit_write_page_dynamic() -> Result<()> {
         let temp_dir = TempDir::new(function_name!())?;
-        let test_file = temp_dir.path().join("db");
+        let test_file_path = temp_dir.path().join("db");
+        let test_file = Arc::new(DbFile::open(test_file_path.clone())?);
 
         let fio = Fio::builder()
             .sq(2)
             .cq(4)
             .page_buf_pool(0)
-            .path(test_file.clone())
+            .file(test_file)
             .build()?;
         let mut buf = fio.get_buf();
         buf.get_mut()[0..].fill(1u8);
         fio.submit_write(0, buf);
         fio.commit_flush().await?;
 
-        let mut file = OpenOptions::new().read(true).append(true).open(test_file)?;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(test_file_path)?;
         let mut buf = vec![0u8; fio.page_size()];
         file.read_exact(&mut buf)?;
 
@@ -1242,7 +1250,10 @@ mod tests {
 
         fio.alloc(1).await?;
         assert_eq!(1, fio.len());
-        assert_eq!(fio.page_size(), fs::metadata(fio.path())?.len() as usize);
+        assert_eq!(
+            fio.page_size(),
+            fs::metadata(fio.file().path())?.len() as usize
+        );
 
         let _read_test = fio.read(0).await?;
 
@@ -1250,7 +1261,7 @@ mod tests {
         assert_eq!(1000, fio.len());
         assert_eq!(
             1000 * fio.page_size(),
-            fs::metadata(fio.path())?.len() as usize
+            fs::metadata(fio.file().path())?.len() as usize
         );
 
         let _read_test = fio.read(5).await?;

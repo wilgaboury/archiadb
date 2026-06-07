@@ -1,8 +1,11 @@
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use anyhow::Result;
 
-use crate::{alloc::PageAllocator, fio::Fio};
+use crate::{alloc::PageAllocator, file::DbFile, fio::Fio};
 
 pub struct TempDir {
     path: PathBuf,
@@ -32,7 +35,7 @@ impl TempDir {
             .sq(2)
             .cq(4)
             .page_buf_pool(2)
-            .path(self.path.join(path.as_ref()))
+            .file(Arc::new(DbFile::open(self.path.join(path.as_ref()))?))
             .build()
     }
 

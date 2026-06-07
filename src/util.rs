@@ -57,6 +57,26 @@ pub fn validate_checksum(buf: &[u8]) -> Result<()> {
     }
 }
 
+pub fn from_bytes<T>(buf: &[u8]) -> &T {
+    assert!(buf.len() >= size_of::<T>(), "buffer too small for type");
+    assert_eq!(
+        buf.as_ptr() as usize % align_of::<T>(),
+        0,
+        "buffer misaligned for type"
+    );
+    unsafe { &*(buf.as_ptr() as *const T) }
+}
+
+pub fn from_bytes_mut<T>(buf: &mut [u8]) -> &mut T {
+    assert!(buf.len() >= size_of::<T>(), "buffer too small for type");
+    assert_eq!(
+        buf.as_ptr() as usize % align_of::<T>(),
+        0,
+        "buffer misaligned for type"
+    );
+    unsafe { &mut *(buf.as_mut_ptr() as *mut T) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
