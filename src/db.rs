@@ -11,16 +11,16 @@ use crate::{
     fio::{DEFAULT_CQ_SIZE, DEFAULT_SQ_SIZE, Fio},
     key::{KeyPath, KeyPathBuf},
     lock::{Lock, LockGuard, LockType},
+    meta::MetaHandler,
     trie::TxnKeyTrie,
 };
 
 #[derive(Clone)]
 struct Db {
-    inner: Arc<Inner>,
+    inner: Arc<DbInner>,
 }
 
-struct Inner {
-    // meta: MetaHandler,
+struct DbInner {
     alloc: PageAllocator,
     fio: Fio,
     read_locks: ConCache<KeyPathBuf, Lock>,
@@ -38,13 +38,11 @@ impl Db {
         generic_op_state_pool: Option<usize>,
     ) -> Result<Self> {
         let file = Arc::new(DbFile::open(path)?);
-        // TODO: add back once meta handler supports initialization
-        // let meta = MetaHandler::new(&path)?;
-        let fio = Fio::new(file, sq, cq, page_buf_pool, generic_op_state_pool)?;
-        let alloc = PageAllocator::new(fio.clone()).await?;
+        let meta = MetaHandler::new(&file.file())?;
+        let fio = Fio::new(file, &meta, sq, cq, page_buf_pool, generic_op_state_pool)?;
+        let alloc = PageAllocator::new(fio.clone(), meta).await?;
         Ok(Self {
-            inner: Arc::new(Inner {
-                // meta,
+            inner: Arc::new(DbInner {
                 alloc,
                 fio,
                 read_locks: ConCache::new(Box::new(|| Lock::new())),

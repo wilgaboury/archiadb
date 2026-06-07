@@ -8,7 +8,7 @@ use std::{
         fd::{AsFd, AsRawFd},
         unix::fs::OpenOptionsExt,
     },
-    path::{Path, PathBuf},
+    path::Path,
     pin::Pin,
     sync::{
         Arc,
@@ -27,7 +27,7 @@ use libc::{O_DIRECT, iovec};
 use parking_lot::Mutex;
 use rustix::fs::fstatvfs;
 
-use crate::file::DbFile;
+use crate::{file::DbFile, meta::MetaHandler};
 
 pub const MIN_PAGE_SIZE: u64 = 4096; // smallest supported page size and most common filesystem block size
 pub const MAX_PAGE_SIZE: u64 = 65536;
@@ -218,16 +218,18 @@ impl Fio {
     #[builder]
     pub fn builder(
         file: Arc<DbFile>,
+        meta: &MetaHandler,
         #[builder(default = DEFAULT_SQ_SIZE)] sq: usize,
         #[builder(default = DEFAULT_CQ_SIZE)] cq: usize,
         page_buf_pool: Option<usize>,
         generic_op_state_pool: Option<usize>,
     ) -> Result<Self> {
-        Self::new(file, sq, cq, page_buf_pool, generic_op_state_pool)
+        Self::new(file, meta, sq, cq, page_buf_pool, generic_op_state_pool)
     }
 
     pub fn new(
         file: Arc<DbFile>,
+        meta: &MetaHandler,
         sq: usize,
         cq: usize,
         page_buf_pool: Option<usize>,
@@ -243,13 +245,9 @@ impl Fio {
             .custom_flags(O_DIRECT) // TODO: if filesystem block size does not match db page (the file was moved to another computers/filesystem), O_DIRECT will not work
             .open(file.path())?;
 
-        fio_file.try_lock()?; // prevent multiple instances from opening the same file
-
-        // TODO: page_size will be passed in
-        let page_size = choose_page_size(file.path())?;
-
         let fd = fio_file.as_raw_fd();
-        let len = fio_file.metadata()?.len() / page_size as u64;
+        let len = meta.len();
+        let page_size = meta.page_size() as usize;
 
         let stop = AtomicBool::new(false);
         let queue = SegQueue::new();
@@ -309,6 +307,7 @@ impl Fio {
         self.inner.page_size
     }
 
+    // TODO: deprecate, tracking len in meta now
     pub fn len(&self) -> u64 {
         self.inner.len.load(Ordering::Acquire)
     }
@@ -1029,8 +1028,7 @@ impl IoLoop {
     }
 }
 
-pub fn choose_page_size<P: AsRef<Path>>(path: P) -> Result<usize> {
-    let file = File::open(path)?;
+pub fn choose_page_size(file: &File) -> Result<usize> {
     let fd = file.as_fd();
     let fstatvfs = fstatvfs(fd)?;
     let block_size = fstatvfs.f_bsize as u64;
@@ -1068,28 +1066,29 @@ mod tests {
 
     use function_name::named;
 
-    use crate::test_util::TempDir;
+    use crate::{meta::NUM_HEADER_PAGES, test_util::TempDir};
 
     use super::*;
 
     #[test]
-    fn test_choose_page_size() {
-        let page_size = choose_page_size(Path::new("/")).unwrap();
+    fn test_choose_page_size() -> Result<()> {
+        let page_size = choose_page_size(&File::open(Path::new("/"))?)?;
         println!("Auto picked size: {}", page_size);
+        Ok(())
     }
 
     #[named]
     #[test]
     fn test_buf() -> Result<()> {
         let temp_dir = TempDir::new(function_name!())?;
-        let test_file_path = temp_dir.path().join("db");
-        let test_file = Arc::new(DbFile::open(test_file_path.clone())?);
+        let (file, meta) = temp_dir.fio_cust("db")?;
 
         let fio = Fio::builder()
+            .file(file)
+            .meta(&meta)
             .sq(2)
             .cq(4)
             .page_buf_pool(2)
-            .file(test_file)
             .build()?;
         let mut buf = fio.get_buf();
         assert!(matches!(buf, PageBuf::Pool(_)));
@@ -1104,7 +1103,7 @@ mod tests {
     #[tokio::test]
     async fn test_single_read_page() -> Result<()> {
         let temp_dir = TempDir::new(function_name!())?;
-        let fio = temp_dir.fio("db")?;
+        let (fio, _) = temp_dir.fio("db")?;
         let mut file = OpenOptions::new()
             .write(true)
             .append(true)
@@ -1132,20 +1131,19 @@ mod tests {
     #[tokio::test]
     async fn test_single_read_page_dynamic() -> Result<()> {
         let temp_dir = TempDir::new(function_name!())?;
-        let test_file_path = temp_dir.path().join("db");
-        let test_file = Arc::new(DbFile::open(test_file_path.clone())?);
+        let (file, meta) = temp_dir.fio_cust("db")?;
 
         let fio = Fio::builder()
+            .file(file.clone())
+            .meta(&meta)
             .sq(2)
             .cq(4)
             .page_buf_pool(0)
-            .file(test_file)
-            .build()
-            .unwrap();
+            .build()?;
         let mut file = OpenOptions::new()
             .write(true)
             .append(true)
-            .open(test_file_path)?;
+            .open(file.path())?;
         file.write_all(&vec![1u8; fio.page_size()])?;
         file.flush()?;
         file.sync_all()?;
@@ -1169,7 +1167,7 @@ mod tests {
     #[tokio::test]
     async fn test_single_submit_write_page() -> Result<()> {
         let temp_dir = TempDir::new(function_name!())?;
-        let fio = temp_dir.fio("db")?;
+        let (fio, _) = temp_dir.fio("db")?;
 
         let mut buf = fio.get_buf();
         buf.get_mut()[0..].fill(1u8);
@@ -1192,7 +1190,7 @@ mod tests {
     #[tokio::test]
     async fn test_single_write_page() -> Result<()> {
         let temp_dir = TempDir::new(function_name!())?;
-        let fio = temp_dir.fio("db")?;
+        let (fio, _) = temp_dir.fio("db")?;
 
         let mut buf = fio.get_buf();
         buf.get_mut()[0..].fill(1u8);
@@ -1215,14 +1213,14 @@ mod tests {
     #[tokio::test]
     async fn test_single_submit_write_page_dynamic() -> Result<()> {
         let temp_dir = TempDir::new(function_name!())?;
-        let test_file_path = temp_dir.path().join("db");
-        let test_file = Arc::new(DbFile::open(test_file_path.clone())?);
+        let (file, meta) = temp_dir.fio_cust("db")?;
 
         let fio = Fio::builder()
+            .file(file.clone())
+            .meta(&meta)
             .sq(2)
             .cq(4)
             .page_buf_pool(0)
-            .file(test_file)
             .build()?;
         let mut buf = fio.get_buf();
         buf.get_mut()[0..].fill(1u8);
@@ -1232,7 +1230,7 @@ mod tests {
         let mut file = OpenOptions::new()
             .read(true)
             .append(true)
-            .open(test_file_path)?;
+            .open(file.path())?;
         let mut buf = vec![0u8; fio.page_size()];
         file.read_exact(&mut buf)?;
 
@@ -1245,13 +1243,13 @@ mod tests {
     #[tokio::test]
     async fn test_simple_alloc() -> Result<()> {
         let temp_dir = TempDir::new(function_name!())?;
-        let fio = temp_dir.fio("db")?;
-        assert_eq!(0, fio.len());
+        let (fio, _) = temp_dir.fio("db")?;
+        assert_eq!(NUM_HEADER_PAGES, fio.len());
 
-        fio.alloc(1).await?;
-        assert_eq!(1, fio.len());
+        fio.alloc(NUM_HEADER_PAGES + 1).await?;
+        assert_eq!(NUM_HEADER_PAGES + 1, fio.len());
         assert_eq!(
-            fio.page_size(),
+            fio.page_size() * (NUM_HEADER_PAGES + 1) as usize,
             fs::metadata(fio.file().path())?.len() as usize
         );
 

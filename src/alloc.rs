@@ -3,7 +3,6 @@ use std::{
     array,
     cell::UnsafeCell,
     collections::{HashMap, HashSet},
-    io::Write,
     ptr,
     sync::atomic::{AtomicPtr, AtomicU64, Ordering},
 };
@@ -14,7 +13,10 @@ use tokio::sync::Mutex;
 #[cfg(not(test))]
 use crate::fio::MAX_PAGE_SIZE;
 
-use crate::fio::{Fio, MIN_PAGE_SIZE};
+use crate::{
+    fio::{Fio, MIN_PAGE_SIZE},
+    meta::{MetaHandler, NUM_HEADER_PAGES},
+};
 
 const CACHE_LINE_SIZE: u64 = 64; // standard size on pretty much every system that matters
 
@@ -28,7 +30,6 @@ const SEGMENT_LEN: u64 = (MAX_PAGE_SIZE * 128/* magic num */) / BYTES_PER_UNIT;
 #[cfg(test)]
 const SEGMENT_LEN: u64 = (MIN_PAGE_SIZE * 2/* magic num */) / BYTES_PER_UNIT;
 
-const NUM_HEADER_PAGES: u64 = 3;
 const BITS_PER_BYTE: u64 = 8;
 const BYTES_PER_UNIT: u64 = size_of::<BitfieldUnit>() as u64;
 const BITS_PER_UNIT: u64 = BYTES_PER_UNIT * BITS_PER_BYTE;
@@ -52,6 +53,7 @@ pub struct PageAllocator {
     num_segs: AtomicU64,
     num_allocs: AtomicU64,
     fio: Fio,
+    pub meta: MetaHandler,
 }
 
 pub struct AllocationSet<'a> {
@@ -116,18 +118,18 @@ impl<'a> AllocationSet<'a> {
 }
 
 impl PageAllocator {
-    pub async fn new(fio: Fio) -> Result<Self> {
+    pub async fn new(fio: Fio, meta: MetaHandler) -> Result<Self> {
         let ret = Self {
             segments: array::from_fn(|_| AtomicPtr::new(ptr::null_mut())),
             num_segs: AtomicU64::new(0),
             num_allocs: AtomicU64::new(0),
             fio,
+            meta,
         };
 
-        let len_pages = ret.fio_pages_len();
+        let len_pages = ret.pages_len();
         let mut x_seg_idx = 0;
         while x_seg_idx < (len_pages / BITS_PER_BYTE) {
-            std::io::stdout().flush().unwrap();
             let seg_idx = x_seg_idx / SEGMENT_LEN;
             ret.check_num_segments(seg_idx)?;
             let in_seg_idx = x_seg_idx % SEGMENT_LEN;
@@ -214,19 +216,22 @@ impl PageAllocator {
 
         loop {
             if (attempts > SEGMENT_LEN
-                && (self.num_allocs.load(Ordering::Relaxed) as f32 / self.fio_pages_len() as f32)
+                && (self.num_allocs.load(Ordering::Relaxed) as f32 / self.pages_len() as f32)
                     >= EXPAND_FRACTION)
-                || self.fio.len() == 0
+                || self.meta.len() <= NUM_HEADER_PAGES
             {
-                let len = self.fio.len();
-                // TODO: this is fucked. headers need to be allocated on initalization
-                let headers = if len == 0 { NUM_HEADER_PAGES } else { 0 };
-                let new_len = len + headers + 1 + self.pages_per_chunk();
+                let len = self.meta.len();
+                let new_len = len + 1 + self.pages_per_chunk();
                 self.fio.alloc(new_len).await?;
+                self.meta
+                    .mutate_async(&self.fio, |meta| {
+                        meta.len = meta.len.max(new_len);
+                    })
+                    .await?;
                 {
                     let mut buf = self.fio.get_buf();
                     buf.get_mut().fill(0);
-                    self.fio.write(len + headers, buf).await?;
+                    self.fio.write(len, buf).await?;
                 }
                 let adj_len = self.remove_headers_from_pages_len(new_len);
                 if (adj_len / BITS_PER_UNIT) / SEGMENT_LEN >= self.num_segs.load(Ordering::Relaxed)
@@ -252,7 +257,7 @@ impl PageAllocator {
             let free_idx = word.trailing_ones();
             if free_idx == 64 {
                 CROSS_SEG_IDX.with(|idx| unsafe {
-                    *idx.get() = (x_seg_idx + 1) % (self.fio_pages_len() / BITS_PER_UNIT)
+                    *idx.get() = (x_seg_idx + 1) % (self.pages_len() / BITS_PER_UNIT)
                 });
                 continue;
             }
@@ -275,8 +280,7 @@ impl PageAllocator {
             } else {
                 // there was conflict move forward one cache line
                 CROSS_SEG_IDX.with(|idx| unsafe {
-                    *idx.get() =
-                        (x_seg_idx + CACHE_LINE_SIZE) % (self.fio_pages_len() / BITS_PER_UNIT)
+                    *idx.get() = (x_seg_idx + CACHE_LINE_SIZE) % (self.pages_len() / BITS_PER_UNIT)
                 });
             }
         }
@@ -364,8 +368,8 @@ impl PageAllocator {
         NUM_HEADER_PAGES + 1 + pg_idx + (pg_idx / self.pages_per_chunk())
     }
 
-    fn fio_pages_len(&self) -> u64 {
-        self.remove_headers_from_pages_len(self.fio.len())
+    fn pages_len(&self) -> u64 {
+        self.remove_headers_from_pages_len(self.meta.len())
     }
 
     fn remove_headers_from_pages_len(&self, len: u64) -> u64 {
@@ -393,7 +397,7 @@ mod tests {
     use function_name::named;
 
     use crate::{
-        alloc::{BITS_PER_BYTE, NUM_HEADER_PAGES, PageAllocator},
+        alloc::{BITS_PER_BYTE, NUM_HEADER_PAGES},
         test_util::TempDir,
     };
 
@@ -401,38 +405,38 @@ mod tests {
     #[tokio::test]
     async fn simple_test() -> Result<()> {
         let temp_dir = TempDir::new(function_name!())?;
-        let fio = temp_dir.fio("file")?;
+        let alloc = temp_dir.alloc("file").await?;
 
-        assert_eq!(0, fio.len());
+        assert_eq!(2, alloc.meta.len());
+        assert_eq!(2, alloc.fio.len());
 
-        let len = NUM_HEADER_PAGES + 1 + fio.page_size() as u64 * BITS_PER_BYTE;
-        fio.alloc(len).await?;
-        let alloc = PageAllocator::new(fio.clone()).await?;
+        let len = NUM_HEADER_PAGES + 1 + alloc.meta.page_size() as u64 * BITS_PER_BYTE;
+        alloc.fio.alloc(len).await?;
         let mut allocs = alloc.create_set();
         let pg_idx = alloc.alloc(&mut allocs).await?;
 
-        assert_eq!(4, pg_idx);
+        assert_eq!(NUM_HEADER_PAGES + 1, pg_idx);
 
         let pg_idx = alloc.alloc(&mut allocs).await?;
 
-        assert_eq!(5, pg_idx);
+        assert_eq!(NUM_HEADER_PAGES + 2, pg_idx);
 
         let pg_idx = alloc.alloc(&mut allocs).await?;
 
-        assert_eq!(6, pg_idx);
+        assert_eq!(NUM_HEADER_PAGES + 3, pg_idx);
 
         allocs.flush().await?;
 
-        let buf = fio.read(3).await?;
+        let buf = alloc.fio.read(NUM_HEADER_PAGES).await?;
         // only works on little endian systems
         assert_eq!(0b111, buf.get()[0]);
 
-        assert_eq!(7, alloc.alloc(&mut allocs).await?);
+        assert_eq!(NUM_HEADER_PAGES + 4, alloc.alloc(&mut allocs).await?);
 
         drop(allocs);
 
         let mut allocs = alloc.create_set();
-        assert_eq!(7, alloc.alloc(&mut allocs).await?);
+        assert_eq!(NUM_HEADER_PAGES + 4, alloc.alloc(&mut allocs).await?);
 
         Ok(())
     }
@@ -441,13 +445,12 @@ mod tests {
     #[tokio::test]
     async fn many_allocs() -> Result<()> {
         let temp_dir = TempDir::new(function_name!())?;
-        let fio = temp_dir.fio("file")?;
+        let alloc = temp_dir.alloc("file").await?;
 
         const CHKS: u64 = 6;
 
-        let num_allocs = fio.page_size() as u64 * BITS_PER_BYTE * CHKS;
+        let num_allocs = alloc.fio.page_size() as u64 * BITS_PER_BYTE * CHKS;
 
-        let alloc = PageAllocator::new(fio.clone()).await?;
         let mut allocs = alloc.create_set();
 
         for _ in 0..num_allocs {
@@ -485,7 +488,8 @@ mod tests {
         }
 
         for i in 0..CHKS {
-            let buf = fio
+            let buf = alloc
+                .fio
                 .read(NUM_HEADER_PAGES + i * (1 + alloc.pages_per_chunk()))
                 .await?;
             assert!(is_all_ones(buf.get()), "bad idx: {}", i);
@@ -510,7 +514,8 @@ mod tests {
         }
 
         for i in 0..CHKS {
-            let buf = fio
+            let buf = alloc
+                .fio
                 .read(NUM_HEADER_PAGES + i * (1 + alloc.pages_per_chunk()))
                 .await?;
             assert!(is_all_zeros(buf.get()))

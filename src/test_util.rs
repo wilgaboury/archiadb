@@ -1,11 +1,17 @@
 use std::{
+    fs::File,
     path::{Path, PathBuf},
     sync::Arc,
 };
 
 use anyhow::Result;
 
-use crate::{alloc::PageAllocator, file::DbFile, fio::Fio};
+use crate::{
+    alloc::PageAllocator,
+    file::DbFile,
+    fio::{Fio, FioBuilder},
+    meta::MetaHandler,
+};
 
 pub struct TempDir {
     path: PathBuf,
@@ -30,17 +36,39 @@ impl TempDir {
         &self.path
     }
 
-    pub fn fio<P: AsRef<Path>>(&self, path: P) -> Result<Fio> {
-        Fio::builder()
-            .sq(2)
-            .cq(4)
-            .page_buf_pool(2)
-            .file(Arc::new(DbFile::open(self.path.join(path.as_ref()))?))
-            .build()
+    pub fn file<P: AsRef<Path>>(&self, path: P) -> Result<DbFile> {
+        DbFile::open(self.path.join(path.as_ref()))
+    }
+
+    pub fn meta<P: AsRef<Path>>(&self, path: P) -> Result<MetaHandler> {
+        let file = self.file(path)?;
+        MetaHandler::new(file.file())
+    }
+
+    pub fn fio<P: AsRef<Path>>(&self, path: P) -> Result<(Fio, MetaHandler)> {
+        let file = self.file(path)?;
+        let meta = MetaHandler::new(file.file())?;
+        Ok((
+            Fio::builder()
+                .file(Arc::new(file))
+                .meta(&meta)
+                .sq(2)
+                .cq(4)
+                .page_buf_pool(2)
+                .build()?,
+            meta,
+        ))
+    }
+
+    pub fn fio_cust<P: AsRef<Path>>(&self, path: P) -> Result<(Arc<DbFile>, MetaHandler)> {
+        let file = self.file(path)?;
+        let meta = MetaHandler::new(file.file())?;
+        Ok((Arc::new(file), meta))
     }
 
     pub async fn alloc<P: AsRef<Path>>(&self, path: P) -> Result<PageAllocator> {
-        PageAllocator::new(self.fio(path)?).await
+        let (fio, meta) = self.fio(path)?;
+        PageAllocator::new(fio, meta).await
     }
 }
 
