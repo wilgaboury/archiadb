@@ -72,6 +72,8 @@ impl MetaHandler {
             let page_size = choose_page_size(file)?;
             let front = Self::create_buf(page_size);
             let back = Self::create_buf(page_size);
+            file.write_at(&front, 0)?;
+            file.write_at(&back, page_size as u64)?;
             (true, front, back)
         } else {
             let page_size = Self::read_page_size(&file)?;
@@ -128,7 +130,7 @@ impl MetaHandler {
             let len = meta.len;
             update_checksum(&mut inner.back);
 
-            let offset = if inner.is_first { 0 } else { self.page_size };
+            let offset = if inner.is_first { self.page_size } else { 0 };
             file.write_at(&inner.back, offset)?;
 
             std::mem::swap(&mut inner.front, &mut inner.back);
@@ -152,7 +154,7 @@ impl MetaHandler {
             let len = meta.len;
             update_checksum(&mut inner.back);
 
-            let pg_idx = if inner.is_first { 0 } else { 1 };
+            let pg_idx = if inner.is_first { 1 } else { 0 };
             {
                 let mut buf = fio.get_buf();
                 buf.get_mut().copy_from_slice(&inner.back);
@@ -223,5 +225,87 @@ impl MetaHandler {
         meta.init(page_size as u64);
         update_checksum(&mut buf);
         buf
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs::File;
+    use std::os::unix::fs::FileExt;
+
+    use anyhow::Result;
+    use function_name::named;
+
+    use crate::meta::Meta;
+    use crate::util::from_bytes;
+    use crate::{meta::MagicType, test_util::TempDir};
+
+    fn corrupt_page(file: &File, page_size: u64, page_num: u64) -> Result<()> {
+        let offset = page_num * page_size;
+        let garbage = [0u8; size_of::<MagicType>()];
+        file.write_all_at(&garbage, offset)?;
+        Ok(())
+    }
+
+    #[named]
+    #[test]
+    fn test_mutate_sync() -> Result<()> {
+        let temp_dir = TempDir::new(function_name!())?;
+
+        let file = temp_dir.file("sync.db")?;
+        let meta_hand = temp_dir.meta("sync.db")?;
+
+        let mut buf = vec![0u8; meta_hand.page_size as usize];
+
+        meta_hand.mutate(&file, |m| m.len = 100)?;
+        file.read_at(&mut buf, meta_hand.page_size)?;
+        let meta = from_bytes::<Meta>(&buf);
+        assert_eq!({ meta.len }, 100);
+
+        meta_hand.mutate(&file, |m| m.len = 101)?;
+        file.read_at(&mut buf, 0)?;
+        let meta = from_bytes::<Meta>(&buf);
+        assert_eq!({ meta.len }, 101);
+
+        meta_hand.mutate(&file, |m| m.len = 102)?;
+        file.read_at(&mut buf, meta_hand.page_size)?;
+        let meta = from_bytes::<Meta>(&buf);
+        assert_eq!({ meta.len }, 102);
+
+        Ok(())
+    }
+
+    #[named]
+    #[test]
+    fn test_mutate_async() -> Result<()> {
+        let temp_dir = TempDir::new(function_name!())?;
+
+        let (fio, meta_hand) = temp_dir.fio("sync.db")?;
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+
+        let result: Result<()> = rt.block_on(async {
+            meta_hand.mutate_async(&fio, |m| m.len = 100).await?;
+            let buf = fio.read(1).await?;
+            let meta = from_bytes::<Meta>(&buf.get());
+            assert_eq!({ meta.len }, 100);
+
+            meta_hand.mutate_async(&fio, |m| m.len = 101).await?;
+            let buf = fio.read(0).await?;
+            let meta = from_bytes::<Meta>(&buf.get());
+            assert_eq!({ meta.len }, 101);
+
+            meta_hand.mutate_async(&fio, |m| m.len = 102).await?;
+            let buf = fio.read(1).await?;
+            let meta = from_bytes::<Meta>(&buf.get());
+            assert_eq!({ meta.len }, 102);
+
+            Ok(())
+        });
+        result?;
+
+        Ok(())
     }
 }

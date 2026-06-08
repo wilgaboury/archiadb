@@ -1112,7 +1112,7 @@ mod tests {
         file.flush()?;
         file.sync_all()?;
 
-        let data = fio.read(0).await?;
+        let data = fio.read(NUM_HEADER_PAGES).await?;
 
         if let PageBuf::Pool(shared) = &data {
             println!(
@@ -1148,7 +1148,7 @@ mod tests {
         file.flush()?;
         file.sync_all()?;
 
-        let data = fio.read(0).await?;
+        let data = fio.read(NUM_HEADER_PAGES).await?;
 
         if let PageBuf::Pool(shared) = &data {
             println!(
