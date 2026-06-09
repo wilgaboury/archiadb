@@ -16,6 +16,7 @@ impl TxnFreeDeferMap {
         }
     }
 
+    // TODO: I don't think it's okay to generate the id outside the lock, invalidates finishing assumptions
     fn begin(&self, txn_id: u64) {
         let mut map = self.map.lock();
         map.insert(txn_id, Vec::with_capacity(0));

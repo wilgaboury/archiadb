@@ -14,7 +14,7 @@ use crate::{
     fio::{DEFAULT_CQ_SIZE, DEFAULT_SQ_SIZE, Fio},
     key::{KeyPath, KeyPathBuf},
     lock::{Lock, LockGuard, LockType},
-    meta::{Meta, MetaHandler},
+    meta::MetaHandler,
     trie::TxnKeyTrie,
     txnmap::TxnFreeDeferMap,
 };
