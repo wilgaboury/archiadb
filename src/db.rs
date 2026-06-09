@@ -14,7 +14,7 @@ use crate::{
     fio::{DEFAULT_CQ_SIZE, DEFAULT_SQ_SIZE, Fio},
     key::{KeyPath, KeyPathBuf},
     lock::{Lock, LockGuard, LockType},
-    meta::MetaHandler,
+    meta::{Meta, MetaHandler},
     trie::TxnKeyTrie,
     txnmap::TxnFreeDeferMap,
 };
@@ -25,8 +25,10 @@ struct Db {
 }
 
 struct DbInner {
-    alloc: PageAllocator,
+    file: Arc<DbFile>,
+    meta: MetaHandler,
     fio: Fio,
+    alloc: PageAllocator,
     txn_next_id: AtomicU64,
     txn_free_defer_map: TxnFreeDeferMap,
     read_locks: ConCache<KeyPathBuf, Lock>,
@@ -45,12 +47,21 @@ impl Db {
     ) -> Result<Self> {
         let file = Arc::new(DbFile::open(path)?);
         let meta = MetaHandler::new(&file.file())?;
-        let fio = Fio::new(file, &meta, sq, cq, page_buf_pool, generic_op_state_pool)?;
-        let alloc = PageAllocator::new(fio.clone(), meta).await?;
+        let fio = Fio::new(
+            file.clone(),
+            &meta,
+            sq,
+            cq,
+            page_buf_pool,
+            generic_op_state_pool,
+        )?;
+        let alloc = PageAllocator::new(fio.clone(), &meta).await?;
         Ok(Self {
             inner: Arc::new(DbInner {
-                alloc,
+                file,
+                meta,
                 fio,
+                alloc,
                 txn_next_id: AtomicU64::new(0),
                 txn_free_defer_map: TxnFreeDeferMap::new(),
                 read_locks: ConCache::new(Box::new(|| Lock::new())),

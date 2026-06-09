@@ -78,13 +78,13 @@ mod tests {
     #[tokio::test]
     async fn freed_pages_moved_to_earlier_txn_and_freed_when_no_older_txns() -> Result<()> {
         let dir = TempDir::new(function_name!()).unwrap();
-        let alloc = dir.alloc("file").await?;
+        let (alloc, _fio, meta) = dir.alloc("file").await?;
         let map = TxnFreeDeferMap::new();
 
         let mut set = alloc.create_set();
-        let pg1 = alloc.alloc(&mut set).await?;
-        let pg2 = alloc.alloc(&mut set).await?;
-        let pg3 = alloc.alloc(&mut set).await?;
+        let pg1 = alloc.alloc(&meta, &mut set).await?;
+        let pg2 = alloc.alloc(&meta, &mut set).await?;
+        let pg3 = alloc.alloc(&meta, &mut set).await?;
         set.flush().await?;
 
         map.begin(1);
@@ -118,13 +118,13 @@ mod tests {
     #[tokio::test]
     async fn pages_moved_to_last_active_txn() -> Result<()> {
         let dir = TempDir::new(function_name!()).unwrap();
-        let alloc = dir.alloc("file").await?;
+        let (alloc, _fio, meta) = dir.alloc("file").await?;
         let map = TxnFreeDeferMap::new();
 
         let mut set = alloc.create_set();
-        let pg1 = alloc.alloc(&mut set).await?;
-        let pg2 = alloc.alloc(&mut set).await?;
-        let pg3 = alloc.alloc(&mut set).await?;
+        let pg1 = alloc.alloc(&meta, &mut set).await?;
+        let pg2 = alloc.alloc(&meta, &mut set).await?;
+        let pg3 = alloc.alloc(&meta, &mut set).await?;
         set.flush().await?;
 
         map.begin(1);

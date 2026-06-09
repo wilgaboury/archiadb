@@ -48,15 +48,14 @@ struct Chunk {
     write: Mutex<()>,
 }
 
-pub struct PageAllocator {
+pub(crate) struct PageAllocator {
     segments: [AtomicPtr<Segment>; SEGMENTS_LEN as usize], // maximum of ~17 GB memory, represents ~562 terrabytes of disk assuming 4kb page
     num_segs: AtomicU64,
     num_allocs: AtomicU64,
     fio: Fio,
-    pub meta: MetaHandler,
 }
 
-pub struct AllocationSet<'a> {
+pub(crate) struct AllocationSet<'a> {
     alloc: &'a PageAllocator,
     allocations: HashSet<u64>, // page index
     dirty: HashMap<u64, u64>,  // chunk index, version
@@ -118,16 +117,15 @@ impl<'a> AllocationSet<'a> {
 }
 
 impl PageAllocator {
-    pub async fn new(fio: Fio, meta: MetaHandler) -> Result<Self> {
+    pub async fn new(fio: Fio, meta: &MetaHandler) -> Result<Self> {
         let ret = Self {
             segments: array::from_fn(|_| AtomicPtr::new(ptr::null_mut())),
             num_segs: AtomicU64::new(0),
             num_allocs: AtomicU64::new(0),
             fio,
-            meta,
         };
 
-        let len_pages = ret.pages_len();
+        let len_pages = ret.pages_len(meta);
         let mut x_seg_idx = 0;
         while x_seg_idx < (len_pages / BITS_PER_BYTE) {
             let seg_idx = x_seg_idx / SEGMENT_LEN;
@@ -211,23 +209,22 @@ impl PageAllocator {
         }
     }
 
-    pub async fn alloc(&self, allocs: &mut AllocationSet<'_>) -> Result<u64> {
+    pub async fn alloc(&self, meta: &MetaHandler, allocs: &mut AllocationSet<'_>) -> Result<u64> {
         let mut attempts = 0;
 
         loop {
             if (attempts > SEGMENT_LEN
-                && (self.num_allocs.load(Ordering::Relaxed) as f32 / self.pages_len() as f32)
+                && (self.num_allocs.load(Ordering::Relaxed) as f32 / self.pages_len(meta) as f32)
                     >= EXPAND_FRACTION)
-                || self.meta.len() <= NUM_HEADER_PAGES
+                || meta.len() <= NUM_HEADER_PAGES
             {
-                let len = self.meta.len();
+                let len = meta.len();
                 let new_len = len + 1 + self.pages_per_chunk();
                 self.fio.alloc(new_len).await?;
-                self.meta
-                    .mutate_async(&self.fio, |meta| {
-                        meta.len = meta.len.max(new_len);
-                    })
-                    .await?;
+                meta.mutate_async(&self.fio, |meta| {
+                    meta.len = meta.len.max(new_len);
+                })
+                .await?;
                 {
                     let mut buf = self.fio.get_buf();
                     buf.get_mut().fill(0);
@@ -257,7 +254,7 @@ impl PageAllocator {
             let free_idx = word.trailing_ones();
             if free_idx == 64 {
                 CROSS_SEG_IDX.with(|idx| unsafe {
-                    *idx.get() = (x_seg_idx + 1) % (self.pages_len() / BITS_PER_UNIT)
+                    *idx.get() = (x_seg_idx + 1) % (self.pages_len(meta) / BITS_PER_UNIT)
                 });
                 continue;
             }
@@ -280,7 +277,8 @@ impl PageAllocator {
             } else {
                 // there was conflict move forward one cache line
                 CROSS_SEG_IDX.with(|idx| unsafe {
-                    *idx.get() = (x_seg_idx + CACHE_LINE_SIZE) % (self.pages_len() / BITS_PER_UNIT)
+                    *idx.get() =
+                        (x_seg_idx + CACHE_LINE_SIZE) % (self.pages_len(meta) / BITS_PER_UNIT)
                 });
             }
         }
@@ -368,8 +366,8 @@ impl PageAllocator {
         NUM_HEADER_PAGES + 1 + pg_idx + (pg_idx / self.pages_per_chunk())
     }
 
-    fn pages_len(&self) -> u64 {
-        self.remove_headers_from_pages_len(self.meta.len())
+    fn pages_len(&self, meta: &MetaHandler) -> u64 {
+        self.remove_headers_from_pages_len(meta.len())
     }
 
     fn remove_headers_from_pages_len(&self, len: u64) -> u64 {
@@ -405,23 +403,23 @@ mod tests {
     #[tokio::test]
     async fn simple_test() -> Result<()> {
         let temp_dir = TempDir::new(function_name!())?;
-        let alloc = temp_dir.alloc("file").await?;
+        let (alloc, fio, meta) = temp_dir.alloc("file").await?;
 
-        assert_eq!(2, alloc.meta.len());
-        assert_eq!(2, alloc.fio.len());
+        assert_eq!(2, meta.len());
+        assert_eq!(2, fio.len());
 
-        let len = NUM_HEADER_PAGES + 1 + alloc.meta.page_size() as u64 * BITS_PER_BYTE;
+        let len = NUM_HEADER_PAGES + 1 + meta.page_size() as u64 * BITS_PER_BYTE;
         alloc.fio.alloc(len).await?;
         let mut allocs = alloc.create_set();
-        let pg_idx = alloc.alloc(&mut allocs).await?;
+        let pg_idx = alloc.alloc(&meta, &mut allocs).await?;
 
         assert_eq!(NUM_HEADER_PAGES + 1, pg_idx);
 
-        let pg_idx = alloc.alloc(&mut allocs).await?;
+        let pg_idx = alloc.alloc(&meta, &mut allocs).await?;
 
         assert_eq!(NUM_HEADER_PAGES + 2, pg_idx);
 
-        let pg_idx = alloc.alloc(&mut allocs).await?;
+        let pg_idx = alloc.alloc(&meta, &mut allocs).await?;
 
         assert_eq!(NUM_HEADER_PAGES + 3, pg_idx);
 
@@ -431,12 +429,12 @@ mod tests {
         // only works on little endian systems
         assert_eq!(0b111, buf.get()[0]);
 
-        assert_eq!(NUM_HEADER_PAGES + 4, alloc.alloc(&mut allocs).await?);
+        assert_eq!(NUM_HEADER_PAGES + 4, alloc.alloc(&meta, &mut allocs).await?);
 
         drop(allocs);
 
         let mut allocs = alloc.create_set();
-        assert_eq!(NUM_HEADER_PAGES + 4, alloc.alloc(&mut allocs).await?);
+        assert_eq!(NUM_HEADER_PAGES + 4, alloc.alloc(&meta, &mut allocs).await?);
 
         Ok(())
     }
@@ -445,16 +443,16 @@ mod tests {
     #[tokio::test]
     async fn many_allocs() -> Result<()> {
         let temp_dir = TempDir::new(function_name!())?;
-        let alloc = temp_dir.alloc("file").await?;
+        let (alloc, fio, meta) = temp_dir.alloc("file").await?;
 
         const CHKS: u64 = 6;
 
-        let num_allocs = alloc.fio.page_size() as u64 * BITS_PER_BYTE * CHKS;
+        let num_allocs = fio.page_size() as u64 * BITS_PER_BYTE * CHKS;
 
         let mut allocs = alloc.create_set();
 
         for _ in 0..num_allocs {
-            alloc.alloc(&mut allocs).await?;
+            alloc.alloc(&meta, &mut allocs).await?;
         }
 
         allocs.flush().await?;

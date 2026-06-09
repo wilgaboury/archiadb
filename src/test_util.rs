@@ -69,9 +69,12 @@ impl TempDir {
         Ok((Arc::new(file), meta))
     }
 
-    pub async fn alloc<P: AsRef<Path>>(&self, path: P) -> Result<PageAllocator> {
+    pub async fn alloc<P: AsRef<Path>>(
+        &self,
+        path: P,
+    ) -> Result<(PageAllocator, Fio, MetaHandler)> {
         let (fio, meta) = self.fio(path)?;
-        PageAllocator::new(fio, meta).await
+        Ok((PageAllocator::new(fio.clone(), &meta).await?, fio, meta))
     }
 }
 
