@@ -8,7 +8,6 @@ use std::{
         fd::{AsFd, AsRawFd},
         unix::fs::OpenOptionsExt,
     },
-    path::Path,
     pin::Pin,
     sync::{
         Arc,
@@ -1062,6 +1061,7 @@ mod tests {
     use std::{
         fs,
         io::{Read, Write},
+        path::Path,
     };
 
     use function_name::named;
