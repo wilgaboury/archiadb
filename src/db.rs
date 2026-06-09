@@ -1,4 +1,7 @@
-use std::{path::Path, sync::Arc};
+use std::{
+    path::Path,
+    sync::{Arc, atomic::AtomicU64},
+};
 
 use anyhow::Result;
 use bon::bon;
@@ -13,6 +16,7 @@ use crate::{
     lock::{Lock, LockGuard, LockType},
     meta::MetaHandler,
     trie::TxnKeyTrie,
+    txnmap::TxnFreeDeferMap,
 };
 
 #[derive(Clone)]
@@ -23,6 +27,8 @@ struct Db {
 struct DbInner {
     alloc: PageAllocator,
     fio: Fio,
+    txn_next_id: AtomicU64,
+    txn_free_defer_map: TxnFreeDeferMap,
     read_locks: ConCache<KeyPathBuf, Lock>,
     write_locks: ConCache<KeyPathBuf, Mutex<()>>,
 }
@@ -45,6 +51,8 @@ impl Db {
             inner: Arc::new(DbInner {
                 alloc,
                 fio,
+                txn_next_id: AtomicU64::new(0),
+                txn_free_defer_map: TxnFreeDeferMap::new(),
                 read_locks: ConCache::new(Box::new(|| Lock::new())),
                 write_locks: ConCache::new(Box::new(|| Mutex::new(()))),
             }),
