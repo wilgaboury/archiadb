@@ -236,16 +236,9 @@ mod tests {
     use anyhow::Result;
     use function_name::named;
 
-    use crate::meta::Meta;
-    use crate::util::from_bytes;
-    use crate::{meta::MagicType, test_util::TempDir};
-
-    fn corrupt_page(file: &File, page_size: u64, page_num: u64) -> Result<()> {
-        let offset = page_num * page_size;
-        let garbage = [0u8; size_of::<MagicType>()];
-        file.write_all_at(&garbage, offset)?;
-        Ok(())
-    }
+    use crate::meta::{MAGIC, Meta};
+    use crate::test_util::TempDir;
+    use crate::util::{from_bytes, from_bytes_mut, update_checksum};
 
     #[named]
     #[test]
@@ -305,6 +298,74 @@ mod tests {
             Ok(())
         });
         result?;
+
+        Ok(())
+    }
+
+    #[named]
+    #[test]
+    fn test_version() -> Result<()> {
+        Ok(())
+    }
+
+    #[named]
+    #[test]
+    fn test_corrption() -> Result<()> {
+        fn corrupt_page(file: &File, page_size: u64, page_num: u64) -> Result<()> {
+            file.write_all_at(&[0u8; 1], page_num * page_size)?;
+            Ok(())
+        }
+
+        fn fix_corrupt_page(file: &File, page_size: u64, page_num: u64) -> Result<()> {
+            file.write_all_at(&MAGIC.to_ne_bytes()[0..1], page_num * page_size)?;
+            Ok(())
+        }
+
+        let temp_dir = TempDir::new(function_name!())?;
+        let loc = "meta.db";
+        let file = temp_dir.file(loc)?;
+        let page_size = {
+            let meta_hand = temp_dir.meta(loc)?;
+            meta_hand.page_size
+        };
+
+        corrupt_page(&file, page_size, 0)?;
+        corrupt_page(&file, page_size, 1)?;
+        {
+            assert!(temp_dir.meta(loc).is_err());
+        }
+
+        fix_corrupt_page(&file, page_size, 0)?;
+        {
+            assert!(temp_dir.meta(loc)?.inner.blocking_lock().is_first);
+        }
+
+        corrupt_page(&file, page_size, 0)?;
+        fix_corrupt_page(&file, page_size, 1)?;
+        {
+            assert!(!temp_dir.meta(loc)?.inner.blocking_lock().is_first);
+        }
+
+        fix_corrupt_page(&file, page_size, 0)?;
+        {
+            assert!(temp_dir.meta(loc)?.inner.blocking_lock().is_first);
+        }
+
+        let mut buf = vec![0u8; page_size as usize];
+        {
+            let meta = from_bytes_mut::<Meta>(&mut buf);
+            meta.init(page_size);
+            meta.version += 1;
+        }
+        update_checksum(&mut buf);
+
+        file.write_all_at(&buf, page_size)?;
+        {
+            let meta_hand = temp_dir.meta(loc)?;
+            let inner = meta_hand.inner.blocking_lock();
+            assert!(!inner.is_first);
+            assert_eq!(1, inner.version);
+        }
 
         Ok(())
     }
