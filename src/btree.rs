@@ -1,12 +1,11 @@
 use crate::{
-    btree::SearchResult::Exact,
     const_assert,
     fio::MIN_PAGE_SIZE,
-    key,
     util::{CHECKSUM_SIZE, from_bytes, from_bytes_mut},
 };
 
 const MAX_KEY_SIZE: usize = 256;
+const SLOT_SIZE: usize = size_of::<u32>();
 const PAGE_PTR_SIZE: usize = size_of::<u64>();
 
 /// Inner node layout:
@@ -41,10 +40,10 @@ impl From<u8> for NodeKind {
 }
 
 impl NodeKind {
-    pub fn header_size(&self) -> u32 {
+    pub fn header_size(&self) -> usize {
         match self {
-            NodeKind::BTreeRoot => size_of::<BTreeRootHeader>() as u32,
-            NodeKind::BTreeInner | NodeKind::BTreeLeaf => size_of::<BTreeHeader>() as u32,
+            NodeKind::BTreeRoot => size_of::<BTreeRootHeader>(),
+            NodeKind::BTreeInner | NodeKind::BTreeLeaf => size_of::<BTreeHeader>(),
         }
     }
 }
@@ -80,21 +79,26 @@ struct BTreeLeafSlot {
     data_len: u32,
 }
 
-fn min_one_or_zero(val: u32) -> u32 {
+fn min_one_or_zero(val: usize) -> usize {
     if val > 0 { val - 1 } else { 0 }
 }
 
-fn available(buf: &[u8]) -> u32 {
+fn available(buf: &[u8]) -> usize {
     let header = from_bytes::<BTreeHeader>(buf);
-    (buf.len() as u32) - header.kind.header_size()
+    buf.len() - header.kind.header_size()
 }
 
-fn remaining(buf: &[u8]) -> u32 {
+fn remaining(buf: &[u8]) -> usize {
     let header = from_bytes::<BTreeHeader>(buf);
-    (buf.len() as u32)
-        - (header.kind.header_size()
-            + min_one_or_zero(header.len) * (size_of::<u32>() as u32)
-            + (header.len * (size_of::<u64>() as u32)))
+    let slot_len = min_one_or_zero(header.len as usize);
+    let tail_size = if slot_len == 0 {
+        CHECKSUM_SIZE
+    } else if slot_len == 1 {
+        CHECKSUM_SIZE + PAGE_PTR_SIZE
+    } else {
+        buf.len() - (PAGE_PTR_SIZE + read_slot(buf, slot_len - 1))
+    };
+    buf.len() - (header.kind.header_size() + slot_len * SLOT_SIZE + tail_size)
 }
 
 fn insert_init_inner(buf: &mut [u8], ptr: u64) {
@@ -105,25 +109,34 @@ fn insert_init_inner(buf: &mut [u8], ptr: u64) {
     buf[start..end].copy_from_slice(&ptr.to_ne_bytes());
 }
 
-/// will unconditionally copy the key into the node without checking if there is space, assumes len > 1
-fn insert_at_inner(buf: &[u8], key: &[u8], ptr: u64, idx: u32) {
+/// will unconditionally copy the key into the node without checking if there is space, always inserts as ptr|key
+fn insert_at_inner(buf: &mut [u8], idx: usize, ptr: u64, key: &[u8]) {
     let header = from_bytes::<BTreeHeader>(buf);
     let slots_idx = header.kind.header_size();
-    let slots_len = min_one_or_zero(header.len);
+    let slots_len = min_one_or_zero(header.len as usize);
+    let slots_insert_idx = slots_idx + SLOT_SIZE * idx;
+    let slots_end_idx = slots_idx + SLOT_SIZE * slots_len;
+
+    // let key_insert_idx = read_slot(buf, idx)
+
+    buf.copy_within(
+        slots_insert_idx..slots_end_idx,
+        slots_insert_idx + SLOT_SIZE,
+    );
+    // buf[slots_insert_idx..slots_insert_idx+SLOT_SIZE].copy_from_slice();
 }
 
-fn read_slot(buf: &[u8], idx: u32) -> u32 {
+fn read_slot(buf: &[u8], idx: usize) -> usize {
     let header = from_bytes::<BTreeHeader>(buf);
     let slots_idx = header.kind.header_size();
-    const SLOT_SIZE: u32 = size_of::<u32>() as u32;
-    let start = (slots_idx + SLOT_SIZE * idx) as usize;
-    let end = start + SLOT_SIZE as usize;
+    let start = slots_idx + SLOT_SIZE * idx;
+    let end = start + SLOT_SIZE;
     let mut u32_buf = [0u8; 4];
     u32_buf.copy_from_slice(&buf[start..end]);
-    u32::from_ne_bytes(u32_buf)
+    u32::from_ne_bytes(u32_buf) as usize
 }
 
-fn get_key_inner(buf: &[u8], idx: u32) -> &[u8] {
+fn get_key_inner(buf: &[u8], idx: usize) -> &[u8] {
     let key_idx = read_slot(buf, idx) as usize;
     let key_len = if idx == 0 {
         key_idx - PAGE_PTR_SIZE - CHECKSUM_SIZE
@@ -135,21 +148,19 @@ fn get_key_inner(buf: &[u8], idx: u32) -> &[u8] {
 }
 
 enum SearchResult {
-    Exact(u32),
-    Insert(u32),
+    Exact(usize),
+    Insert(usize),
 }
 
 fn search_inner(buf: &[u8], target: &[u8]) -> SearchResult {
     let header = from_bytes::<BTreeHeader>(buf);
 
-    if header.len == 0 {
+    if header.len <= 1 {
         return SearchResult::Insert(0);
-    } else if header.len == 1 {
-        return SearchResult::Insert(1);
     }
 
     let mut left = 0;
-    let mut right = min_one_or_zero(header.len);
+    let mut right = min_one_or_zero(header.len as usize);
 
     while left < right {
         let mid = left + (left + right) / 2;
