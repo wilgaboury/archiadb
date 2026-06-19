@@ -1,14 +1,17 @@
 use crate::{
+    btree::SearchResult::Exact,
     const_assert,
     fio::MIN_PAGE_SIZE,
-    util::{CHECKSUM_SIZE, from_bytes},
+    key,
+    util::{CHECKSUM_SIZE, from_bytes, from_bytes_mut},
 };
 
 const MAX_KEY_SIZE: usize = 256;
+const PAGE_PTR_SIZE: usize = size_of::<u64>();
 
 /// Inner node layout:
 /// - header
-/// - slots:[u32; len], key_len is derivable
+/// - slots:[u32; max(0,len-1)], key_len is derivable
 /// - data: [u8], grows backward, interleaved child pointer and key
 /// - checksum: u32
 ///
@@ -94,10 +97,71 @@ fn remaining(buf: &[u8]) -> u32 {
             + (header.len * (size_of::<u64>() as u32)))
 }
 
-// only for root and inner
-fn insert_at(buf: &[u8], key: &[u8], idx: u32) {
+fn insert_init_inner(buf: &mut [u8], ptr: u64) {
+    let header = from_bytes_mut::<BTreeHeader>(buf);
+    header.len += 1;
+    let end = buf.len() - CHECKSUM_SIZE;
+    let start = end - PAGE_PTR_SIZE;
+    buf[start..end].copy_from_slice(&ptr.to_ne_bytes());
+}
+
+/// will unconditionally copy the key into the node without checking if there is space, assumes len > 1
+fn insert_at_inner(buf: &[u8], key: &[u8], ptr: u64, idx: u32) {
     let header = from_bytes::<BTreeHeader>(buf);
     let slots_idx = header.kind.header_size();
+    let slots_len = min_one_or_zero(header.len);
+}
+
+fn read_slot(buf: &[u8], idx: u32) -> u32 {
+    let header = from_bytes::<BTreeHeader>(buf);
+    let slots_idx = header.kind.header_size();
+    const SLOT_SIZE: u32 = size_of::<u32>() as u32;
+    let start = (slots_idx + SLOT_SIZE * idx) as usize;
+    let end = start + SLOT_SIZE as usize;
+    let mut u32_buf = [0u8; 4];
+    u32_buf.copy_from_slice(&buf[start..end]);
+    u32::from_ne_bytes(u32_buf)
+}
+
+fn get_key_inner(buf: &[u8], idx: u32) -> &[u8] {
+    let key_idx = read_slot(buf, idx) as usize;
+    let key_len = if idx == 0 {
+        key_idx - PAGE_PTR_SIZE - CHECKSUM_SIZE
+    } else {
+        key_idx - read_slot(buf, idx - 1) as usize - PAGE_PTR_SIZE
+    } as usize;
+
+    &buf[key_idx..(key_idx + key_len)]
+}
+
+enum SearchResult {
+    Exact(u32),
+    Insert(u32),
+}
+
+fn search_inner(buf: &[u8], target: &[u8]) -> SearchResult {
+    let header = from_bytes::<BTreeHeader>(buf);
+
+    if header.len == 0 {
+        return SearchResult::Insert(0);
+    } else if header.len == 1 {
+        return SearchResult::Insert(1);
+    }
+
+    let mut left = 0;
+    let mut right = min_one_or_zero(header.len);
+
+    while left < right {
+        let mid = left + (left + right) / 2;
+        let key = get_key_inner(buf, mid);
+        match key.cmp(target) {
+            std::cmp::Ordering::Equal => return SearchResult::Exact(mid),
+            std::cmp::Ordering::Less => left = mid + 1,
+            std::cmp::Ordering::Greater => right = mid,
+        }
+    }
+
+    SearchResult::Exact(left)
 }
 
 #[test]
