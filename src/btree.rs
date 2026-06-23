@@ -4,9 +4,12 @@ use crate::{
     util::{CHECKSUM_SIZE, from_bytes, from_bytes_mut},
 };
 
+type Slot = u32;
+type PagePtr = u64;
+
 const MAX_KEY_SIZE: usize = 256;
-const SLOT_SIZE: usize = size_of::<u32>();
-const PAGE_PTR_SIZE: usize = size_of::<u64>();
+const SLOT_SIZE: usize = size_of::<Slot>();
+const PAGE_PTR_SIZE: usize = size_of::<PagePtr>();
 
 /// Inner node layout:
 /// - header
@@ -63,6 +66,14 @@ struct BTreeHeader {
     len: u32,
 }
 
+impl BTreeHeader {
+    pub fn init_inner(&mut self) {
+        self.kind = NodeKind::BTreeInner.into();
+        self.parent = 0;
+        self.len = 0;
+    }
+}
+
 #[repr(C, packed)]
 struct BTreeRootHeader {
     header: BTreeHeader,
@@ -111,19 +122,51 @@ fn insert_init_inner(buf: &mut [u8], ptr: u64) {
 
 /// will unconditionally copy the key into the node without checking if there is space, always inserts as ptr|key
 fn insert_at_inner(buf: &mut [u8], idx: usize, ptr: u64, key: &[u8]) {
-    let header = from_bytes::<BTreeHeader>(buf);
-    let slots_idx = header.kind.header_size();
-    let slots_len = min_one_or_zero(header.len as usize);
-    let slots_insert_idx = slots_idx + SLOT_SIZE * idx;
-    let slots_end_idx = slots_idx + SLOT_SIZE * slots_len;
+    {
+        let header = from_bytes::<BTreeHeader>(buf);
+        let slots_idx = header.kind.header_size();
+        let slots_len = min_one_or_zero(header.len as usize);
+        let slots_insert_idx = slots_idx + SLOT_SIZE * idx;
+        let slots_end_idx = slots_idx + SLOT_SIZE * slots_len;
 
-    // let key_insert_idx = read_slot(buf, idx)
+        let key_and_ptr_len = key.len() + PAGE_PTR_SIZE;
+        let key_and_ptr_end = if slots_len == 0 {
+            buf.len() - CHECKSUM_SIZE - PAGE_PTR_SIZE
+        } else {
+            read_slot(buf, idx) - PAGE_PTR_SIZE
+        };
+        let key_and_ptr_start = key_and_ptr_end - key_and_ptr_len;
+        let all_key_and_ptr_start = if slots_len == 0 {
+            buf.len() - CHECKSUM_SIZE - PAGE_PTR_SIZE
+        } else {
+            read_slot(buf, slots_len - 1) - PAGE_PTR_SIZE
+        };
 
-    buf.copy_within(
-        slots_insert_idx..slots_end_idx,
-        slots_insert_idx + SLOT_SIZE,
-    );
-    // buf[slots_insert_idx..slots_insert_idx+SLOT_SIZE].copy_from_slice();
+        buf.copy_within(
+            all_key_and_ptr_start..key_and_ptr_start,
+            all_key_and_ptr_start - key_and_ptr_len,
+        );
+        buf[key_and_ptr_start..key_and_ptr_start + PAGE_PTR_SIZE]
+            .copy_from_slice(&(ptr as PagePtr).to_ne_bytes());
+        buf[key_and_ptr_start + PAGE_PTR_SIZE..key_and_ptr_end].copy_from_slice(key);
+
+        for i in idx..slots_len {
+            let slot_value = read_slot(buf, i);
+            write_slot(buf, i, slot_value - key_and_ptr_len);
+        }
+
+        buf.copy_within(
+            slots_insert_idx..slots_end_idx,
+            slots_insert_idx + SLOT_SIZE,
+        );
+        buf[slots_insert_idx..slots_insert_idx + SLOT_SIZE]
+            .copy_from_slice(&(key_and_ptr_start as u32).to_ne_bytes());
+    }
+
+    {
+        let header = from_bytes_mut::<BTreeHeader>(buf);
+        header.len += 1;
+    }
 }
 
 fn read_slot(buf: &[u8], idx: usize) -> usize {
@@ -134,6 +177,14 @@ fn read_slot(buf: &[u8], idx: usize) -> usize {
     let mut u32_buf = [0u8; 4];
     u32_buf.copy_from_slice(&buf[start..end]);
     u32::from_ne_bytes(u32_buf) as usize
+}
+
+fn write_slot(buf: &mut [u8], idx: usize, value: usize) {
+    let header = from_bytes::<BTreeHeader>(buf);
+    let slots_idx = header.kind.header_size();
+    let start = slots_idx + SLOT_SIZE * idx;
+    let end = start + SLOT_SIZE;
+    buf[start..end].copy_from_slice(&(value as PagePtr).to_ne_bytes());
 }
 
 fn get_key_inner(buf: &[u8], idx: usize) -> &[u8] {
@@ -185,4 +236,33 @@ fn test_access() {
     assert_eq!({ header.header.parent }, 0);
     assert_eq!({ header.sibling }, 0);
     assert_eq!({ header.header.len }, 0);
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        btree::{BTreeHeader, insert_at_inner, insert_init_inner},
+        util::from_bytes_mut,
+    };
+
+    // #[test]
+    // fn simple_inner_node_test() {
+    //     let mut node = [0u8; 48];
+    //     {
+    //         let header = from_bytes_mut::<BTreeHeader>(&mut node);
+    //         header.init_inner();
+    //     }
+
+    //     insert_init_inner(&mut node, 2);
+    //     insert_at_inner(&mut node, 0, 1, b"a");
+
+    //     assert_eq!(
+    //         node,
+    //         [
+    //             1u8, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0,
+    //             0, 0, 0, 0, b'a', 2, 0, 0, 0, 0, 0, 0, 0, /* checksum */ 0, 0, 0, 0, 0, 0, 0,
+    //             0
+    //         ]
+    //     );
+    // }
 }
