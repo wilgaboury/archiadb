@@ -130,12 +130,13 @@ fn insert_at_inner(buf: &mut [u8], idx: usize, ptr: u64, key: &[u8]) {
         let slots_end_idx = slots_idx + SLOT_SIZE * slots_len;
 
         let key_and_ptr_len = key.len() + PAGE_PTR_SIZE;
-        let key_and_ptr_end = if slots_len == 0 {
+        let key_and_ptr_end = if idx == 0 {
             buf.len() - CHECKSUM_SIZE - PAGE_PTR_SIZE
         } else {
-            read_slot(buf, idx) - PAGE_PTR_SIZE
+            read_slot(buf, idx - 1) - PAGE_PTR_SIZE
         };
         let key_and_ptr_start = key_and_ptr_end - key_and_ptr_len;
+        let key_start = key_and_ptr_start + PAGE_PTR_SIZE;
         let all_key_and_ptr_start = if slots_len == 0 {
             buf.len() - CHECKSUM_SIZE - PAGE_PTR_SIZE
         } else {
@@ -143,12 +144,11 @@ fn insert_at_inner(buf: &mut [u8], idx: usize, ptr: u64, key: &[u8]) {
         };
 
         buf.copy_within(
-            all_key_and_ptr_start..key_and_ptr_start,
+            all_key_and_ptr_start..key_and_ptr_end,
             all_key_and_ptr_start - key_and_ptr_len,
         );
-        buf[key_and_ptr_start..key_and_ptr_start + PAGE_PTR_SIZE]
-            .copy_from_slice(&(ptr as PagePtr).to_ne_bytes());
-        buf[key_and_ptr_start + PAGE_PTR_SIZE..key_and_ptr_end].copy_from_slice(key);
+        buf[key_and_ptr_start..key_start].copy_from_slice(&(ptr as PagePtr).to_ne_bytes());
+        buf[key_start..key_and_ptr_end].copy_from_slice(key);
 
         for i in idx..slots_len {
             let slot_value = read_slot(buf, i);
@@ -160,7 +160,7 @@ fn insert_at_inner(buf: &mut [u8], idx: usize, ptr: u64, key: &[u8]) {
             slots_insert_idx + SLOT_SIZE,
         );
         buf[slots_insert_idx..slots_insert_idx + SLOT_SIZE]
-            .copy_from_slice(&(key_and_ptr_start as u32).to_ne_bytes());
+            .copy_from_slice(&(key_start as u32).to_ne_bytes());
     }
 
     {
@@ -184,7 +184,7 @@ fn write_slot(buf: &mut [u8], idx: usize, value: usize) {
     let slots_idx = header.kind.header_size();
     let start = slots_idx + SLOT_SIZE * idx;
     let end = start + SLOT_SIZE;
-    buf[start..end].copy_from_slice(&(value as PagePtr).to_ne_bytes());
+    buf[start..end].copy_from_slice(&(value as Slot).to_ne_bytes());
 }
 
 fn get_key_inner(buf: &[u8], idx: usize) -> &[u8] {
@@ -245,24 +245,97 @@ mod tests {
         util::from_bytes_mut,
     };
 
-    // #[test]
-    // fn simple_inner_node_test() {
-    //     let mut node = [0u8; 48];
-    //     {
-    //         let header = from_bytes_mut::<BTreeHeader>(&mut node);
-    //         header.init_inner();
-    //     }
+    #[test]
+    fn inner_node_insert_test_1() {
+        let mut node = [0u8; 64];
+        {
+            let header = from_bytes_mut::<BTreeHeader>(&mut node);
+            header.init_inner();
+        }
 
-    //     insert_init_inner(&mut node, 2);
-    //     insert_at_inner(&mut node, 0, 1, b"a");
+        insert_init_inner(&mut node, 1);
 
-    //     assert_eq!(
-    //         node,
-    //         [
-    //             1u8, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0,
-    //             0, 0, 0, 0, b'a', 2, 0, 0, 0, 0, 0, 0, 0, /* checksum */ 0, 0, 0, 0, 0, 0, 0,
-    //             0
-    //         ]
-    //     );
-    // }
+        assert_eq!(
+            node,
+            [
+                /* kind */ 1u8, /* parent */ 0, 0, 0, 0, 0, 0, 0, 0, /* len */ 1, 0,
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 0, 0, /* ptr 0 */ 1, 0, 0, 0, 0, 0, 0, 0,
+                /* checksum */ 0, 0, 0, 0, 0, 0, 0, 0
+            ]
+        );
+
+        insert_at_inner(&mut node, 0, 2, b"a");
+
+        assert_eq!(
+            node,
+            [
+                /* kind */ 1u8, /* parent */ 0, 0, 0, 0, 0, 0, 0, 0, /* len */ 2, 0,
+                0, 0, /* slot 0 */ 47, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, /* ptr 0 */ 2, 0, 0, 0, 0, 0, 0, 0,
+                /* key 0 */ b'a', /* ptr 1 */ 1, 0, 0, 0, 0, 0, 0, 0,
+                /* checksum */ 0, 0, 0, 0, 0, 0, 0, 0
+            ]
+        );
+
+        insert_at_inner(&mut node, 0, 3, b"b");
+
+        assert_eq!(
+            node,
+            [
+                /* kind */ 1u8, /* parent */ 0, 0, 0, 0, 0, 0, 0, 0, /* len */ 3, 0,
+                0, 0, /* slot 0 */ 47, 0, 0, 0, /* slot 1 */ 38, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, /* ptr 0 */ 2, 0, 0, 0, 0, 0, 0, 0, /* key 0 */ b'a',
+                /* ptr 1 */ 3, 0, 0, 0, 0, 0, 0, 0, /* key 1 */ b'b', /* ptr 2 */ 1,
+                0, 0, 0, 0, 0, 0, 0, /* checksum */ 0, 0, 0, 0, 0, 0, 0, 0
+            ]
+        );
+    }
+
+    #[test]
+    fn inner_node_insert_test_2() {
+        let mut node = [0u8; 64];
+        {
+            let header = from_bytes_mut::<BTreeHeader>(&mut node);
+            header.init_inner();
+        }
+
+        insert_init_inner(&mut node, 1);
+
+        assert_eq!(
+            node,
+            [
+                /* kind */ 1u8, /* parent */ 0, 0, 0, 0, 0, 0, 0, 0, /* len */ 1, 0,
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 0, 0, /* ptr 0 */ 1, 0, 0, 0, 0, 0, 0, 0,
+                /* checksum */ 0, 0, 0, 0, 0, 0, 0, 0
+            ]
+        );
+
+        insert_at_inner(&mut node, 0, 2, b"a");
+
+        assert_eq!(
+            node,
+            [
+                /* kind */ 1u8, /* parent */ 0, 0, 0, 0, 0, 0, 0, 0, /* len */ 2, 0,
+                0, 0, /* slot 0 */ 47, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, /* ptr 0 */ 2, 0, 0, 0, 0, 0, 0, 0,
+                /* key 0 */ b'a', /* ptr 1 */ 1, 0, 0, 0, 0, 0, 0, 0,
+                /* checksum */ 0, 0, 0, 0, 0, 0, 0, 0
+            ]
+        );
+
+        insert_at_inner(&mut node, 1, 3, b"b");
+
+        assert_eq!(
+            node,
+            [
+                /* kind */ 1u8, /* parent */ 0, 0, 0, 0, 0, 0, 0, 0, /* len */ 3, 0,
+                0, 0, /* slot 0 */ 47, 0, 0, 0, /* slot 1 */ 38, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, /* ptr 0 */ 3, 0, 0, 0, 0, 0, 0, 0, /* key 0 */ b'b',
+                /* ptr 1 */ 2, 0, 0, 0, 0, 0, 0, 0, /* key 1 */ b'a', /* ptr 2 */ 1,
+                0, 0, 0, 0, 0, 0, 0, /* checksum */ 0, 0, 0, 0, 0, 0, 0, 0
+            ]
+        );
+    }
 }
