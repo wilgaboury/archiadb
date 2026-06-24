@@ -22,13 +22,17 @@ For this document, it suffices to say that hierarchical modelling is one style a
 
 ## COW B+trees
 
-B+trees are a ubiquitous data structure for on-disk database formats. In brief, for those unfamiliar, they are a form of self-balancing tree where each node has many children and data is stored only in the leaves. What makes them espetially suitable for databases is that they can be designed such that each node makes efficent use of a fixed amount of space, and most underlying storage devices are designed to work best with fixed size blocks (commonly 4kb, for instance).
+B+trees are a ubiquitous data structure for on-disk database formats. In brief, for those unfamiliar, they are a form of self-balancing sorted tree map where there is a high branching factor and values are stored only in the leaves. What makes them espetially suitable for databases is that they can be designed such that each node makes efficent use of a fixed amount of space, as most underlying storage devices are designed to work best with fixed size blocks (commonly 4kb, for instance).
 
-Before discussing the COW variant, it is pertinent for sake of comparison to discuss the in-place version used by many database systems. Each modifying operation is carefully programmed so that it is idemponent; a record describing said operation is appended to a write ahead log (WAL) before it is actually executed. On an unexpected shutdown, operations from the WAL may be safely replayed, which will clean up any partially applied modifications to the B+tree.
+Before discussing the COW variant, it is pertinent for sake of comparison to discuss the in-place version used by many database systems. In such systems, tree modifying operation are carefully programmed to be idemponent; a record describing said operation is appended to a write ahead log (WAL) before it is actually executed. On an unexpected shutdown, operations from the WAL may be safely replayed, which will clean up any partially applied modifications to the B+tree. Ultimately this ensures on-disk data integrity.
+
+### Path Copying
 
 TODO: explain path copying
 
-### Double Buffered Pages
+### Double Buffered Root Node
+
+TODO: explain double buffered roots
 
 ## Transactions
 
