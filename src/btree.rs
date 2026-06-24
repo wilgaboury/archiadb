@@ -187,6 +187,27 @@ fn write_slot(buf: &mut [u8], idx: usize, value: usize) {
     buf[start..end].copy_from_slice(&(value as Slot).to_ne_bytes());
 }
 
+fn read_page_ptr(buf: &[u8], idx: usize) -> u64 {
+    let mut u64_buf = [0u8; 8];
+    let loc = if idx == 0 {
+        buf.len() - CHECKSUM_SIZE - PAGE_PTR_SIZE
+    } else {
+        read_slot(buf, idx - 1) - PAGE_PTR_SIZE
+    };
+    u64_buf.copy_from_slice(&buf[loc..loc + PAGE_PTR_SIZE]);
+    u64::from_ne_bytes(u64_buf)
+}
+
+fn read_key(buf: &[u8], idx: usize) -> &[u8] {
+    let end = if idx == 0 {
+        buf.len() - CHECKSUM_SIZE - PAGE_PTR_SIZE
+    } else {
+        read_slot(buf, idx - 1) - PAGE_PTR_SIZE
+    };
+    let start = read_slot(buf, idx);
+    &buf[start..end]
+}
+
 fn get_key_inner(buf: &[u8], idx: usize) -> &[u8] {
     let key_idx = read_slot(buf, idx) as usize;
     let key_len = if idx == 0 {
