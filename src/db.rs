@@ -121,7 +121,7 @@ impl TxnBuilder {
     }
 }
 
-struct Txn {
+pub struct Txn {
     db: Db,
     guards: Vec<LockGuard>,
 }

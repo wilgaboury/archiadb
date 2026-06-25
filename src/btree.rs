@@ -1,6 +1,8 @@
 use crate::{
     const_assert,
+    db::Txn,
     fio::MIN_PAGE_SIZE,
+    key_path,
     util::{CHECKSUM_SIZE, from_bytes, from_bytes_mut},
 };
 
@@ -245,6 +247,10 @@ fn search_inner(buf: &[u8], target: &[u8]) -> SearchResult {
     }
 
     SearchResult::Exact(left)
+}
+
+impl Txn {
+    async fn insert(&mut self, key: &[u8]) {}
 }
 
 #[test]
