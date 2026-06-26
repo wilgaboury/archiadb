@@ -1,11 +1,8 @@
-use std::{
-    path::Path,
-    sync::{Arc, atomic::AtomicU64},
-};
+use std::{path::Path, sync::Arc};
 
 use anyhow::Result;
 use bon::bon;
-use parking_lot::Mutex;
+use tokio::sync::Mutex;
 
 use crate::{
     alloc::PageAllocator,
@@ -20,18 +17,18 @@ use crate::{
 };
 
 #[derive(Clone)]
-struct Db {
-    inner: Arc<DbInner>,
+pub struct Db {
+    pub(crate) inner: Arc<DbInner>,
 }
 
-struct DbInner {
-    file: Arc<DbFile>,
-    meta: MetaHandler,
-    fio: Fio,
-    alloc: PageAllocator,
-    txn_free_defer_map: TxnFreeDeferMap,
-    read_locks: ConCache<KeyPathBuf, Lock>,
-    write_locks: ConCache<KeyPathBuf, Mutex<()>>,
+pub(crate) struct DbInner {
+    pub(crate) file: Arc<DbFile>,
+    pub(crate) meta: MetaHandler,
+    pub(crate) fio: Fio,
+    pub(crate) alloc: PageAllocator,
+    pub(crate) txn_free_defer_map: TxnFreeDeferMap,
+    pub(crate) read_locks: ConCache<KeyPathBuf, Lock>,
+    pub(crate) write_locks: ConCache<KeyPathBuf, Mutex<()>>,
 }
 
 #[bon]
@@ -122,8 +119,8 @@ impl TxnBuilder {
 }
 
 pub struct Txn {
-    db: Db,
-    guards: Vec<LockGuard>,
+    pub(crate) db: Db,
+    pub(crate) guards: Vec<LockGuard>,
 }
 
 impl Txn {

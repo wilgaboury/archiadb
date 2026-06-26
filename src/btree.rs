@@ -1,9 +1,17 @@
+use std::{
+    io::BufRead,
+    time::{Duration, Instant},
+};
+
+use anyhow::{Result, bail};
+
 use crate::{
     const_assert,
-    db::Txn,
-    fio::MIN_PAGE_SIZE,
+    db::{Db, Txn},
+    fio::{Fio, MIN_PAGE_SIZE, PageBuf},
+    key::KeyPath,
     key_path,
-    util::{CHECKSUM_SIZE, from_bytes, from_bytes_mut},
+    util::{CHECKSUM_SIZE, from_bytes, from_bytes_mut, has_valid_checksum},
 };
 
 type Slot = u32;
@@ -249,8 +257,90 @@ fn search_inner(buf: &[u8], target: &[u8]) -> SearchResult {
     SearchResult::Exact(left)
 }
 
-impl Txn {
-    async fn insert(&mut self, key: &[u8]) {}
+struct RootDoublePageBuf {
+    front_pg_idx: u64,
+    front: PageBuf,
+    back_pg_idx: u64,
+    back: PageBuf,
+}
+
+impl RootDoublePageBuf {
+    pub async fn new_no_retry(fio: &Fio, pg_idx1: u64, pg_idx2: u64) -> Result<Self> {
+        let pg1 = fio.read(pg_idx1).await?;
+        let pg2 = fio.read(pg_idx2).await?;
+        let ((front_pg_idx, front), (back_pg_idx, back)) =
+            Self::order_front_back(pg_idx1, pg1, pg_idx2, pg2)?;
+        Ok(Self {
+            front_pg_idx,
+            front,
+            back_pg_idx,
+            back,
+        })
+    }
+
+    /// For read-only transactions, it's possible that page reads both fail checksum so as
+    /// a last ditch it will acquire a write lock to do a consistent read.
+    pub async fn new_retry(
+        db: &Db,
+        key: &KeyPath,
+        pg_idx1: u64,
+        pg_idx2: u64,
+        timeout: Duration,
+    ) -> Result<Self> {
+        let start = Instant::now();
+        while Instant::now().duration_since(start) < timeout {
+            let pg1 = db.inner.fio.read(pg_idx1).await?;
+            let pg2 = db.inner.fio.read(pg_idx2).await?;
+            if let Ok(((front_pg_idx, front), (back_pg_idx, back))) =
+                Self::order_front_back(pg_idx1, pg1, pg_idx2, pg2)
+            {
+                return Ok(Self {
+                    front_pg_idx,
+                    front,
+                    back_pg_idx,
+                    back,
+                });
+            }
+        }
+
+        let carc = db.inner.write_locks.get(key.to_owned());
+        let _gaurd = carc.lock().await;
+        Self::new_no_retry(&db.inner.fio, pg_idx1, pg_idx2).await
+    }
+
+    fn order_front_back(
+        pg_idx1: u64,
+        pg1: PageBuf,
+        pg_idx2: u64,
+        pg2: PageBuf,
+    ) -> Result<((u64, PageBuf), (u64, PageBuf))> {
+        let pg1_checksum_valid = has_valid_checksum(&pg1.get());
+        let pg2_checksum_valid = has_valid_checksum(&pg2.get());
+
+        if !pg1_checksum_valid && !pg2_checksum_valid {
+            bail!("both invalid")
+        } else if pg1_checksum_valid && !pg2_checksum_valid {
+            Ok(((pg_idx1, pg1), (pg_idx2, pg2)))
+        } else if !pg1_checksum_valid && pg2_checksum_valid {
+            Ok(((pg_idx2, pg2), (pg_idx1, pg1)))
+        } else {
+            // Both checksums are valid, choose the one with higher version
+            let keep_order = {
+                let root1 = from_bytes::<BTreeRootHeader>(&pg1.get());
+                let root2 = from_bytes::<BTreeRootHeader>(&pg2.get());
+                root1.version >= root2.version
+            };
+            if keep_order {
+                Ok(((pg_idx1, pg1), (pg_idx2, pg2)))
+            } else {
+                Ok(((pg_idx2, pg2), (pg_idx1, pg1)))
+            }
+        }
+    }
+}
+
+impl Db {
+    async fn insert(&mut self, key: &[u8], value: &[u8], root: RootDoublePageBuf) {}
 }
 
 #[test]
