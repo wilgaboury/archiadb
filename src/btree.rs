@@ -35,28 +35,28 @@ const PAGE_PTR_SIZE: usize = size_of::<PagePtr>();
 
 #[repr(u8)]
 #[derive(PartialEq, Eq, Debug, Clone)]
-enum NodeKind {
-    BTreeRoot = 0,
-    BTreeInner,
-    BTreeLeaf,
+enum BTreeNodeKind {
+    Root = 0,
+    Inner,
+    Leaf,
 }
 
-impl From<u8> for NodeKind {
+impl From<u8> for BTreeNodeKind {
     fn from(value: u8) -> Self {
         match value {
-            0 => NodeKind::BTreeRoot,
-            1 => NodeKind::BTreeInner,
-            2 => NodeKind::BTreeLeaf,
+            0 => BTreeNodeKind::Root,
+            1 => BTreeNodeKind::Inner,
+            2 => BTreeNodeKind::Leaf,
             _ => panic!("invalid discriminant"),
         }
     }
 }
 
-impl NodeKind {
+impl BTreeNodeKind {
     pub fn header_size(&self) -> usize {
         match self {
-            NodeKind::BTreeRoot => size_of::<BTreeRootHeader>(),
-            NodeKind::BTreeInner | NodeKind::BTreeLeaf => size_of::<BTreeHeader>(),
+            BTreeNodeKind::Root => size_of::<BTreeRootHeader>(),
+            BTreeNodeKind::Inner | BTreeNodeKind::Leaf => size_of::<BTreeHeader>(),
         }
     }
 }
@@ -71,14 +71,14 @@ enum DataKind {
 
 #[repr(C, packed)]
 struct BTreeHeader {
-    kind: NodeKind,
+    kind: BTreeNodeKind,
     parent: u64,
     len: u32,
 }
 
 impl BTreeHeader {
     pub fn init_inner(&mut self) {
-        self.kind = NodeKind::BTreeInner.into();
+        self.kind = BTreeNodeKind::Inner.into();
         self.parent = 0;
         self.len = 0;
     }
@@ -341,6 +341,11 @@ impl RootDoublePageBuf {
 
 impl Db {
     async fn insert(&mut self, key: &[u8], value: &[u8], root: RootDoublePageBuf) {}
+
+    async fn insert_help(&mut self, key: &[u8], value: &[u8], pg_idx: u64, pg: PageBuf) {
+        let header = from_bytes::<BTreeHeader>(pg.get());
+        if header.kind == BTreeNodeKind::Leaf {}
+    }
 }
 
 #[test]
@@ -348,7 +353,7 @@ fn test_access() {
     let buffer = vec![0u8; 4096];
     let slice = &buffer[1..];
     let header = from_bytes::<BTreeRootHeader>(slice);
-    assert_eq!({ header.header.kind.clone() }, NodeKind::BTreeRoot);
+    assert_eq!({ header.header.kind.clone() }, BTreeNodeKind::Root);
     assert_eq!({ header.version }, 0);
     assert_eq!({ header.header.parent }, 0);
     assert_eq!({ header.sibling }, 0);
