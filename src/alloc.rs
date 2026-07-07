@@ -55,18 +55,9 @@ pub(crate) struct PageAllocator {
     fio: Fio,
 }
 
-pub(crate) struct AllocationSet<'a> {
-    alloc: &'a PageAllocator,
+pub(crate) struct AllocationSet {
     allocations: HashSet<u64>, // page index
     dirty: HashMap<u64, u64>,  // chunk index, version
-}
-
-impl<'a> Drop for AllocationSet<'a> {
-    fn drop(&mut self) {
-        for allocation in &self.allocations {
-            self.alloc.free(*allocation);
-        }
-    }
 }
 
 thread_local! {
@@ -102,17 +93,30 @@ impl Chunk {
     }
 }
 
-impl<'a> AllocationSet<'a> {
-    pub async fn flush(&mut self) -> Result<()> {
+impl AllocationSet {
+    pub fn new() -> Self {
+        Self {
+            allocations: HashSet::new(),
+            dirty: HashMap::new(),
+        }
+    }
+
+    pub async fn flush(&mut self, alloc: &PageAllocator) -> Result<()> {
         for (chunk_idx, version) in &self.dirty {
             // just a note, short circuit from error may temporarily leak blocks in already written chunk headers
-            self.alloc.flush(*chunk_idx, *version).await?;
+            alloc.flush(*chunk_idx, *version).await?;
         }
 
         self.allocations.clear();
         self.dirty.clear();
 
         Ok(())
+    }
+
+    pub fn free(&mut self, alloc: &PageAllocator) {
+        for allocation in &self.allocations {
+            alloc.free(*allocation);
+        }
     }
 }
 
@@ -201,15 +205,7 @@ impl PageAllocator {
         }
     }
 
-    pub fn create_set(&self) -> AllocationSet<'_> {
-        AllocationSet {
-            alloc: &self,
-            allocations: HashSet::new(),
-            dirty: HashMap::new(),
-        }
-    }
-
-    pub async fn alloc(&self, meta: &MetaHandler, allocs: &mut AllocationSet<'_>) -> Result<u64> {
+    pub async fn alloc(&self, meta: &MetaHandler, allocs: &mut AllocationSet) -> Result<u64> {
         let mut attempts = 0;
 
         loop {
@@ -395,7 +391,7 @@ mod tests {
     use function_name::named;
 
     use crate::{
-        alloc::{BITS_PER_BYTE, NUM_HEADER_PAGES},
+        alloc::{AllocationSet, BITS_PER_BYTE, NUM_HEADER_PAGES},
         test_util::TempDir,
     };
 
@@ -410,7 +406,7 @@ mod tests {
 
         let len = NUM_HEADER_PAGES + 1 + meta.page_size() as u64 * BITS_PER_BYTE;
         alloc.fio.alloc(len).await?;
-        let mut allocs = alloc.create_set();
+        let mut allocs = AllocationSet::new();
         let pg_idx = alloc.alloc(&meta, &mut allocs).await?;
 
         assert_eq!(NUM_HEADER_PAGES + 1, pg_idx);
@@ -423,7 +419,7 @@ mod tests {
 
         assert_eq!(NUM_HEADER_PAGES + 3, pg_idx);
 
-        allocs.flush().await?;
+        allocs.flush(&alloc).await?;
 
         let buf = alloc.fio.read(NUM_HEADER_PAGES).await?;
         // only works on little endian systems
@@ -431,9 +427,9 @@ mod tests {
 
         assert_eq!(NUM_HEADER_PAGES + 4, alloc.alloc(&meta, &mut allocs).await?);
 
-        drop(allocs);
+        allocs.free(&alloc);
 
-        let mut allocs = alloc.create_set();
+        let mut allocs = AllocationSet::new();
         assert_eq!(NUM_HEADER_PAGES + 4, alloc.alloc(&meta, &mut allocs).await?);
 
         Ok(())
@@ -449,13 +445,13 @@ mod tests {
 
         let num_allocs = fio.page_size() as u64 * BITS_PER_BYTE * CHKS;
 
-        let mut allocs = alloc.create_set();
+        let mut allocs = AllocationSet::new();
 
         for _ in 0..num_allocs {
             alloc.alloc(&meta, &mut allocs).await?;
         }
 
-        allocs.flush().await?;
+        allocs.flush(&alloc).await?;
 
         assert!(alloc.num_segs.load(Ordering::Acquire) >= (CHKS / 2));
 

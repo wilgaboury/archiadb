@@ -5,7 +5,7 @@ use bon::bon;
 use tokio::sync::Mutex;
 
 use crate::{
-    alloc::PageAllocator,
+    alloc::{AllocationSet, PageAllocator},
     concache::ConCache,
     file::DbFile,
     fio::{DEFAULT_CQ_SIZE, DEFAULT_SQ_SIZE, Fio},
@@ -77,7 +77,7 @@ impl Db {
     }
 }
 
-struct TxnBuilder {
+pub struct TxnBuilder {
     db: Db,
     ops: TxnKeyTrie,
 }
@@ -111,16 +111,25 @@ impl TxnBuilder {
             );
         }
         guards.reverse();
+
+        // There can be no failable code between this line and struct initialization
+        let txn_free_defer_id = self.db.inner.txn_free_defer_map.begin();
         Txn {
+            txn_free_defer_id,
             db: self.db,
             guards,
+            allocs: AllocationSet::new(),
+            free: Vec::new(),
         }
     }
 }
 
 pub struct Txn {
+    pub(crate) txn_free_defer_id: u64,
     pub(crate) db: Db,
     pub(crate) guards: Vec<LockGuard>,
+    pub(crate) allocs: AllocationSet,
+    pub(crate) free: Vec<u64>,
 }
 
 impl Txn {
@@ -146,6 +155,17 @@ impl Txn {
     pub async fn commit(&mut self) {
         // collect write paths and then acquire in reverse/bottom-up order
         todo!()
+    }
+}
+
+impl Drop for Txn {
+    fn drop(&mut self) {
+        self.db.inner.txn_free_defer_map.finish(
+            self.txn_free_defer_id,
+            &mut self.free,
+            &self.db.inner.alloc,
+        );
+        self.allocs.free(&self.db.inner.alloc);
     }
 }
 

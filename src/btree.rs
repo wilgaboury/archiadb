@@ -1,17 +1,14 @@
-use std::{
-    io::BufRead,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 
 use crate::{
+    btree::LeafDataKind::ValueEmbedded,
     const_assert,
     db::{Db, Txn},
     fio::{Fio, MIN_PAGE_SIZE, PageBuf},
     key::KeyPath,
-    key_path,
-    util::{CHECKSUM_SIZE, from_bytes, from_bytes_mut, has_valid_checksum},
+    util::{CHECKSUM_SIZE, from_bytes, from_bytes_mut, has_valid_checksum, update_checksum},
 };
 
 type Slot = u32;
@@ -20,16 +17,17 @@ type PagePtr = u64;
 const MAX_KEY_SIZE: usize = 256;
 const SLOT_SIZE: usize = size_of::<Slot>();
 const PAGE_PTR_SIZE: usize = size_of::<PagePtr>();
+const LINKED_LIST_VALUE_LEN_SIZE: usize = size_of::<u64>();
 
 /// Inner node layout:
 /// - header
-/// - slots:[u32; max(0,len-1)], key_len is derivable
+/// - slots:[u32; max(0,len-1)], key_len is derivable, pointer to beginning of key
 /// - data: [u8], grows backward, interleaved child pointer and key
 /// - checksum: u32
 ///
 /// Leaf node layout:
 /// - header
-/// - slots: [u32; len]
+/// - slots: [u32; len], key_len is derivable, pointer to beginning of (value,key)
 /// - data: [u8], grows backward, interleaved key and value
 /// - checksum: u32
 
@@ -62,11 +60,22 @@ impl BTreeNodeKind {
 }
 
 #[repr(u8)]
-#[derive(PartialEq)]
-enum DataKind {
-    Btree,
-    ValueEmbedded,
+#[derive(PartialEq, Eq, Debug, Clone)]
+enum LeafDataKind {
+    Btree = 0,
+    ValueEmbedded, // len, value
     ValueLinkedList,
+}
+
+impl From<u8> for LeafDataKind {
+    fn from(value: u8) -> Self {
+        match value {
+            0 => LeafDataKind::Btree,
+            1 => LeafDataKind::ValueEmbedded,
+            2 => LeafDataKind::ValueLinkedList,
+            _ => panic!("invalid discriminant"),
+        }
+    }
 }
 
 #[repr(C, packed)]
@@ -100,30 +109,62 @@ struct BTreeLeafSlot {
     data_len: u32,
 }
 
-fn min_one_or_zero(val: usize) -> usize {
-    if val > 0 { val - 1 } else { 0 }
+trait BTreeNodeBuf {
+    fn header(&self) -> &BTreeHeader;
+    fn header_mut(&mut self) -> &mut BTreeHeader;
+    fn root_header(&self) -> &BTreeRootHeader;
+    fn root_header_mut(&mut self) -> &mut BTreeRootHeader;
+    fn slots_len(&self) -> usize;
+    fn remaining(&self) -> usize;
+    fn available(&self) -> usize;
 }
 
-fn available(buf: &[u8]) -> usize {
-    let header = from_bytes::<BTreeHeader>(buf);
-    buf.len() - header.kind.header_size()
-}
+impl BTreeNodeBuf for [u8] {
+    fn header(&self) -> &BTreeHeader {
+        from_bytes::<BTreeHeader>(self)
+    }
 
-fn remaining(buf: &[u8]) -> usize {
-    let header = from_bytes::<BTreeHeader>(buf);
-    let slot_len = min_one_or_zero(header.len as usize);
-    let tail_size = if slot_len == 0 {
-        CHECKSUM_SIZE
-    } else if slot_len == 1 {
-        CHECKSUM_SIZE + PAGE_PTR_SIZE
-    } else {
-        buf.len() - (PAGE_PTR_SIZE + read_slot(buf, slot_len - 1))
-    };
-    buf.len() - (header.kind.header_size() + slot_len * SLOT_SIZE + tail_size)
+    fn header_mut(&mut self) -> &mut BTreeHeader {
+        from_bytes_mut::<BTreeHeader>(self)
+    }
+
+    fn root_header(&self) -> &BTreeRootHeader {
+        from_bytes::<BTreeRootHeader>(self)
+    }
+
+    fn root_header_mut(&mut self) -> &mut BTreeRootHeader {
+        from_bytes_mut::<BTreeRootHeader>(self)
+    }
+
+    fn slots_len(&self) -> usize {
+        let header = self.header();
+        match header.kind {
+            BTreeNodeKind::Root | BTreeNodeKind::Inner => {
+                (if header.len > 0 { header.len - 1 } else { 0 }) as usize
+            }
+            BTreeNodeKind::Leaf => header.len as usize,
+        }
+    }
+
+    fn remaining(&self) -> usize {
+        let slots_len = self.slots_len();
+        let tail_size = if slots_len == 0 {
+            CHECKSUM_SIZE
+        } else if slots_len == 1 {
+            CHECKSUM_SIZE + PAGE_PTR_SIZE
+        } else {
+            self.len() - (PAGE_PTR_SIZE + read_slot(self, slots_len - 1))
+        };
+        self.len() - (self.header().kind.header_size() + slots_len * SLOT_SIZE + tail_size)
+    }
+
+    fn available(&self) -> usize {
+        self.len() - self.header().kind.header_size()
+    }
 }
 
 fn insert_init_inner(buf: &mut [u8], ptr: u64) {
-    let header = from_bytes_mut::<BTreeHeader>(buf);
+    let header = buf.header_mut();
     header.len += 1;
     let end = buf.len() - CHECKSUM_SIZE;
     let start = end - PAGE_PTR_SIZE;
@@ -131,11 +172,11 @@ fn insert_init_inner(buf: &mut [u8], ptr: u64) {
 }
 
 /// will unconditionally copy the key into the node without checking if there is space, always inserts as ptr|key
-fn insert_at_inner(buf: &mut [u8], idx: usize, ptr: u64, key: &[u8]) {
+fn insert_at_inner(buf: &mut [u8], idx: usize, left: PagePtr, key: &[u8], right: PagePtr) {
     {
-        let header = from_bytes::<BTreeHeader>(buf);
+        let header = buf.header();
         let slots_idx = header.kind.header_size();
-        let slots_len = min_one_or_zero(header.len as usize);
+        let slots_len = buf.slots_len();
         let slots_insert_idx = slots_idx + SLOT_SIZE * idx;
         let slots_end_idx = slots_idx + SLOT_SIZE * slots_len;
 
@@ -157,8 +198,9 @@ fn insert_at_inner(buf: &mut [u8], idx: usize, ptr: u64, key: &[u8]) {
             all_key_and_ptr_start..key_and_ptr_end,
             all_key_and_ptr_start - key_and_ptr_len,
         );
-        buf[key_and_ptr_start..key_start].copy_from_slice(&(ptr as PagePtr).to_ne_bytes());
+        buf[key_and_ptr_start..key_start].copy_from_slice(&left.to_ne_bytes());
         buf[key_start..key_and_ptr_end].copy_from_slice(key);
+        buf[key_and_ptr_end..key_and_ptr_end + PAGE_PTR_SIZE].copy_from_slice(&right.to_ne_bytes());
 
         for i in idx..slots_len {
             let slot_value = read_slot(buf, i);
@@ -174,7 +216,7 @@ fn insert_at_inner(buf: &mut [u8], idx: usize, ptr: u64, key: &[u8]) {
     }
 
     {
-        let header = from_bytes_mut::<BTreeHeader>(buf);
+        let header = buf.header_mut();
         header.len += 1;
     }
 }
@@ -219,11 +261,33 @@ fn read_key(buf: &[u8], idx: usize) -> &[u8] {
 }
 
 fn get_key_inner(buf: &[u8], idx: usize) -> &[u8] {
-    let key_idx = read_slot(buf, idx) as usize;
+    let key_idx = read_slot(buf, idx);
     let key_len = if idx == 0 {
         key_idx - PAGE_PTR_SIZE - CHECKSUM_SIZE
     } else {
-        key_idx - read_slot(buf, idx - 1) as usize - PAGE_PTR_SIZE
+        key_idx - read_slot(buf, idx - 1) - PAGE_PTR_SIZE
+    } as usize;
+
+    &buf[key_idx..(key_idx + key_len)]
+}
+
+fn get_key_leaf(buf: &[u8], idx: usize) -> &[u8] {
+    let val_key_idx = read_slot(buf, idx);
+    let val_len = 1 + match LeafDataKind::from(buf[val_key_idx]) {
+        LeafDataKind::Btree => 2 * PAGE_PTR_SIZE,
+        LeafDataKind::ValueEmbedded => {
+            let mut val_len_buf = [0u8; size_of::<u32>()];
+            let len_idx = val_key_idx + 1;
+            val_len_buf.copy_from_slice(&buf[len_idx..len_idx + size_of::<u32>()]);
+            u32::from_ne_bytes(val_len_buf) as usize
+        }
+        LeafDataKind::ValueLinkedList => PAGE_PTR_SIZE + LINKED_LIST_VALUE_LEN_SIZE,
+    };
+    let key_idx = val_key_idx + val_len;
+    let key_len = if idx == 0 {
+        key_idx - CHECKSUM_SIZE
+    } else {
+        key_idx - read_slot(buf, idx - 1)
     } as usize;
 
     &buf[key_idx..(key_idx + key_len)]
@@ -242,11 +306,30 @@ fn search_inner(buf: &[u8], target: &[u8]) -> SearchResult {
     }
 
     let mut left = 0;
-    let mut right = min_one_or_zero(header.len as usize);
+    let mut right = buf.slots_len();
 
     while left < right {
         let mid = left + (left + right) / 2;
         let key = get_key_inner(buf, mid);
+        match key.cmp(target) {
+            std::cmp::Ordering::Equal => return SearchResult::Exact(mid),
+            std::cmp::Ordering::Less => left = mid + 1,
+            std::cmp::Ordering::Greater => right = mid,
+        }
+    }
+
+    SearchResult::Exact(left)
+}
+
+fn search_leaf(buf: &[u8], target: &[u8]) -> SearchResult {
+    let header = from_bytes::<BTreeHeader>(buf);
+
+    let mut left = 0;
+    let mut right = buf.slots_len();
+
+    while left < right {
+        let mid = left + (left + right) / 2;
+        let key = get_key_leaf(buf, mid);
         match key.cmp(target) {
             std::cmp::Ordering::Equal => return SearchResult::Exact(mid),
             std::cmp::Ordering::Less => left = mid + 1,
@@ -339,12 +422,66 @@ impl RootDoublePageBuf {
     }
 }
 
-impl Db {
+enum InsertResult {
+    Single(u64),
+    Split(u64, Box<[u8]>, u64),
+}
+
+impl Txn {
     async fn insert(&mut self, key: &[u8], value: &[u8], root: RootDoublePageBuf) {}
 
-    async fn insert_help(&mut self, key: &[u8], value: &[u8], pg_idx: u64, pg: PageBuf) {
+    async fn insert_help(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+        pg_idx: u64,
+        pg: PageBuf,
+    ) -> Result<()> {
+        let db = &self.db.inner;
         let header = from_bytes::<BTreeHeader>(pg.get());
-        if header.kind == BTreeNodeKind::Leaf {}
+        if header.kind == BTreeNodeKind::Leaf {
+            let ret = self.insert_leaf(key, value, pg).await?;
+            self.free.push(pg_idx);
+        }
+        Ok(())
+    }
+
+    async fn insert_leaf(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+        mut pg: PageBuf,
+    ) -> Result<InsertResult> {
+        // let new_pg_idx = self.db.alloc.alloc(&db.meta, &mut self.allocs).await?;
+
+        let header = pg.get_mut().header_mut();
+
+        Ok(InsertResult::Single(0))
+    }
+
+    async fn create_value_linked_list(&mut self, value: &[u8]) -> Result<u64> {
+        let chunk_size = self.db.inner.meta.page_size() as usize - PAGE_PTR_SIZE - CHECKSUM_SIZE;
+        let mut prev_pg_idx = 0u64;
+        for chunk in value.chunks(chunk_size) {
+            let pg_idx = self.alloc().await?;
+            let mut buf = self.db.inner.fio.get_buf();
+            let b = buf.get_mut();
+            let len = chunk.len();
+            b[..len].copy_from_slice(chunk);
+            b[len..len + PAGE_PTR_SIZE].copy_from_slice(&prev_pg_idx.to_ne_bytes());
+            update_checksum(b);
+            prev_pg_idx = pg_idx;
+            self.db.inner.fio.write(pg_idx, buf).await?;
+        }
+        Ok(prev_pg_idx)
+    }
+
+    async fn alloc(&mut self) -> Result<u64> {
+        self.db
+            .inner
+            .alloc
+            .alloc(&self.db.inner.meta, &mut self.allocs)
+            .await
     }
 }
 
@@ -387,7 +524,7 @@ mod tests {
             ]
         );
 
-        insert_at_inner(&mut node, 0, 2, b"a");
+        insert_at_inner(&mut node, 0, 2, b"a", 3);
 
         assert_eq!(
             node,
@@ -395,12 +532,12 @@ mod tests {
                 /* kind */ 1u8, /* parent */ 0, 0, 0, 0, 0, 0, 0, 0, /* len */ 2, 0,
                 0, 0, /* slot 0 */ 47, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                 0, 0, 0, 0, 0, 0, 0, /* ptr 0 */ 2, 0, 0, 0, 0, 0, 0, 0,
-                /* key 0 */ b'a', /* ptr 1 */ 1, 0, 0, 0, 0, 0, 0, 0,
+                /* key 0 */ b'a', /* ptr 1 */ 3, 0, 0, 0, 0, 0, 0, 0,
                 /* checksum */ 0, 0, 0, 0, 0, 0, 0, 0
             ]
         );
 
-        insert_at_inner(&mut node, 0, 3, b"b");
+        insert_at_inner(&mut node, 0, 4, b"b", 5);
 
         assert_eq!(
             node,
@@ -408,7 +545,7 @@ mod tests {
                 /* kind */ 1u8, /* parent */ 0, 0, 0, 0, 0, 0, 0, 0, /* len */ 3, 0,
                 0, 0, /* slot 0 */ 47, 0, 0, 0, /* slot 1 */ 38, 0, 0, 0, 0, 0, 0, 0, 0,
                 0, 0, 0, 0, /* ptr 0 */ 2, 0, 0, 0, 0, 0, 0, 0, /* key 0 */ b'a',
-                /* ptr 1 */ 3, 0, 0, 0, 0, 0, 0, 0, /* key 1 */ b'b', /* ptr 2 */ 1,
+                /* ptr 1 */ 4, 0, 0, 0, 0, 0, 0, 0, /* key 1 */ b'b', /* ptr 2 */ 5,
                 0, 0, 0, 0, 0, 0, 0, /* checksum */ 0, 0, 0, 0, 0, 0, 0, 0
             ]
         );
@@ -434,7 +571,7 @@ mod tests {
             ]
         );
 
-        insert_at_inner(&mut node, 0, 2, b"a");
+        insert_at_inner(&mut node, 0, 2, b"a", 3);
 
         assert_eq!(
             node,
@@ -442,20 +579,20 @@ mod tests {
                 /* kind */ 1u8, /* parent */ 0, 0, 0, 0, 0, 0, 0, 0, /* len */ 2, 0,
                 0, 0, /* slot 0 */ 47, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                 0, 0, 0, 0, 0, 0, 0, /* ptr 0 */ 2, 0, 0, 0, 0, 0, 0, 0,
-                /* key 0 */ b'a', /* ptr 1 */ 1, 0, 0, 0, 0, 0, 0, 0,
+                /* key 0 */ b'a', /* ptr 1 */ 3, 0, 0, 0, 0, 0, 0, 0,
                 /* checksum */ 0, 0, 0, 0, 0, 0, 0, 0
             ]
         );
 
-        insert_at_inner(&mut node, 1, 3, b"b");
+        insert_at_inner(&mut node, 1, 4, b"b", 5);
 
         assert_eq!(
             node,
             [
                 /* kind */ 1u8, /* parent */ 0, 0, 0, 0, 0, 0, 0, 0, /* len */ 3, 0,
                 0, 0, /* slot 0 */ 47, 0, 0, 0, /* slot 1 */ 38, 0, 0, 0, 0, 0, 0, 0, 0,
-                0, 0, 0, 0, /* ptr 0 */ 3, 0, 0, 0, 0, 0, 0, 0, /* key 0 */ b'b',
-                /* ptr 1 */ 2, 0, 0, 0, 0, 0, 0, 0, /* key 1 */ b'a', /* ptr 2 */ 1,
+                0, 0, 0, 0, /* ptr 0 */ 4, 0, 0, 0, 0, 0, 0, 0, /* key 0 */ b'b',
+                /* ptr 1 */ 5, 0, 0, 0, 0, 0, 0, 0, /* key 1 */ b'a', /* ptr 2 */ 3,
                 0, 0, 0, 0, 0, 0, 0, /* checksum */ 0, 0, 0, 0, 0, 0, 0, 0
             ]
         );

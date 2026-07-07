@@ -1,38 +1,45 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 use parking_lot::Mutex;
 
 use crate::alloc::PageAllocator;
 
+pub type TxnFreeDeferId = u64;
+
 /// Tracks currently running transactions and ensures that freeing of pages is deferred until no transactions reference them.
+#[derive(Clone)]
 pub(crate) struct TxnFreeDeferMap {
-    inner: Mutex<Inner>,
+    inner: Arc<Mutex<Inner>>,
 }
 
 struct Inner {
-    next: u64,
-    map: BTreeMap<u64, Vec<u64>>,
+    next: TxnFreeDeferId,
+    map: BTreeMap<TxnFreeDeferId, Vec<u64>>,
 }
 
 impl TxnFreeDeferMap {
     pub fn new() -> Self {
         Self {
-            inner: Mutex::new(Inner {
+            inner: Arc::new(Mutex::new(Inner {
                 next: 0,
                 map: BTreeMap::new(),
-            }),
+            })),
         }
     }
+}
 
-    // TODO: I don't think it's okay to generate the id outside the lock, invalidates finishing assumptions
-    fn begin(&self) {
+impl TxnFreeDeferMap {
+    /// It is vital that transaction ids returned by this function be finished
+    /// otherwise it effecively causes a leak, and pages will never be freed.
+    pub fn begin(&self) -> TxnFreeDeferId {
         let mut inner = self.inner.lock();
         let txn_id = inner.next;
         inner.next += 1;
         inner.map.insert(txn_id, Vec::with_capacity(0));
+        txn_id
     }
 
-    fn finish(&self, txn_id: u64, freeable: &mut Vec<u64>, alloc: &PageAllocator) {
+    pub fn finish(&self, txn_id: TxnFreeDeferId, freeable: &mut Vec<u64>, alloc: &PageAllocator) {
         let free_pgs = {
             let mut inner = self.inner.lock();
             // Add pages to last transaction, since we can garuntee there will be no references to freed pages after it finishes
@@ -75,7 +82,7 @@ impl TxnFreeDeferMap {
 
 #[cfg(test)]
 mod tests {
-    use crate::test_util::TempDir;
+    use crate::{alloc::AllocationSet, test_util::TempDir};
 
     use super::*;
     use anyhow::Result;
@@ -92,11 +99,11 @@ mod tests {
         let (alloc, _fio, meta) = dir.alloc("file").await?;
         let map = TxnFreeDeferMap::new();
 
-        let mut set = alloc.create_set();
+        let mut set = AllocationSet::new();
         let pg1 = alloc.alloc(&meta, &mut set).await?;
         let pg2 = alloc.alloc(&meta, &mut set).await?;
         let pg3 = alloc.alloc(&meta, &mut set).await?;
-        set.flush().await?;
+        set.flush(&alloc).await?;
 
         map.begin();
 
@@ -132,11 +139,11 @@ mod tests {
         let (alloc, _fio, meta) = dir.alloc("file").await?;
         let map = TxnFreeDeferMap::new();
 
-        let mut set = alloc.create_set();
+        let mut set = AllocationSet::new();
         let pg1 = alloc.alloc(&meta, &mut set).await?;
         let pg2 = alloc.alloc(&meta, &mut set).await?;
         let pg3 = alloc.alloc(&meta, &mut set).await?;
-        set.flush().await?;
+        set.flush(&alloc).await?;
 
         map.begin();
         map.begin();
