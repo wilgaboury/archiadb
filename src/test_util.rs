@@ -6,7 +6,7 @@ use std::{
 
 use anyhow::Result;
 
-use crate::{alloc::PageAllocator, file::DbFile, fio::Fio, meta::MetaHandler};
+use crate::{alloc::PageAllocator, db::Db, file::DbFile, fio::Fio, meta::MetaHandler};
 
 pub struct TempDir {
     path: PathBuf,
@@ -29,6 +29,13 @@ impl TempDir {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub async fn db<P: AsRef<Path>>(&self, path: P) -> Result<Db> {
+        Db::builder()
+            .path(self.path.join(path.as_ref()))
+            .build()
+            .await
     }
 
     pub fn db_file<P: AsRef<Path>>(&self, path: P) -> Result<DbFile> {

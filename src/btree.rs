@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 
 use crate::{
     btree::LeafDataKind::ValueEmbedded,
@@ -8,7 +8,10 @@ use crate::{
     db::{Db, Txn},
     fio::{Fio, MIN_PAGE_SIZE, PageBuf},
     key::KeyPath,
-    util::{CHECKSUM_SIZE, from_bytes, from_bytes_mut, has_valid_checksum, update_checksum},
+    util::{
+        CHECKSUM_SIZE, from_bytes, from_bytes_mut, has_valid_checksum, update_checksum,
+        validate_checksum,
+    },
 };
 
 type Slot = u32;
@@ -18,6 +21,8 @@ const MAX_KEY_SIZE: usize = 256;
 const SLOT_SIZE: usize = size_of::<Slot>();
 const PAGE_PTR_SIZE: usize = size_of::<PagePtr>();
 const LINKED_LIST_VALUE_LEN_SIZE: usize = size_of::<u64>();
+
+// TODO: data does not need to be backwards, just confusing and has no benefits for COW
 
 /// Inner node layout:
 /// - header
@@ -462,7 +467,7 @@ impl Txn {
     async fn create_value_linked_list(&mut self, value: &[u8]) -> Result<u64> {
         let chunk_size = self.db.inner.meta.page_size() as usize - PAGE_PTR_SIZE - CHECKSUM_SIZE;
         let mut prev_pg_idx = 0u64;
-        for chunk in value.chunks(chunk_size) {
+        for chunk in value.chunks(chunk_size).rev() {
             let pg_idx = self.alloc().await?;
             let mut buf = self.db.inner.fio.get_buf();
             let b = buf.get_mut();
@@ -474,6 +479,25 @@ impl Txn {
             self.db.inner.fio.write(pg_idx, buf).await?;
         }
         Ok(prev_pg_idx)
+    }
+
+    async fn read_value_linked_list(&mut self, mut pg_idx: u64, buf: &mut [u8]) -> Result<()> {
+        let mut empty = buf.len();
+        while empty > 0 {
+            let page = self.db.inner.fio.read(pg_idx).await?;
+            let b = page.get();
+            validate_checksum(b)?;
+            let len = b.len() - PAGE_PTR_SIZE - CHECKSUM_SIZE;
+            let cp_len = std::cmp::min(len, empty);
+            let cp_start = buf.len() - empty;
+            buf[cp_start..cp_start + cp_len].copy_from_slice(&b[0..cp_len]);
+            empty -= cp_len;
+            pg_idx = b[len..len + PAGE_PTR_SIZE]
+                .try_into()
+                .map(u64::from_ne_bytes)
+                .context("buffer cannot fit page pointer")?;
+        }
+        Ok(())
     }
 
     async fn alloc(&mut self) -> Result<u64> {
@@ -499,8 +523,12 @@ fn test_access() {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Result;
+    use function_name::named;
+
     use crate::{
-        btree::{BTreeHeader, insert_at_inner, insert_init_inner},
+        btree::{BTreeHeader, insert_at_inner, insert_init_inner, read_page_ptr},
+        test_util::TempDir,
         util::from_bytes_mut,
     };
 
@@ -523,6 +551,7 @@ mod tests {
                 /* checksum */ 0, 0, 0, 0, 0, 0, 0, 0
             ]
         );
+        // assert_eq!(1, read_page_ptr(&node, 0));
 
         insert_at_inner(&mut node, 0, 2, b"a", 3);
 
@@ -536,6 +565,8 @@ mod tests {
                 /* checksum */ 0, 0, 0, 0, 0, 0, 0, 0
             ]
         );
+        // assert_eq!(3, read_page_ptr(&node, 0));
+        // assert_eq!(2, read_page_ptr(&node, 1));
 
         insert_at_inner(&mut node, 0, 4, b"b", 5);
 
@@ -549,6 +580,9 @@ mod tests {
                 0, 0, 0, 0, 0, 0, 0, /* checksum */ 0, 0, 0, 0, 0, 0, 0, 0
             ]
         );
+        // assert_eq!(2, read_page_ptr(&node, 0));
+        // assert_eq!(4, read_page_ptr(&node, 1));
+        // assert_eq!(5, read_page_ptr(&node, 2));
     }
 
     #[test]
@@ -596,5 +630,20 @@ mod tests {
                 0, 0, 0, 0, 0, 0, 0, /* checksum */ 0, 0, 0, 0, 0, 0, 0, 0
             ]
         );
+    }
+
+    #[named]
+    #[tokio::test]
+    async fn test_linked_list() -> Result<()> {
+        let dir = TempDir::new(function_name!())?;
+        let db = dir.db("db").await?;
+        let mut txn = db.txn().begin().await;
+        let value_len = txn.db.inner.meta.page_size() as usize * 2.5 as usize;
+        let value = vec![1u8; value_len];
+        let mut value_test = vec![0u8; value_len];
+        let pg_idx = txn.create_value_linked_list(&value).await?;
+        txn.read_value_linked_list(pg_idx, &mut value_test).await?;
+        assert_eq!(value, value_test);
+        Ok(())
     }
 }
