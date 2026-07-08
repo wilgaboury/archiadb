@@ -3,7 +3,6 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 
 use crate::{
-    btree::LeafDataKind::ValueEmbedded,
     const_assert,
     db::{Db, Txn},
     fio::{Fio, MIN_PAGE_SIZE, PageBuf},
@@ -22,8 +21,6 @@ const SLOT_SIZE: usize = size_of::<Slot>();
 const PAGE_PTR_SIZE: usize = size_of::<PagePtr>();
 const LINKED_LIST_VALUE_LEN_SIZE: usize = size_of::<u64>();
 
-// TODO: data does not need to be backwards, just confusing and has no benefits for COW
-
 /// Inner node layout:
 /// - header
 /// - slots:[u32; max(0,len-1)], key_len is derivable, pointer to beginning of key
@@ -33,7 +30,7 @@ const LINKED_LIST_VALUE_LEN_SIZE: usize = size_of::<u64>();
 /// Leaf node layout:
 /// - header
 /// - slots: [u32; len], key_len is derivable, pointer to beginning of (value,key)
-/// - data: [u8], grows backward, interleaved key and value
+/// - data: [u8], grows backward, interleaved value and key
 /// - checksum: u32
 
 #[repr(u8)]
@@ -70,6 +67,12 @@ enum LeafDataKind {
     Btree = 0,
     ValueEmbedded, // len, value
     ValueLinkedList,
+}
+
+enum LeafData<'a> {
+    Btree { pg_idx_1: u64, pg_idx_2: u64 },
+    ValueEmbedded(&'a [u8]),
+    ValueLinkedList { pg_idx: u64, len: u64 },
 }
 
 impl From<u8> for LeafDataKind {
@@ -153,13 +156,25 @@ impl BTreeNodeBuf for [u8] {
 
     fn remaining(&self) -> usize {
         let slots_len = self.slots_len();
-        let tail_size = if slots_len == 0 {
-            CHECKSUM_SIZE
-        } else if slots_len == 1 {
-            CHECKSUM_SIZE + PAGE_PTR_SIZE
-        } else {
-            self.len() - (PAGE_PTR_SIZE + read_slot(self, slots_len - 1))
+        let tail_size = match self.header().kind {
+            BTreeNodeKind::Root | BTreeNodeKind::Inner => {
+                if slots_len == 0 {
+                    CHECKSUM_SIZE
+                } else if slots_len == 1 {
+                    CHECKSUM_SIZE + PAGE_PTR_SIZE
+                } else {
+                    self.len() - (PAGE_PTR_SIZE + read_slot(self, slots_len - 1))
+                }
+            }
+            BTreeNodeKind::Leaf => {
+                if slots_len == 0 {
+                    CHECKSUM_SIZE
+                } else {
+                    self.len() - read_slot(self, slots_len - 1)
+                }
+            }
         };
+
         self.len() - (self.header().kind.header_size() + slots_len * SLOT_SIZE + tail_size)
     }
 
@@ -280,12 +295,7 @@ fn get_key_leaf(buf: &[u8], idx: usize) -> &[u8] {
     let val_key_idx = read_slot(buf, idx);
     let val_len = 1 + match LeafDataKind::from(buf[val_key_idx]) {
         LeafDataKind::Btree => 2 * PAGE_PTR_SIZE,
-        LeafDataKind::ValueEmbedded => {
-            let mut val_len_buf = [0u8; size_of::<u32>()];
-            let len_idx = val_key_idx + 1;
-            val_len_buf.copy_from_slice(&buf[len_idx..len_idx + size_of::<u32>()]);
-            u32::from_ne_bytes(val_len_buf) as usize
-        }
+        LeafDataKind::ValueEmbedded => buf[val_key_idx + 1] as usize,
         LeafDataKind::ValueLinkedList => PAGE_PTR_SIZE + LINKED_LIST_VALUE_LEN_SIZE,
     };
     let key_idx = val_key_idx + val_len;
@@ -296,6 +306,45 @@ fn get_key_leaf(buf: &[u8], idx: usize) -> &[u8] {
     } as usize;
 
     &buf[key_idx..(key_idx + key_len)]
+}
+
+fn get_value_leaf(buf: &[u8], idx: usize) -> LeafData<'_> {
+    let val_key_idx = read_slot(buf, idx);
+    match LeafDataKind::from(buf[val_key_idx]) {
+        LeafDataKind::Btree => {
+            let b_idx_1 = val_key_idx + 1;
+            let b_idx_2 = b_idx_1 + PAGE_PTR_SIZE;
+            let pg_idx_1 = buf[b_idx_1..b_idx_2 + PAGE_PTR_SIZE]
+                .try_into()
+                .map(PagePtr::from_ne_bytes)
+                .expect("buffer cannot fit page pointer");
+            let pg_idx_2 = buf[b_idx_2..b_idx_2 + PAGE_PTR_SIZE]
+                .try_into()
+                .map(PagePtr::from_ne_bytes)
+                .expect("buffer cannot fit page pointer");
+            LeafData::Btree { pg_idx_1, pg_idx_2 }
+        }
+        LeafDataKind::ValueEmbedded => {
+            let len_idx = val_key_idx + 1;
+            let len = buf[val_key_idx + 1] as usize;
+            let value_idx = len_idx + 1;
+            let value = &buf[value_idx..value_idx + len];
+            LeafData::ValueEmbedded(value)
+        }
+        LeafDataKind::ValueLinkedList => {
+            let b_idx_1 = val_key_idx + 1;
+            let b_idx_2 = b_idx_1 + PAGE_PTR_SIZE;
+            let pg_idx = buf[b_idx_1..b_idx_2 + PAGE_PTR_SIZE]
+                .try_into()
+                .map(PagePtr::from_ne_bytes)
+                .expect("buffer cannot fit page pointer");
+            let len = buf[b_idx_2..b_idx_2 + size_of::<u64>()]
+                .try_into()
+                .map(u64::from_ne_bytes)
+                .expect("buffer cannot fit u64");
+            LeafData::ValueLinkedList { pg_idx, len }
+        }
+    }
 }
 
 enum SearchResult {
@@ -551,7 +600,7 @@ mod tests {
                 /* checksum */ 0, 0, 0, 0, 0, 0, 0, 0
             ]
         );
-        // assert_eq!(1, read_page_ptr(&node, 0));
+        assert_eq!(1, read_page_ptr(&node, 0));
 
         insert_at_inner(&mut node, 0, 2, b"a", 3);
 
@@ -565,8 +614,8 @@ mod tests {
                 /* checksum */ 0, 0, 0, 0, 0, 0, 0, 0
             ]
         );
-        // assert_eq!(3, read_page_ptr(&node, 0));
-        // assert_eq!(2, read_page_ptr(&node, 1));
+        assert_eq!(3, read_page_ptr(&node, 0));
+        assert_eq!(2, read_page_ptr(&node, 1));
 
         insert_at_inner(&mut node, 0, 4, b"b", 5);
 
@@ -580,9 +629,9 @@ mod tests {
                 0, 0, 0, 0, 0, 0, 0, /* checksum */ 0, 0, 0, 0, 0, 0, 0, 0
             ]
         );
-        // assert_eq!(2, read_page_ptr(&node, 0));
-        // assert_eq!(4, read_page_ptr(&node, 1));
-        // assert_eq!(5, read_page_ptr(&node, 2));
+        assert_eq!(5, read_page_ptr(&node, 0));
+        assert_eq!(4, read_page_ptr(&node, 1));
+        assert_eq!(2, read_page_ptr(&node, 2));
     }
 
     #[test]
