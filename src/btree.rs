@@ -75,6 +75,44 @@ enum LeafData<'a> {
     ValueLinkedList { pg_idx: u64, len: u64 },
 }
 
+impl LeafData<'_> {
+    pub fn kind(&self) -> LeafDataKind {
+        match self {
+            LeafData::Btree { .. } => LeafDataKind::Btree,
+            LeafData::ValueEmbedded(_) => LeafDataKind::ValueEmbedded,
+            LeafData::ValueLinkedList { .. } => LeafDataKind::ValueLinkedList,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        1 + match self {
+            LeafData::Btree { .. } => 2 * PAGE_PTR_SIZE,
+            LeafData::ValueEmbedded(v) => 1 + v.len(),
+            LeafData::ValueLinkedList { .. } => PAGE_PTR_SIZE + LINKED_LIST_VALUE_LEN_SIZE,
+        }
+    }
+
+    pub fn write_to_buf(&self, buf: &mut [u8]) {
+        buf[0] = self.kind() as u8;
+        match self {
+            LeafData::Btree { pg_idx_1, pg_idx_2 } => {
+                buf[1..1 + PAGE_PTR_SIZE].copy_from_slice(&pg_idx_1.to_ne_bytes());
+                buf[1 + PAGE_PTR_SIZE..1 + 2 * PAGE_PTR_SIZE]
+                    .copy_from_slice(&pg_idx_2.to_ne_bytes());
+            }
+            LeafData::ValueEmbedded(v) => {
+                buf[1] = v.len() as u8;
+                buf[2..2 + v.len()].copy_from_slice(v);
+            }
+            LeafData::ValueLinkedList { pg_idx, len } => {
+                buf[1..1 + PAGE_PTR_SIZE].copy_from_slice(&pg_idx.to_ne_bytes());
+                buf[1 + PAGE_PTR_SIZE..1 + PAGE_PTR_SIZE + LINKED_LIST_VALUE_LEN_SIZE]
+                    .copy_from_slice(&len.to_ne_bytes());
+            }
+        }
+    }
+}
+
 impl From<u8> for LeafDataKind {
     fn from(value: u8) -> Self {
         match value {
@@ -97,6 +135,12 @@ impl BTreeHeader {
     pub fn init_inner(&mut self) {
         self.kind = BTreeNodeKind::Inner.into();
         self.parent = 0;
+        self.len = 0;
+    }
+
+    pub fn init_leaf(&mut self, parent: u64) {
+        self.kind = BTreeNodeKind::Leaf.into();
+        self.parent = parent;
         self.len = 0;
     }
 }
@@ -218,9 +262,9 @@ fn insert_at_inner(buf: &mut [u8], idx: usize, left: PagePtr, key: &[u8], right:
             all_key_and_ptr_start..key_and_ptr_end,
             all_key_and_ptr_start - key_and_ptr_len,
         );
-        buf[key_and_ptr_start..key_start].copy_from_slice(&left.to_ne_bytes());
+        buf[key_and_ptr_start..key_start].copy_from_slice(&right.to_ne_bytes());
         buf[key_start..key_and_ptr_end].copy_from_slice(key);
-        buf[key_and_ptr_end..key_and_ptr_end + PAGE_PTR_SIZE].copy_from_slice(&right.to_ne_bytes());
+        buf[key_and_ptr_end..key_and_ptr_end + PAGE_PTR_SIZE].copy_from_slice(&left.to_ne_bytes());
 
         for i in idx..slots_len {
             let slot_value = read_slot(buf, i);
@@ -231,9 +275,52 @@ fn insert_at_inner(buf: &mut [u8], idx: usize, left: PagePtr, key: &[u8], right:
             slots_insert_idx..slots_end_idx,
             slots_insert_idx + SLOT_SIZE,
         );
-        buf[slots_insert_idx..slots_insert_idx + SLOT_SIZE]
-            .copy_from_slice(&(key_start as u32).to_ne_bytes());
+        write_slot(buf, idx, key_start);
     }
+
+    {
+        let header = buf.header_mut();
+        header.len += 1;
+    }
+}
+
+fn insert_at_leaf(buf: &mut [u8], idx: usize, key: &[u8], value: &LeafData) {
+    let header = buf.header();
+    let slots_idx = header.kind.header_size();
+    let slots_len = buf.slots_len();
+    let slots_insert_idx = slots_idx + SLOT_SIZE * idx;
+    let slots_end_idx = slots_idx + SLOT_SIZE * slots_len;
+
+    let value_key_len = value.len() + key.len();
+    let value_key_end = if idx == 0 {
+        buf.len() - CHECKSUM_SIZE
+    } else {
+        read_slot(buf, idx - 1)
+    };
+    let value_key_start = value_key_end - value_key_len;
+    let all_value_key_start = if slots_len == 0 {
+        buf.len() - PAGE_PTR_SIZE
+    } else {
+        read_slot(buf, slots_len - 1)
+    };
+
+    buf.copy_within(
+        all_value_key_start..value_key_end,
+        all_value_key_start - value_key_len,
+    );
+    value.write_to_buf(buf[value_key_start..value_key_start + value.len()].as_mut());
+    buf[value_key_start + value.len()..value_key_end].copy_from_slice(key);
+
+    for i in idx..slots_len {
+        let slot_value = read_slot(buf, i);
+        write_slot(buf, i, slot_value - value_key_len);
+    }
+
+    buf.copy_within(
+        slots_insert_idx..slots_end_idx,
+        slots_insert_idx + SLOT_SIZE,
+    );
+    write_slot(buf, idx, value_key_start);
 
     {
         let header = buf.header_mut();
@@ -283,11 +370,10 @@ fn read_key(buf: &[u8], idx: usize) -> &[u8] {
 fn get_key_inner(buf: &[u8], idx: usize) -> &[u8] {
     let key_idx = read_slot(buf, idx);
     let key_len = if idx == 0 {
-        key_idx - PAGE_PTR_SIZE - CHECKSUM_SIZE
+        (buf.len() - PAGE_PTR_SIZE - CHECKSUM_SIZE) - key_idx
     } else {
-        key_idx - read_slot(buf, idx - 1) - PAGE_PTR_SIZE
+        (read_slot(buf, idx - 1) - PAGE_PTR_SIZE) - key_idx
     } as usize;
-
     &buf[key_idx..(key_idx + key_len)]
 }
 
@@ -295,16 +381,15 @@ fn get_key_leaf(buf: &[u8], idx: usize) -> &[u8] {
     let val_key_idx = read_slot(buf, idx);
     let val_len = 1 + match LeafDataKind::from(buf[val_key_idx]) {
         LeafDataKind::Btree => 2 * PAGE_PTR_SIZE,
-        LeafDataKind::ValueEmbedded => buf[val_key_idx + 1] as usize,
+        LeafDataKind::ValueEmbedded => 1 + buf[val_key_idx + 1] as usize,
         LeafDataKind::ValueLinkedList => PAGE_PTR_SIZE + LINKED_LIST_VALUE_LEN_SIZE,
     };
     let key_idx = val_key_idx + val_len;
     let key_len = if idx == 0 {
-        key_idx - CHECKSUM_SIZE
+        buf.len() - CHECKSUM_SIZE - key_idx
     } else {
-        key_idx - read_slot(buf, idx - 1)
+        read_slot(buf, idx - 1) - key_idx
     } as usize;
-
     &buf[key_idx..(key_idx + key_len)]
 }
 
@@ -376,8 +461,6 @@ fn search_inner(buf: &[u8], target: &[u8]) -> SearchResult {
 }
 
 fn search_leaf(buf: &[u8], target: &[u8]) -> SearchResult {
-    let header = from_bytes::<BTreeHeader>(buf);
-
     let mut left = 0;
     let mut right = buf.slots_len();
 
@@ -576,7 +659,10 @@ mod tests {
     use function_name::named;
 
     use crate::{
-        btree::{BTreeHeader, insert_at_inner, insert_init_inner, read_page_ptr},
+        btree::{
+            BTreeHeader, BTreeNodeBuf, BTreeRootHeader, LeafData, get_key_inner, get_key_leaf,
+            get_value_leaf, insert_at_inner, insert_at_leaf, insert_init_inner, read_page_ptr,
+        },
         test_util::TempDir,
         util::from_bytes_mut,
     };
@@ -609,13 +695,14 @@ mod tests {
             [
                 /* kind */ 1u8, /* parent */ 0, 0, 0, 0, 0, 0, 0, 0, /* len */ 2, 0,
                 0, 0, /* slot 0 */ 47, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                0, 0, 0, 0, 0, 0, 0, /* ptr 0 */ 2, 0, 0, 0, 0, 0, 0, 0,
-                /* key 0 */ b'a', /* ptr 1 */ 3, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, /* ptr 1 */ 3, 0, 0, 0, 0, 0, 0, 0,
+                /* key 0 */ b'a', /* ptr 0 */ 2, 0, 0, 0, 0, 0, 0, 0,
                 /* checksum */ 0, 0, 0, 0, 0, 0, 0, 0
             ]
         );
-        assert_eq!(3, read_page_ptr(&node, 0));
-        assert_eq!(2, read_page_ptr(&node, 1));
+        assert_eq!(2, read_page_ptr(&node, 0));
+        assert_eq!(b"a", get_key_inner(&node, 0));
+        assert_eq!(3, read_page_ptr(&node, 1));
 
         insert_at_inner(&mut node, 0, 4, b"b", 5);
 
@@ -624,14 +711,16 @@ mod tests {
             [
                 /* kind */ 1u8, /* parent */ 0, 0, 0, 0, 0, 0, 0, 0, /* len */ 3, 0,
                 0, 0, /* slot 0 */ 47, 0, 0, 0, /* slot 1 */ 38, 0, 0, 0, 0, 0, 0, 0, 0,
-                0, 0, 0, 0, /* ptr 0 */ 2, 0, 0, 0, 0, 0, 0, 0, /* key 0 */ b'a',
-                /* ptr 1 */ 4, 0, 0, 0, 0, 0, 0, 0, /* key 1 */ b'b', /* ptr 2 */ 5,
+                0, 0, 0, 0, /* ptr 2 */ 3, 0, 0, 0, 0, 0, 0, 0, /* key 1 */ b'a',
+                /* ptr 1 */ 5, 0, 0, 0, 0, 0, 0, 0, /* key 0 */ b'b', /* ptr 0 */ 4,
                 0, 0, 0, 0, 0, 0, 0, /* checksum */ 0, 0, 0, 0, 0, 0, 0, 0
             ]
         );
-        assert_eq!(5, read_page_ptr(&node, 0));
-        assert_eq!(4, read_page_ptr(&node, 1));
-        assert_eq!(2, read_page_ptr(&node, 2));
+        assert_eq!(4, read_page_ptr(&node, 0));
+        assert_eq!(b"b", get_key_inner(&node, 0));
+        assert_eq!(5, read_page_ptr(&node, 1));
+        assert_eq!(b"a", get_key_inner(&node, 1));
+        assert_eq!(3, read_page_ptr(&node, 2));
     }
 
     #[test]
@@ -654,6 +743,8 @@ mod tests {
             ]
         );
 
+        assert_eq!(1, read_page_ptr(&node, 0));
+
         insert_at_inner(&mut node, 0, 2, b"a", 3);
 
         assert_eq!(
@@ -661,11 +752,15 @@ mod tests {
             [
                 /* kind */ 1u8, /* parent */ 0, 0, 0, 0, 0, 0, 0, 0, /* len */ 2, 0,
                 0, 0, /* slot 0 */ 47, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                0, 0, 0, 0, 0, 0, 0, /* ptr 0 */ 2, 0, 0, 0, 0, 0, 0, 0,
-                /* key 0 */ b'a', /* ptr 1 */ 3, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, /* ptr 1 */ 3, 0, 0, 0, 0, 0, 0, 0,
+                /* key 0 */ b'a', /* ptr 0 */ 2, 0, 0, 0, 0, 0, 0, 0,
                 /* checksum */ 0, 0, 0, 0, 0, 0, 0, 0
             ]
         );
+
+        assert_eq!(2, read_page_ptr(&node, 0));
+        assert_eq!(b"a", get_key_inner(&node, 0));
+        assert_eq!(3, read_page_ptr(&node, 1));
 
         insert_at_inner(&mut node, 1, 4, b"b", 5);
 
@@ -674,11 +769,17 @@ mod tests {
             [
                 /* kind */ 1u8, /* parent */ 0, 0, 0, 0, 0, 0, 0, 0, /* len */ 3, 0,
                 0, 0, /* slot 0 */ 47, 0, 0, 0, /* slot 1 */ 38, 0, 0, 0, 0, 0, 0, 0, 0,
-                0, 0, 0, 0, /* ptr 0 */ 4, 0, 0, 0, 0, 0, 0, 0, /* key 0 */ b'b',
-                /* ptr 1 */ 5, 0, 0, 0, 0, 0, 0, 0, /* key 1 */ b'a', /* ptr 2 */ 3,
+                0, 0, 0, 0, /* ptr 2 */ 5, 0, 0, 0, 0, 0, 0, 0, /* key 1 */ b'b',
+                /* ptr 1 */ 4, 0, 0, 0, 0, 0, 0, 0, /* key 0 */ b'a', /* ptr 0 */ 2,
                 0, 0, 0, 0, 0, 0, 0, /* checksum */ 0, 0, 0, 0, 0, 0, 0, 0
             ]
         );
+
+        assert_eq!(2, read_page_ptr(&node, 0));
+        assert_eq!(b"a", get_key_inner(&node, 0));
+        assert_eq!(4, read_page_ptr(&node, 1));
+        assert_eq!(b"b", get_key_inner(&node, 1));
+        assert_eq!(5, read_page_ptr(&node, 2));
     }
 
     #[named]
@@ -693,6 +794,165 @@ mod tests {
         let pg_idx = txn.create_value_linked_list(&value).await?;
         txn.read_value_linked_list(pg_idx, &mut value_test).await?;
         assert_eq!(value, value_test);
+        Ok(())
+    }
+
+    #[named]
+    #[tokio::test]
+    async fn test_single_inner_insert() -> Result<()> {
+        let mut page = vec![0u8; 4096];
+
+        {
+            page.header_mut().init_inner();
+        }
+        assert_eq!(0, { page.header().len });
+
+        insert_init_inner(&mut page, 1);
+        assert_eq!(1, read_page_ptr(&page, 0));
+        assert_eq!(1, { page.header().len });
+
+        insert_at_inner(&mut page, 0, 2, b"AAA", 3);
+        assert_eq!(2, read_page_ptr(&page, 0));
+        assert_eq!(b"AAA", get_key_inner(&page, 0));
+        assert_eq!(3, read_page_ptr(&page, 1));
+        assert_eq!(2, { page.header().len });
+
+        insert_at_inner(&mut page, 1, 3, b"BBB", 4);
+        assert_eq!(2, read_page_ptr(&page, 0));
+        assert_eq!(b"AAA", get_key_inner(&page, 0));
+        assert_eq!(3, read_page_ptr(&page, 1));
+        assert_eq!(b"BBB", get_key_inner(&page, 1));
+        assert_eq!(4, read_page_ptr(&page, 2));
+        assert_eq!(3, { page.header().len });
+
+        insert_at_inner(&mut page, 0, 1, b"CCC", 2);
+        assert_eq!(1, read_page_ptr(&page, 0));
+        assert_eq!(b"CCC", get_key_inner(&page, 0));
+        assert_eq!(2, read_page_ptr(&page, 1));
+        assert_eq!(b"AAA", get_key_inner(&page, 1));
+        assert_eq!(3, read_page_ptr(&page, 2));
+        assert_eq!(b"BBB", get_key_inner(&page, 2));
+        assert_eq!(4, read_page_ptr(&page, 3));
+        assert_eq!(4, { page.header().len });
+
+        insert_at_inner(&mut page, 2, 5, b"DDD", 6);
+        assert_eq!(1, read_page_ptr(&page, 0));
+        assert_eq!(b"CCC", get_key_inner(&page, 0));
+        assert_eq!(2, read_page_ptr(&page, 1));
+        assert_eq!(b"AAA", get_key_inner(&page, 1));
+        assert_eq!(5, read_page_ptr(&page, 2));
+        assert_eq!(b"DDD", get_key_inner(&page, 2));
+        assert_eq!(6, read_page_ptr(&page, 3));
+        assert_eq!(b"BBB", get_key_inner(&page, 3));
+        assert_eq!(4, read_page_ptr(&page, 4));
+        assert_eq!(5, { page.header().len });
+
+        Ok(())
+    }
+
+    #[named]
+    #[tokio::test]
+    async fn test_single_leaf_insert() -> Result<()> {
+        let mut page = vec![0u8; 4096];
+
+        {
+            page.header_mut().init_leaf(0);
+        }
+
+        assert_eq!(0, { page.header().len });
+
+        insert_at_leaf(&mut page, 0, b"K_AAA", &LeafData::ValueEmbedded(b"V_AAA"));
+        assert_eq!(b"K_AAA", get_key_leaf(&page, 0));
+        assert_eq!(
+            b"V_AAA",
+            match get_value_leaf(&page, 0) {
+                LeafData::ValueEmbedded(v) => v,
+                _ => panic!("expected embedded value"),
+            }
+        );
+        assert_eq!(1, { page.header().len });
+
+        insert_at_leaf(&mut page, 1, b"K_BBB", &LeafData::ValueEmbedded(b"V_BBB"));
+        assert_eq!(b"K_AAA", get_key_leaf(&page, 0));
+        assert_eq!(
+            b"V_AAA",
+            match get_value_leaf(&page, 0) {
+                LeafData::ValueEmbedded(v) => v,
+                _ => panic!("expected embedded value"),
+            }
+        );
+        assert_eq!(b"K_BBB", get_key_leaf(&page, 1));
+        assert_eq!(
+            b"V_BBB",
+            match get_value_leaf(&page, 1) {
+                LeafData::ValueEmbedded(v) => v,
+                _ => panic!("expected embedded value"),
+            }
+        );
+        assert_eq!(2, { page.header().len });
+
+        insert_at_leaf(&mut page, 0, b"K_CCC", &LeafData::ValueEmbedded(b"V_CCC"));
+        assert_eq!(b"K_CCC", get_key_leaf(&page, 0));
+        assert_eq!(
+            b"V_CCC",
+            match get_value_leaf(&page, 0) {
+                LeafData::ValueEmbedded(v) => v,
+                _ => panic!("expected embedded value"),
+            }
+        );
+        assert_eq!(b"K_AAA", get_key_leaf(&page, 1));
+        assert_eq!(
+            b"V_AAA",
+            match get_value_leaf(&page, 1) {
+                LeafData::ValueEmbedded(v) => v,
+                _ => panic!("expected embedded value"),
+            }
+        );
+        assert_eq!(b"K_BBB", get_key_leaf(&page, 2));
+        assert_eq!(
+            b"V_BBB",
+            match get_value_leaf(&page, 2) {
+                LeafData::ValueEmbedded(v) => v,
+                _ => panic!("expected embedded value"),
+            }
+        );
+        assert_eq!(3, { page.header().len });
+
+        insert_at_leaf(&mut page, 2, b"K_DDD", &LeafData::ValueEmbedded(b"V_DDD"));
+        assert_eq!(b"K_CCC", get_key_leaf(&page, 0));
+        assert_eq!(
+            b"V_CCC",
+            match get_value_leaf(&page, 0) {
+                LeafData::ValueEmbedded(v) => v,
+                _ => panic!("expected embedded value"),
+            }
+        );
+        assert_eq!(b"K_AAA", get_key_leaf(&page, 1));
+        assert_eq!(
+            b"V_AAA",
+            match get_value_leaf(&page, 1) {
+                LeafData::ValueEmbedded(v) => v,
+                _ => panic!("expected embedded value"),
+            }
+        );
+        assert_eq!(b"K_DDD", get_key_leaf(&page, 2));
+        assert_eq!(
+            b"V_DDD",
+            match get_value_leaf(&page, 2) {
+                LeafData::ValueEmbedded(v) => v,
+                _ => panic!("expected embedded value"),
+            }
+        );
+        assert_eq!(b"K_BBB", get_key_leaf(&page, 3));
+        assert_eq!(
+            b"V_BBB",
+            match get_value_leaf(&page, 3) {
+                LeafData::ValueEmbedded(v) => v,
+                _ => panic!("expected embedded value"),
+            }
+        );
+        assert_eq!(4, { page.header().len });
+
         Ok(())
     }
 }
