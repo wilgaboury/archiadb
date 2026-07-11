@@ -393,20 +393,20 @@ fn get_key_leaf(buf: &[u8], idx: usize) -> &[u8] {
     &buf[key_idx..(key_idx + key_len)]
 }
 
+fn read_u64_at(buf: &[u8], idx: usize) -> u64 {
+    let mut u64_buf = [0u8; 8];
+    u64_buf.copy_from_slice(&buf[idx..idx + 8]);
+    u64::from_ne_bytes(u64_buf)
+}
+
 fn get_value_leaf(buf: &[u8], idx: usize) -> LeafData<'_> {
     let val_key_idx = read_slot(buf, idx);
     match LeafDataKind::from(buf[val_key_idx]) {
         LeafDataKind::Btree => {
             let b_idx_1 = val_key_idx + 1;
             let b_idx_2 = b_idx_1 + PAGE_PTR_SIZE;
-            let pg_idx_1 = buf[b_idx_1..b_idx_2 + PAGE_PTR_SIZE]
-                .try_into()
-                .map(PagePtr::from_ne_bytes)
-                .expect("buffer cannot fit page pointer");
-            let pg_idx_2 = buf[b_idx_2..b_idx_2 + PAGE_PTR_SIZE]
-                .try_into()
-                .map(PagePtr::from_ne_bytes)
-                .expect("buffer cannot fit page pointer");
+            let pg_idx_1 = read_u64_at(buf, b_idx_1);
+            let pg_idx_2 = read_u64_at(buf, b_idx_2);
             LeafData::Btree { pg_idx_1, pg_idx_2 }
         }
         LeafDataKind::ValueEmbedded => {
@@ -419,14 +419,8 @@ fn get_value_leaf(buf: &[u8], idx: usize) -> LeafData<'_> {
         LeafDataKind::ValueLinkedList => {
             let b_idx_1 = val_key_idx + 1;
             let b_idx_2 = b_idx_1 + PAGE_PTR_SIZE;
-            let pg_idx = buf[b_idx_1..b_idx_2 + PAGE_PTR_SIZE]
-                .try_into()
-                .map(PagePtr::from_ne_bytes)
-                .expect("buffer cannot fit page pointer");
-            let len = buf[b_idx_2..b_idx_2 + size_of::<u64>()]
-                .try_into()
-                .map(u64::from_ne_bytes)
-                .expect("buffer cannot fit u64");
+            let pg_idx = read_u64_at(buf, b_idx_1);
+            let len = read_u64_at(buf, b_idx_2);
             LeafData::ValueLinkedList { pg_idx, len }
         }
     }
@@ -891,15 +885,23 @@ mod tests {
         );
         assert_eq!(2, { page.header().len });
 
-        insert_at_leaf(&mut page, 0, b"K_CCC", &LeafData::ValueEmbedded(b"V_CCC"));
-        assert_eq!(b"K_CCC", get_key_leaf(&page, 0));
-        assert_eq!(
-            b"V_CCC",
-            match get_value_leaf(&page, 0) {
-                LeafData::ValueEmbedded(v) => v,
-                _ => panic!("expected embedded value"),
-            }
+        insert_at_leaf(
+            &mut page,
+            0,
+            b"K_CCC",
+            &LeafData::Btree {
+                pg_idx_1: 0x6b2a2e7c2ea46f6e,
+                pg_idx_2: 0x68d67d9571ec6979,
+            },
         );
+        assert_eq!(b"K_CCC", get_key_leaf(&page, 0));
+        match get_value_leaf(&page, 0) {
+            LeafData::Btree { pg_idx_1, pg_idx_2 } => {
+                assert_eq!(pg_idx_1, 0x6b2a2e7c2ea46f6e);
+                assert_eq!(pg_idx_2, 0x68d67d9571ec6979);
+            }
+            _ => panic!("expected embedded value"),
+        };
         assert_eq!(b"K_AAA", get_key_leaf(&page, 1));
         assert_eq!(
             b"V_AAA",
@@ -918,15 +920,23 @@ mod tests {
         );
         assert_eq!(3, { page.header().len });
 
-        insert_at_leaf(&mut page, 2, b"K_DDD", &LeafData::ValueEmbedded(b"V_DDD"));
-        assert_eq!(b"K_CCC", get_key_leaf(&page, 0));
-        assert_eq!(
-            b"V_CCC",
-            match get_value_leaf(&page, 0) {
-                LeafData::ValueEmbedded(v) => v,
-                _ => panic!("expected embedded value"),
-            }
+        insert_at_leaf(
+            &mut page,
+            2,
+            b"K_DDD",
+            &LeafData::ValueLinkedList {
+                pg_idx: 0x623c99542265332b,
+                len: 0x15c12bbd13ba0a79,
+            },
         );
+        assert_eq!(b"K_CCC", get_key_leaf(&page, 0));
+        match get_value_leaf(&page, 0) {
+            LeafData::Btree { pg_idx_1, pg_idx_2 } => {
+                assert_eq!(pg_idx_1, 0x6b2a2e7c2ea46f6e);
+                assert_eq!(pg_idx_2, 0x68d67d9571ec6979);
+            }
+            _ => panic!("expected embedded value"),
+        };
         assert_eq!(b"K_AAA", get_key_leaf(&page, 1));
         assert_eq!(
             b"V_AAA",
@@ -936,13 +946,14 @@ mod tests {
             }
         );
         assert_eq!(b"K_DDD", get_key_leaf(&page, 2));
-        assert_eq!(
-            b"V_DDD",
-            match get_value_leaf(&page, 2) {
-                LeafData::ValueEmbedded(v) => v,
-                _ => panic!("expected embedded value"),
+        match get_value_leaf(&page, 2) {
+            LeafData::ValueLinkedList { pg_idx, len } => {
+                assert_eq!(pg_idx, 0x623c99542265332b);
+                assert_eq!(len, 0x15c12bbd13ba0a79);
             }
-        );
+            _ => panic!("expected embedded value"),
+        };
+
         assert_eq!(b"K_BBB", get_key_leaf(&page, 3));
         assert_eq!(
             b"V_BBB",
