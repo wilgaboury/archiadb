@@ -1,4 +1,7 @@
-use std::time::{Duration, Instant};
+use std::{
+    cmp::Ordering,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, bail};
 
@@ -698,6 +701,20 @@ impl Txn {
                 let value = left.get().get_value_leaf(idx);
                 insert_at_leaf(right.get_mut(), 0, key, &value);
                 remove_at_leaf(left.get_mut(), 0);
+            }
+
+            {
+                let insert = if key.cmp(right.get().get_key_leaf(0)) == Ordering::Less {
+                    &mut left
+                } else {
+                    &mut right
+                };
+
+                let search = search_leaf(insert.get(), key);
+                if let SearchResult::Exact(idx) = search {
+                    remove_at_leaf(insert.get_mut(), idx);
+                }
+                insert_at_leaf(insert.get_mut(), search.idx(), key, &encoded_value);
             }
 
             let key = right.get().get_key_leaf(0).to_vec().into_boxed_slice();
