@@ -69,42 +69,66 @@ enum LeafDataKind {
     ValueLinkedList,
 }
 
-enum LeafData<'a> {
+enum LeafDataEncoded<'a> {
     Btree { pg_idx_1: u64, pg_idx_2: u64 },
     ValueEmbedded(&'a [u8]),
     ValueLinkedList { pg_idx: u64, len: u64 },
 }
 
-impl LeafData<'_> {
+enum LeafData<'a> {
+    Btree { pg_idx_1: u64, pg_idx_2: u64 },
+    Value(&'a [u8]),
+}
+
+impl<'a> LeafData<'a> {
+    pub async fn encode(self, txn: &mut Txn) -> Result<LeafDataEncoded<'a>> {
+        Ok(match self {
+            LeafData::Btree { pg_idx_1, pg_idx_2 } => LeafDataEncoded::Btree { pg_idx_1, pg_idx_2 },
+            LeafData::Value(v) => {
+                if v.len() < 256 {
+                    LeafDataEncoded::ValueEmbedded(v)
+                } else {
+                    let pg_idx = txn.create_value_linked_list(v).await?;
+                    LeafDataEncoded::ValueLinkedList {
+                        pg_idx,
+                        len: v.len() as u64,
+                    }
+                }
+            }
+        })
+    }
+}
+
+impl LeafDataEncoded<'_> {
     pub fn kind(&self) -> LeafDataKind {
         match self {
-            LeafData::Btree { .. } => LeafDataKind::Btree,
-            LeafData::ValueEmbedded(_) => LeafDataKind::ValueEmbedded,
-            LeafData::ValueLinkedList { .. } => LeafDataKind::ValueLinkedList,
+            LeafDataEncoded::Btree { .. } => LeafDataKind::Btree,
+            LeafDataEncoded::ValueEmbedded(_) => LeafDataKind::ValueEmbedded,
+            LeafDataEncoded::ValueLinkedList { .. } => LeafDataKind::ValueLinkedList,
         }
     }
 
     pub fn len(&self) -> usize {
         1 + match self {
-            LeafData::Btree { .. } => 2 * PAGE_PTR_SIZE,
-            LeafData::ValueEmbedded(v) => 1 + v.len(),
-            LeafData::ValueLinkedList { .. } => PAGE_PTR_SIZE + LINKED_LIST_VALUE_LEN_SIZE,
+            LeafDataEncoded::Btree { .. } => 2 * PAGE_PTR_SIZE,
+            LeafDataEncoded::ValueEmbedded(v) => 1 + v.len(),
+            LeafDataEncoded::ValueLinkedList { .. } => PAGE_PTR_SIZE + LINKED_LIST_VALUE_LEN_SIZE,
         }
     }
 
     pub fn write_to_buf(&self, buf: &mut [u8]) {
         buf[0] = self.kind() as u8;
         match self {
-            LeafData::Btree { pg_idx_1, pg_idx_2 } => {
+            LeafDataEncoded::Btree { pg_idx_1, pg_idx_2 } => {
                 buf[1..1 + PAGE_PTR_SIZE].copy_from_slice(&pg_idx_1.to_ne_bytes());
                 buf[1 + PAGE_PTR_SIZE..1 + 2 * PAGE_PTR_SIZE]
                     .copy_from_slice(&pg_idx_2.to_ne_bytes());
             }
-            LeafData::ValueEmbedded(v) => {
+            LeafDataEncoded::ValueEmbedded(v) => {
                 buf[1] = v.len() as u8;
                 buf[2..2 + v.len()].copy_from_slice(v);
             }
-            LeafData::ValueLinkedList { pg_idx, len } => {
+            LeafDataEncoded::ValueLinkedList { pg_idx, len } => {
                 buf[1..1 + PAGE_PTR_SIZE].copy_from_slice(&pg_idx.to_ne_bytes());
                 buf[1 + PAGE_PTR_SIZE..1 + PAGE_PTR_SIZE + LINKED_LIST_VALUE_LEN_SIZE]
                     .copy_from_slice(&len.to_ne_bytes());
@@ -284,7 +308,7 @@ fn insert_at_inner(buf: &mut [u8], idx: usize, left: PagePtr, key: &[u8], right:
     }
 }
 
-fn insert_at_leaf(buf: &mut [u8], idx: usize, key: &[u8], value: &LeafData) {
+fn insert_at_leaf(buf: &mut [u8], idx: usize, key: &[u8], value: &LeafDataEncoded) {
     let header = buf.header();
     let slots_idx = header.kind.header_size();
     let slots_len = buf.slots_len();
@@ -299,7 +323,7 @@ fn insert_at_leaf(buf: &mut [u8], idx: usize, key: &[u8], value: &LeafData) {
     };
     let value_key_start = value_key_end - value_key_len;
     let all_value_key_start = if slots_len == 0 {
-        buf.len() - PAGE_PTR_SIZE
+        buf.len() - CHECKSUM_SIZE
     } else {
         read_slot(buf, slots_len - 1)
     };
@@ -325,6 +349,48 @@ fn insert_at_leaf(buf: &mut [u8], idx: usize, key: &[u8], value: &LeafData) {
     {
         let header = buf.header_mut();
         header.len += 1;
+    }
+}
+
+fn remove_at_leaf(buf: &mut [u8], idx: usize) {
+    let header = buf.header();
+    let slots_idx = header.kind.header_size();
+    let slots_len = buf.slots_len();
+    let slots_remove_idx = slots_idx + SLOT_SIZE * idx;
+    let slots_end_idx = slots_idx + SLOT_SIZE * slots_len;
+
+    let value_key_end = if idx == 0 {
+        buf.len() - CHECKSUM_SIZE
+    } else {
+        read_slot(buf, idx - 1)
+    };
+    let value_key_start = read_slot(buf, idx);
+    let value_key_len = value_key_end - value_key_start;
+
+    let all_value_key_start = if slots_len == 0 {
+        buf.len() - CHECKSUM_SIZE
+    } else {
+        read_slot(buf, slots_len - 1)
+    };
+
+    buf.copy_within(
+        all_value_key_start..value_key_start,
+        all_value_key_start + value_key_len,
+    );
+
+    for i in (idx + 1)..slots_len {
+        let slot_value = read_slot(buf, i);
+        write_slot(buf, i, slot_value + value_key_len);
+    }
+
+    buf.copy_within(
+        (slots_remove_idx + SLOT_SIZE)..slots_end_idx,
+        slots_remove_idx,
+    );
+
+    {
+        let header = buf.header_mut();
+        header.len -= 1;
     }
 }
 
@@ -399,7 +465,7 @@ fn read_u64_at(buf: &[u8], idx: usize) -> u64 {
     u64::from_ne_bytes(u64_buf)
 }
 
-fn get_value_leaf(buf: &[u8], idx: usize) -> LeafData<'_> {
+fn get_value_leaf(buf: &[u8], idx: usize) -> LeafDataEncoded<'_> {
     let val_key_idx = read_slot(buf, idx);
     match LeafDataKind::from(buf[val_key_idx]) {
         LeafDataKind::Btree => {
@@ -407,21 +473,21 @@ fn get_value_leaf(buf: &[u8], idx: usize) -> LeafData<'_> {
             let b_idx_2 = b_idx_1 + PAGE_PTR_SIZE;
             let pg_idx_1 = read_u64_at(buf, b_idx_1);
             let pg_idx_2 = read_u64_at(buf, b_idx_2);
-            LeafData::Btree { pg_idx_1, pg_idx_2 }
+            LeafDataEncoded::Btree { pg_idx_1, pg_idx_2 }
         }
         LeafDataKind::ValueEmbedded => {
             let len_idx = val_key_idx + 1;
             let len = buf[val_key_idx + 1] as usize;
             let value_idx = len_idx + 1;
             let value = &buf[value_idx..value_idx + len];
-            LeafData::ValueEmbedded(value)
+            LeafDataEncoded::ValueEmbedded(value)
         }
         LeafDataKind::ValueLinkedList => {
             let b_idx_1 = val_key_idx + 1;
             let b_idx_2 = b_idx_1 + PAGE_PTR_SIZE;
             let pg_idx = read_u64_at(buf, b_idx_1);
             let len = read_u64_at(buf, b_idx_2);
-            LeafData::ValueLinkedList { pg_idx, len }
+            LeafDataEncoded::ValueLinkedList { pg_idx, len }
         }
     }
 }
@@ -429,6 +495,15 @@ fn get_value_leaf(buf: &[u8], idx: usize) -> LeafData<'_> {
 enum SearchResult {
     Exact(usize),
     Insert(usize),
+}
+
+impl SearchResult {
+    pub fn idx(&self) -> usize {
+        match self {
+            SearchResult::Exact(idx) => *idx,
+            SearchResult::Insert(idx) => *idx,
+        }
+    }
 }
 
 fn search_inner(buf: &[u8], target: &[u8]) -> SearchResult {
@@ -564,30 +639,44 @@ impl Txn {
     async fn insert_help(
         &mut self,
         key: &[u8],
-        value: &[u8],
+        value: LeafData<'_>,
         pg_idx: u64,
         pg: PageBuf,
     ) -> Result<()> {
         let db = &self.db.inner;
         let header = from_bytes::<BTreeHeader>(pg.get());
         if header.kind == BTreeNodeKind::Leaf {
-            let ret = self.insert_leaf(key, value, pg).await?;
+            let ret = self.upsert_leaf(key, value, pg).await?;
             self.free.push(pg_idx);
         }
         Ok(())
     }
 
-    async fn insert_leaf(
+    async fn upsert_leaf(
         &mut self,
         key: &[u8],
-        value: &[u8],
+        value: LeafData<'_>,
         mut pg: PageBuf,
     ) -> Result<InsertResult> {
-        // let new_pg_idx = self.db.alloc.alloc(&db.meta, &mut self.allocs).await?;
+        let encoded_value = value.encode(self).await?;
 
-        let header = pg.get_mut().header_mut();
+        let can_insert = pg.get().remaining() > key.len() + encoded_value.len() + SLOT_SIZE;
+        if can_insert {
+            let search = search_leaf(pg.get(), key);
+            if let SearchResult::Exact(idx) = search {
+                remove_at_leaf(pg.get_mut(), idx);
+            }
+            insert_at_leaf(pg.get_mut(), search.idx(), key, &encoded_value);
+            let pg_idx = self.alloc().await?;
+            self.db.inner.fio.write(pg_idx, pg).await?;
+            Ok(InsertResult::Single(pg_idx))
+        } else {
+            let left_idx = self.alloc().await?;
+            let right_idx = self.alloc().await?;
 
-        Ok(InsertResult::Single(0))
+            todo!("split leaf node and insert")
+            // Ok(InsertResult::Split(left, key, right))
+        }
     }
 
     async fn create_value_linked_list(&mut self, value: &[u8]) -> Result<u64> {
@@ -654,8 +743,9 @@ mod tests {
 
     use crate::{
         btree::{
-            BTreeHeader, BTreeNodeBuf, BTreeRootHeader, LeafData, get_key_inner, get_key_leaf,
-            get_value_leaf, insert_at_inner, insert_at_leaf, insert_init_inner, read_page_ptr,
+            BTreeHeader, BTreeNodeBuf, BTreeRootHeader, LeafDataEncoded, get_key_inner,
+            get_key_leaf, get_value_leaf, insert_at_inner, insert_at_leaf, insert_init_inner,
+            read_page_ptr, remove_at_leaf,
         },
         test_util::TempDir,
         util::from_bytes_mut,
@@ -855,23 +945,33 @@ mod tests {
 
         assert_eq!(0, { page.header().len });
 
-        insert_at_leaf(&mut page, 0, b"K_AAA", &LeafData::ValueEmbedded(b"V_AAA"));
+        insert_at_leaf(
+            &mut page,
+            0,
+            b"K_AAA",
+            &LeafDataEncoded::ValueEmbedded(b"V_AAA"),
+        );
         assert_eq!(b"K_AAA", get_key_leaf(&page, 0));
         assert_eq!(
             b"V_AAA",
             match get_value_leaf(&page, 0) {
-                LeafData::ValueEmbedded(v) => v,
+                LeafDataEncoded::ValueEmbedded(v) => v,
                 _ => panic!("expected embedded value"),
             }
         );
         assert_eq!(1, { page.header().len });
 
-        insert_at_leaf(&mut page, 1, b"K_BBB", &LeafData::ValueEmbedded(b"V_BBB"));
+        insert_at_leaf(
+            &mut page,
+            1,
+            b"K_BBB",
+            &LeafDataEncoded::ValueEmbedded(b"V_BBB"),
+        );
         assert_eq!(b"K_AAA", get_key_leaf(&page, 0));
         assert_eq!(
             b"V_AAA",
             match get_value_leaf(&page, 0) {
-                LeafData::ValueEmbedded(v) => v,
+                LeafDataEncoded::ValueEmbedded(v) => v,
                 _ => panic!("expected embedded value"),
             }
         );
@@ -879,7 +979,7 @@ mod tests {
         assert_eq!(
             b"V_BBB",
             match get_value_leaf(&page, 1) {
-                LeafData::ValueEmbedded(v) => v,
+                LeafDataEncoded::ValueEmbedded(v) => v,
                 _ => panic!("expected embedded value"),
             }
         );
@@ -889,14 +989,14 @@ mod tests {
             &mut page,
             0,
             b"K_CCC",
-            &LeafData::Btree {
+            &LeafDataEncoded::Btree {
                 pg_idx_1: 0x6b2a2e7c2ea46f6e,
                 pg_idx_2: 0x68d67d9571ec6979,
             },
         );
         assert_eq!(b"K_CCC", get_key_leaf(&page, 0));
         match get_value_leaf(&page, 0) {
-            LeafData::Btree { pg_idx_1, pg_idx_2 } => {
+            LeafDataEncoded::Btree { pg_idx_1, pg_idx_2 } => {
                 assert_eq!(pg_idx_1, 0x6b2a2e7c2ea46f6e);
                 assert_eq!(pg_idx_2, 0x68d67d9571ec6979);
             }
@@ -906,7 +1006,7 @@ mod tests {
         assert_eq!(
             b"V_AAA",
             match get_value_leaf(&page, 1) {
-                LeafData::ValueEmbedded(v) => v,
+                LeafDataEncoded::ValueEmbedded(v) => v,
                 _ => panic!("expected embedded value"),
             }
         );
@@ -914,7 +1014,7 @@ mod tests {
         assert_eq!(
             b"V_BBB",
             match get_value_leaf(&page, 2) {
-                LeafData::ValueEmbedded(v) => v,
+                LeafDataEncoded::ValueEmbedded(v) => v,
                 _ => panic!("expected embedded value"),
             }
         );
@@ -924,14 +1024,14 @@ mod tests {
             &mut page,
             2,
             b"K_DDD",
-            &LeafData::ValueLinkedList {
+            &LeafDataEncoded::ValueLinkedList {
                 pg_idx: 0x623c99542265332b,
                 len: 0x15c12bbd13ba0a79,
             },
         );
         assert_eq!(b"K_CCC", get_key_leaf(&page, 0));
         match get_value_leaf(&page, 0) {
-            LeafData::Btree { pg_idx_1, pg_idx_2 } => {
+            LeafDataEncoded::Btree { pg_idx_1, pg_idx_2 } => {
                 assert_eq!(pg_idx_1, 0x6b2a2e7c2ea46f6e);
                 assert_eq!(pg_idx_2, 0x68d67d9571ec6979);
             }
@@ -941,13 +1041,13 @@ mod tests {
         assert_eq!(
             b"V_AAA",
             match get_value_leaf(&page, 1) {
-                LeafData::ValueEmbedded(v) => v,
+                LeafDataEncoded::ValueEmbedded(v) => v,
                 _ => panic!("expected embedded value"),
             }
         );
         assert_eq!(b"K_DDD", get_key_leaf(&page, 2));
         match get_value_leaf(&page, 2) {
-            LeafData::ValueLinkedList { pg_idx, len } => {
+            LeafDataEncoded::ValueLinkedList { pg_idx, len } => {
                 assert_eq!(pg_idx, 0x623c99542265332b);
                 assert_eq!(len, 0x15c12bbd13ba0a79);
             }
@@ -958,11 +1058,38 @@ mod tests {
         assert_eq!(
             b"V_BBB",
             match get_value_leaf(&page, 3) {
-                LeafData::ValueEmbedded(v) => v,
+                LeafDataEncoded::ValueEmbedded(v) => v,
                 _ => panic!("expected embedded value"),
             }
         );
         assert_eq!(4, { page.header().len });
+
+        remove_at_leaf(&mut page, 2);
+        assert_eq!(b"K_CCC", get_key_leaf(&page, 0));
+        match get_value_leaf(&page, 0) {
+            LeafDataEncoded::Btree { pg_idx_1, pg_idx_2 } => {
+                assert_eq!(pg_idx_1, 0x6b2a2e7c2ea46f6e);
+                assert_eq!(pg_idx_2, 0x68d67d9571ec6979);
+            }
+            _ => panic!("expected embedded value"),
+        };
+        assert_eq!(b"K_AAA", get_key_leaf(&page, 1));
+        assert_eq!(
+            b"V_AAA",
+            match get_value_leaf(&page, 1) {
+                LeafDataEncoded::ValueEmbedded(v) => v,
+                _ => panic!("expected embedded value"),
+            }
+        );
+        assert_eq!(b"K_BBB", get_key_leaf(&page, 2));
+        assert_eq!(
+            b"V_BBB",
+            match get_value_leaf(&page, 2) {
+                LeafDataEncoded::ValueEmbedded(v) => v,
+                _ => panic!("expected embedded value"),
+            }
+        );
+        assert_eq!(3, { page.header().len });
 
         Ok(())
     }
