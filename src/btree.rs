@@ -161,9 +161,9 @@ struct BTreeHeader {
 }
 
 impl BTreeHeader {
-    pub fn init_inner(&mut self) {
+    pub fn init_inner(&mut self, parent: u64) {
         self.kind = BTreeNodeKind::Inner.into();
-        self.parent = 0;
+        self.parent = parent;
         self.len = 0;
     }
 
@@ -438,6 +438,16 @@ fn read_page_ptr(buf: &[u8], idx: usize) -> u64 {
     u64::from_ne_bytes(u64_buf)
 }
 
+fn write_page_ptr(buf: &mut [u8], idx: usize, value: u64) {
+    let mut u64_buf = [0u8; 8];
+    let loc = if idx == 0 {
+        buf.len() - CHECKSUM_SIZE - PAGE_PTR_SIZE
+    } else {
+        read_slot(buf, idx - 1) - PAGE_PTR_SIZE
+    };
+    buf[loc..loc + PAGE_PTR_SIZE].copy_from_slice(&value.to_ne_bytes());
+}
+
 fn read_key(buf: &[u8], idx: usize) -> &[u8] {
     let end = if idx == 0 {
         buf.len() - CHECKSUM_SIZE - PAGE_PTR_SIZE
@@ -649,22 +659,43 @@ enum InsertResult {
 }
 
 impl Txn {
-    async fn insert(&mut self, key: &[u8], value: &[u8], root: RootDoublePageBuf) {}
+    async fn upsert(&mut self, key: &[u8], value: &[u8], root: RootDoublePageBuf) {}
 
-    async fn insert_help(
+    async fn upsert_inner(
         &mut self,
         key: &[u8],
         value: LeafValue<'_>,
-        pg_idx: u64,
-        pg: PageBuf,
-    ) -> Result<()> {
+        mut pg: PageBuf,
+        parent_pg_idx: u64,
+    ) -> Result<InsertResult> {
         let db = &self.db.inner;
         let header = from_bytes::<BTreeHeader>(pg.get());
         if header.kind == BTreeNodeKind::Leaf {
-            let ret = self.upsert_leaf(key, value, pg).await?;
-            self.free.push(pg_idx);
+            self.upsert_leaf(key, value, pg, parent_pg_idx).await
+        } else {
+            let search = search_inner(pg.get(), key).idx();
+            let child_idx = read_page_ptr(pg.get(), search);
+            self.free.push(child_idx);
+            let child_pg = self.db.inner.fio.read(child_idx).await?;
+            let pg_idx = self.alloc().await?;
+            let insert = Box::pin(self.upsert_inner(key, value, child_pg, pg_idx)).await?;
+
+            match insert {
+                InsertResult::Single(child_idx) => {
+                    write_page_ptr(pg.get_mut(), search, child_idx);
+                    self.db.inner.fio.write(pg_idx, pg).await?;
+                    Ok(InsertResult::Single(pg_idx))
+                }
+                InsertResult::Split(left, split, right) => {
+                    let can_insert = pg.get().remaining() > PAGE_PTR_SIZE + split.len() + SLOT_SIZE;
+                    if can_insert {
+                        todo!("do simple insert")
+                    } else {
+                        todo!("do annoying split then insert")
+                    }
+                }
+            }
         }
-        Ok(())
     }
 
     async fn upsert_leaf(
@@ -672,6 +703,7 @@ impl Txn {
         key: &[u8],
         value: LeafValue<'_>,
         mut pg: PageBuf,
+        parent_pg_idx: u64,
     ) -> Result<InsertResult> {
         let encoded_value = value.encode(self).await?;
 
@@ -692,7 +724,7 @@ impl Txn {
             let mut left = pg;
             let mut right = self.db.inner.fio.get_buf();
 
-            right.get_mut().header_mut().init_leaf(0); // filled in by caller
+            right.get_mut().header_mut().init_leaf(parent_pg_idx);
 
             // TODO: this could be more efficent, just copy over without removal efficently then "shrink" the left block in one op
             let len = left.get().len();
