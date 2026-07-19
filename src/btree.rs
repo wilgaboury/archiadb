@@ -200,6 +200,8 @@ trait BTreeNodeBuf {
     fn available(&self) -> usize;
     fn get_key_leaf(&self, idx: usize) -> &[u8];
     fn get_value_leaf(&self, idx: usize) -> LeafValueEncoded<'_>;
+    fn get_page_ptr(&self, idx: usize) -> u64;
+    fn get_key_inner(&self, idx: usize) -> &[u8];
 }
 
 impl BTreeNodeBuf for [u8] {
@@ -263,6 +265,14 @@ impl BTreeNodeBuf for [u8] {
 
     fn get_value_leaf(&self, idx: usize) -> LeafValueEncoded<'_> {
         get_value_leaf(&self, idx)
+    }
+
+    fn get_page_ptr(&self, idx: usize) -> u64 {
+        get_page_ptr(self, idx)
+    }
+
+    fn get_key_inner(&self, idx: usize) -> &[u8] {
+        get_key_inner(self, idx)
     }
 }
 
@@ -427,7 +437,7 @@ fn write_slot(buf: &mut [u8], idx: usize, value: usize) {
     buf[start..end].copy_from_slice(&(value as Slot).to_ne_bytes());
 }
 
-fn read_page_ptr(buf: &[u8], idx: usize) -> u64 {
+fn get_page_ptr(buf: &[u8], idx: usize) -> u64 {
     let mut u64_buf = [0u8; 8];
     let loc = if idx == 0 {
         buf.len() - CHECKSUM_SIZE - PAGE_PTR_SIZE
@@ -439,23 +449,12 @@ fn read_page_ptr(buf: &[u8], idx: usize) -> u64 {
 }
 
 fn write_page_ptr(buf: &mut [u8], idx: usize, value: u64) {
-    let mut u64_buf = [0u8; 8];
     let loc = if idx == 0 {
         buf.len() - CHECKSUM_SIZE - PAGE_PTR_SIZE
     } else {
         read_slot(buf, idx - 1) - PAGE_PTR_SIZE
     };
     buf[loc..loc + PAGE_PTR_SIZE].copy_from_slice(&value.to_ne_bytes());
-}
-
-fn read_key(buf: &[u8], idx: usize) -> &[u8] {
-    let end = if idx == 0 {
-        buf.len() - CHECKSUM_SIZE - PAGE_PTR_SIZE
-    } else {
-        read_slot(buf, idx - 1) - PAGE_PTR_SIZE
-    };
-    let start = read_slot(buf, idx);
-    &buf[start..end]
 }
 
 fn get_key_inner(buf: &[u8], idx: usize) -> &[u8] {
@@ -659,7 +658,9 @@ enum InsertResult {
 }
 
 impl Txn {
-    async fn upsert(&mut self, key: &[u8], value: &[u8], root: RootDoublePageBuf) {}
+    async fn upsert(&mut self, key: &[u8], value: &[u8], root: RootDoublePageBuf) {
+        todo!("implement")
+    }
 
     async fn upsert_inner(
         &mut self,
@@ -668,13 +669,12 @@ impl Txn {
         mut pg: PageBuf,
         parent_pg_idx: u64,
     ) -> Result<InsertResult> {
-        let db = &self.db.inner;
         let header = from_bytes::<BTreeHeader>(pg.get());
         if header.kind == BTreeNodeKind::Leaf {
             self.upsert_leaf(key, value, pg, parent_pg_idx).await
         } else {
             let search = search_inner(pg.get(), key).idx();
-            let child_idx = read_page_ptr(pg.get(), search);
+            let child_idx = get_page_ptr(pg.get(), search);
             self.free.push(child_idx);
             let child_pg = self.db.inner.fio.read(child_idx).await?;
             let pg_idx = self.alloc().await?;
@@ -689,13 +689,62 @@ impl Txn {
                 InsertResult::Split(left, split, right) => {
                     let can_insert = pg.get().remaining() > PAGE_PTR_SIZE + split.len() + SLOT_SIZE;
                     if can_insert {
-                        todo!("do simple insert")
+                        insert_at_inner(pg.get_mut(), search, left, &split, right);
+                        self.db.inner.fio.write(pg_idx, pg).await?;
+                        Ok(InsertResult::Single(pg_idx))
                     } else {
-                        todo!("do annoying split then insert")
+                        self.split_inner(left, split, right, pg, parent_pg_idx)
+                            .await
                     }
                 }
             }
         }
+    }
+
+    async fn split_inner(
+        &mut self,
+        left_idx: u64,
+        split: Box<[u8]>,
+        right_idx: u64,
+        pg: PageBuf,
+        parent_pg_idx: u64,
+    ) -> Result<InsertResult> {
+        let mut left = pg;
+        let mut right = self.db.inner.fio.get_buf();
+
+        right.get_mut().header_mut().init_leaf(parent_pg_idx);
+
+        let len = left.get().len();
+        let start = len / 2;
+        for idx in start..len {
+            let key = left.get().get_key_leaf(idx);
+            let value = left.get().get_value_leaf(idx);
+            insert_at_leaf(right.get_mut(), idx - start, key, &value);
+        }
+        left.get_mut().header_mut().len = start as u32;
+
+        {
+            let insert = if split.as_ref().cmp(right.get().get_key_inner(0)) == Ordering::Less {
+                &mut left
+            } else {
+                &mut right
+            };
+
+            let search = search_inner(insert.get(), &split);
+            match search {
+                SearchResult::Exact(_) => bail!("exact match value should never be promoted"),
+                SearchResult::Insert(idx) => {
+                    insert_at_inner(insert.get_mut(), idx, left_idx, &split, right_idx);
+                }
+            }
+        }
+
+        let key = right.get().get_key_leaf(0).to_vec().into_boxed_slice();
+
+        self.db.inner.fio.write(left_idx, left).await?;
+        self.db.inner.fio.write(right_idx, right).await?;
+
+        Ok(InsertResult::Split(left_idx, key, right_idx))
     }
 
     async fn upsert_leaf(
@@ -726,14 +775,14 @@ impl Txn {
 
             right.get_mut().header_mut().init_leaf(parent_pg_idx);
 
-            // TODO: this could be more efficent, just copy over without removal efficently then "shrink" the left block in one op
             let len = left.get().len();
-            for idx in (len / 2..len).rev() {
+            let start = len / 2;
+            for idx in start..len {
                 let key = left.get().get_key_leaf(idx);
                 let value = left.get().get_value_leaf(idx);
-                insert_at_leaf(right.get_mut(), 0, key, &value);
-                remove_at_leaf(left.get_mut(), 0);
+                insert_at_leaf(right.get_mut(), idx - start, key, &value);
             }
+            left.get_mut().header_mut().len = start as u32;
 
             {
                 let insert = if key.cmp(right.get().get_key_leaf(0)) == Ordering::Less {
@@ -822,9 +871,8 @@ mod tests {
 
     use crate::{
         btree::{
-            BTreeHeader, BTreeNodeBuf, LeafValueEncoded, get_key_inner, get_key_leaf,
-            get_value_leaf, insert_at_inner, insert_at_leaf, insert_init_inner, read_page_ptr,
-            remove_at_leaf,
+            BTreeHeader, BTreeNodeBuf, LeafValueEncoded, get_key_inner, get_key_leaf, get_page_ptr,
+            get_value_leaf, insert_at_inner, insert_at_leaf, insert_init_inner, remove_at_leaf,
         },
         test_util::TempDir,
         util::from_bytes_mut,
@@ -835,7 +883,7 @@ mod tests {
         let mut node = [0u8; 64];
         {
             let header = from_bytes_mut::<BTreeHeader>(&mut node);
-            header.init_inner();
+            header.init_inner(0);
         }
 
         insert_init_inner(&mut node, 1);
@@ -849,7 +897,7 @@ mod tests {
                 /* checksum */ 0, 0, 0, 0, 0, 0, 0, 0
             ]
         );
-        assert_eq!(1, read_page_ptr(&node, 0));
+        assert_eq!(1, get_page_ptr(&node, 0));
 
         insert_at_inner(&mut node, 0, 2, b"a", 3);
 
@@ -863,9 +911,9 @@ mod tests {
                 /* checksum */ 0, 0, 0, 0, 0, 0, 0, 0
             ]
         );
-        assert_eq!(2, read_page_ptr(&node, 0));
+        assert_eq!(2, get_page_ptr(&node, 0));
         assert_eq!(b"a", get_key_inner(&node, 0));
-        assert_eq!(3, read_page_ptr(&node, 1));
+        assert_eq!(3, get_page_ptr(&node, 1));
 
         insert_at_inner(&mut node, 0, 4, b"b", 5);
 
@@ -879,11 +927,11 @@ mod tests {
                 0, 0, 0, 0, 0, 0, 0, /* checksum */ 0, 0, 0, 0, 0, 0, 0, 0
             ]
         );
-        assert_eq!(4, read_page_ptr(&node, 0));
-        assert_eq!(b"b", get_key_inner(&node, 0));
-        assert_eq!(5, read_page_ptr(&node, 1));
-        assert_eq!(b"a", get_key_inner(&node, 1));
-        assert_eq!(3, read_page_ptr(&node, 2));
+        assert_eq!(4, node.get_page_ptr(0));
+        assert_eq!(b"b", node.get_key_inner(0));
+        assert_eq!(5, node.get_page_ptr(1));
+        assert_eq!(b"a", node.get_key_inner(1));
+        assert_eq!(3, node.get_page_ptr(2));
     }
 
     #[test]
@@ -891,7 +939,7 @@ mod tests {
         let mut node = [0u8; 64];
         {
             let header = from_bytes_mut::<BTreeHeader>(&mut node);
-            header.init_inner();
+            header.init_inner(0);
         }
 
         insert_init_inner(&mut node, 1);
@@ -906,7 +954,7 @@ mod tests {
             ]
         );
 
-        assert_eq!(1, read_page_ptr(&node, 0));
+        assert_eq!(1, get_page_ptr(&node, 0));
 
         insert_at_inner(&mut node, 0, 2, b"a", 3);
 
@@ -921,9 +969,9 @@ mod tests {
             ]
         );
 
-        assert_eq!(2, read_page_ptr(&node, 0));
+        assert_eq!(2, get_page_ptr(&node, 0));
         assert_eq!(b"a", get_key_inner(&node, 0));
-        assert_eq!(3, read_page_ptr(&node, 1));
+        assert_eq!(3, get_page_ptr(&node, 1));
 
         insert_at_inner(&mut node, 1, 4, b"b", 5);
 
@@ -938,11 +986,11 @@ mod tests {
             ]
         );
 
-        assert_eq!(2, read_page_ptr(&node, 0));
+        assert_eq!(2, get_page_ptr(&node, 0));
         assert_eq!(b"a", get_key_inner(&node, 0));
-        assert_eq!(4, read_page_ptr(&node, 1));
+        assert_eq!(4, get_page_ptr(&node, 1));
         assert_eq!(b"b", get_key_inner(&node, 1));
-        assert_eq!(5, read_page_ptr(&node, 2));
+        assert_eq!(5, get_page_ptr(&node, 2));
     }
 
     #[named]
@@ -966,48 +1014,48 @@ mod tests {
         let mut page = vec![0u8; 4096];
 
         {
-            page.header_mut().init_inner();
+            page.header_mut().init_inner(0);
         }
         assert_eq!(0, { page.header().len });
 
         insert_init_inner(&mut page, 1);
-        assert_eq!(1, read_page_ptr(&page, 0));
+        assert_eq!(1, get_page_ptr(&page, 0));
         assert_eq!(1, { page.header().len });
 
         insert_at_inner(&mut page, 0, 2, b"AAA", 3);
-        assert_eq!(2, read_page_ptr(&page, 0));
+        assert_eq!(2, get_page_ptr(&page, 0));
         assert_eq!(b"AAA", get_key_inner(&page, 0));
-        assert_eq!(3, read_page_ptr(&page, 1));
+        assert_eq!(3, get_page_ptr(&page, 1));
         assert_eq!(2, { page.header().len });
 
         insert_at_inner(&mut page, 1, 3, b"BBB", 4);
-        assert_eq!(2, read_page_ptr(&page, 0));
+        assert_eq!(2, get_page_ptr(&page, 0));
         assert_eq!(b"AAA", get_key_inner(&page, 0));
-        assert_eq!(3, read_page_ptr(&page, 1));
+        assert_eq!(3, get_page_ptr(&page, 1));
         assert_eq!(b"BBB", get_key_inner(&page, 1));
-        assert_eq!(4, read_page_ptr(&page, 2));
+        assert_eq!(4, get_page_ptr(&page, 2));
         assert_eq!(3, { page.header().len });
 
         insert_at_inner(&mut page, 0, 1, b"CCC", 2);
-        assert_eq!(1, read_page_ptr(&page, 0));
+        assert_eq!(1, get_page_ptr(&page, 0));
         assert_eq!(b"CCC", get_key_inner(&page, 0));
-        assert_eq!(2, read_page_ptr(&page, 1));
+        assert_eq!(2, get_page_ptr(&page, 1));
         assert_eq!(b"AAA", get_key_inner(&page, 1));
-        assert_eq!(3, read_page_ptr(&page, 2));
+        assert_eq!(3, get_page_ptr(&page, 2));
         assert_eq!(b"BBB", get_key_inner(&page, 2));
-        assert_eq!(4, read_page_ptr(&page, 3));
+        assert_eq!(4, get_page_ptr(&page, 3));
         assert_eq!(4, { page.header().len });
 
         insert_at_inner(&mut page, 2, 5, b"DDD", 6);
-        assert_eq!(1, read_page_ptr(&page, 0));
+        assert_eq!(1, get_page_ptr(&page, 0));
         assert_eq!(b"CCC", get_key_inner(&page, 0));
-        assert_eq!(2, read_page_ptr(&page, 1));
+        assert_eq!(2, get_page_ptr(&page, 1));
         assert_eq!(b"AAA", get_key_inner(&page, 1));
-        assert_eq!(5, read_page_ptr(&page, 2));
+        assert_eq!(5, get_page_ptr(&page, 2));
         assert_eq!(b"DDD", get_key_inner(&page, 2));
-        assert_eq!(6, read_page_ptr(&page, 3));
+        assert_eq!(6, get_page_ptr(&page, 3));
         assert_eq!(b"BBB", get_key_inner(&page, 3));
-        assert_eq!(4, read_page_ptr(&page, 4));
+        assert_eq!(4, get_page_ptr(&page, 4));
         assert_eq!(5, { page.header().len });
 
         Ok(())
