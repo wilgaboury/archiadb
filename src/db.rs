@@ -133,22 +133,22 @@ pub struct Txn {
 }
 
 impl Txn {
-    pub async fn read(&self, path: &KeyPath) -> &[u8] {
+    pub async fn read(&self, _path: &KeyPath) -> &[u8] {
         todo!()
     }
 
     pub async fn scan(
         &self,
-        root: &KeyPath,
-        start: Option<&[u8]>,
-        end: Option<&[u8]>,
+        _root: &KeyPath,
+        _start: Option<&[u8]>,
+        _end: Option<&[u8]>,
     ) -> impl Iterator<Item = (KeyPathBuf, Vec<u8>)> {
         todo!();
         #[allow(unreachable_code)]
         std::iter::empty()
     }
 
-    pub async fn write(&mut self, path: &KeyPath, value: &[u8]) {
+    pub async fn write(&mut self, _path: &KeyPath, _value: &[u8]) {
         todo!()
     }
 

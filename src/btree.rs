@@ -658,7 +658,7 @@ enum InsertResult {
 }
 
 impl Txn {
-    async fn upsert(&mut self, key: &[u8], value: &[u8], root: RootDoublePageBuf) {
+    async fn upsert(&mut self, _key: &[u8], _value: &[u8], _root: RootDoublePageBuf) {
         todo!("implement")
     }
 
