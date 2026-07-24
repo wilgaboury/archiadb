@@ -15,7 +15,7 @@ impl KeyPathBuf {
         Self { data: vec![0] }
     }
 
-    pub fn append(&mut self, slice: &[u8]) {
+    pub fn push(&mut self, slice: &[u8]) {
         let part_len = slice.len();
         if self.len() == MAX_KEY_PATH_LEN {
             eprintln!("Key path is at limit of length")
@@ -25,6 +25,21 @@ impl KeyPathBuf {
             self.data[0] += 1;
             self.data.push(part_len as u8);
             self.data.extend_from_slice(slice);
+        }
+    }
+
+    pub fn pop(&mut self) {
+        if self.len() == 0 {
+            eprintln!("Cannot pop from empty key path buf")
+        } else {
+            self.data[0] -= 1;
+            let mut i = 1;
+            let mut len = 1;
+            while (len + 1 + self.data[i] as usize) < self.data.len() {
+                len += 1 + self.data[i] as usize;
+                i += 1 + self.data[i] as usize;
+            }
+            self.data.truncate(len);
         }
     }
 
@@ -230,9 +245,9 @@ mod tests {
         assert_eq!(0, buf.len());
         assert_eq!(1, buf.data.len());
 
-        buf.append(b"hello");
-        buf.append(b"world");
-        buf.append(b"rust");
+        buf.push(b"hello");
+        buf.push(b"world");
+        buf.push(b"rust");
 
         let slices: Vec<&[u8]> = buf.into_iter().collect();
         assert_eq!(slices, vec![b"hello" as &[u8], b"world", b"rust"]);
@@ -247,6 +262,13 @@ mod tests {
         let default_buf = KeyPathBuf::default();
         assert_eq!(0, default_buf.len());
         assert_eq!(1, default_buf.data.len());
+
+        buf.pop();
+        assert_eq!(buf.as_path(), key_path![b"hello", b"world"]);
+        buf.pop();
+        assert_eq!(buf.as_path(), key_path![b"hello"]);
+        buf.pop();
+        assert_eq!(buf.as_path(), key_path![]);
     }
 
     #[test]
@@ -254,11 +276,11 @@ mod tests {
         let mut buf = KeyPathBuf::new();
 
         let large_slice = vec![0u8; 300];
-        buf.append(&large_slice);
+        buf.push(&large_slice);
         assert_eq!(0, buf.len());
         assert_eq!(1, buf.data.len());
 
-        buf.append(b"ok");
+        buf.push(b"ok");
         assert_eq!(buf.data, vec![1, 2, b'o', b'k']);
 
         // Corrupt by changing the first length byte to 100
@@ -330,11 +352,11 @@ mod tests {
         let mut buf_b = KeyPathBuf::new();
         let mut buf_ab = KeyPathBuf::new();
 
-        buf_a1.append(b"a");
-        buf_a2.append(b"a");
-        buf_b.append(b"b");
-        buf_ab.append(b"a");
-        buf_ab.append(b"b");
+        buf_a1.push(b"a");
+        buf_a2.push(b"a");
+        buf_b.push(b"b");
+        buf_ab.push(b"a");
+        buf_ab.push(b"b");
 
         assert_eq!(buf_a1.cmp(&buf_a2), Ordering::Equal);
         assert_eq!(buf_a1.cmp(&buf_b), Ordering::Less);

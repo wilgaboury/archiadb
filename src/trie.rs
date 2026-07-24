@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, VecDeque};
 use anyhow::{Context, Result, bail};
 
 use crate::{
+    fio::PageBuf,
     key::{KeyPath, KeyPathBuf},
     lock::LockType,
 };
@@ -14,6 +15,7 @@ pub(crate) struct TxnKeyTrie {
 
 struct TxnKeyTrieNode {
     lock_type: LockType,
+    dirty: Option<PageBuf>,
     children: BTreeMap<Vec<u8>, TxnKeyTrieNode>,
 }
 
@@ -40,10 +42,7 @@ impl TxnKeyTrie {
                 .is_compatible(&next_lock_type)
                 .context("incompatible lock types")?;
         } else {
-            self.root = Some(TxnKeyTrieNode {
-                lock_type: next_lock_type,
-                children: BTreeMap::new(),
-            })
+            self.root = Some(TxnKeyTrieNode::new(next_lock_type))
         }
         let mut node = self.root.as_mut().unwrap();
 
@@ -63,13 +62,8 @@ impl TxnKeyTrie {
                     .context("incompatible lock types")?;
                 next
             } else {
-                node.children.insert(
-                    key.to_vec(),
-                    TxnKeyTrieNode {
-                        lock_type: next_lock_type,
-                        children: BTreeMap::new(),
-                    },
-                );
+                node.children
+                    .insert(key.to_vec(), TxnKeyTrieNode::new(next_lock_type));
                 node.children.get_mut(key).unwrap()
             }
         }
@@ -120,6 +114,95 @@ impl TxnKeyTrie {
 
         Ok(())
     }
+
+    fn get(&mut self, key_path: &KeyPath) -> Option<&TxnKeyTrieNode> {
+        let mut node = match self.root.as_ref() {
+            Some(node) => node,
+            None => return None,
+        };
+
+        for key in key_path.into_iter() {
+            if let Some(next_node) = node.children.get(key) {
+                node = next_node;
+            } else {
+                return None;
+            }
+        }
+
+        Some(node)
+    }
+
+    fn get_mut(&mut self, key_path: &KeyPath) -> Option<&mut TxnKeyTrieNode> {
+        let mut node = match self.root.as_mut() {
+            Some(node) => node,
+            None => return None,
+        };
+
+        for key in key_path.into_iter() {
+            if let Some(next_node) = node.children.get_mut(key) {
+                node = next_node;
+            } else {
+                return None;
+            }
+        }
+
+        Some(node)
+    }
+
+    /// Lowest common ancestor of dirty nodes
+    pub fn dirty_lca(&self) -> Option<KeyPathBuf> {
+        let mut first: Option<KeyPathBuf> = None;
+        let mut last: Option<KeyPathBuf> = None;
+        if let Some(root) = self.root.as_ref() {
+            root.find_dfs_dirty_first_last(&mut KeyPathBuf::new(), &mut first, &mut last);
+        }
+
+        match (first, last) {
+            (None, None) => None,
+            (Some(first), None) => Some(first),
+            (None, Some(last)) => Some(last),
+            (Some(first), Some(last)) => Some(
+                first
+                    .into_iter()
+                    .zip(last.into_iter())
+                    .take_while(|(fi, la)| fi == la)
+                    .map(|(fi, _)| fi)
+                    .fold(KeyPathBuf::new(), |mut buf, k| {
+                        buf.push(k);
+                        buf
+                    }),
+            ),
+        }
+    }
+}
+
+impl TxnKeyTrieNode {
+    pub fn new(lock_type: LockType) -> Self {
+        Self {
+            lock_type,
+            dirty: None,
+            children: BTreeMap::new(),
+        }
+    }
+
+    fn find_dfs_dirty_first_last(
+        &self,
+        stack: &mut KeyPathBuf,
+        first: &mut Option<KeyPathBuf>,
+        last: &mut Option<KeyPathBuf>,
+    ) {
+        if matches!(self.dirty, Some(_)) {
+            if matches!(first, None) {
+                *first = Some(stack.clone())
+            }
+            *last = Some(stack.clone())
+        }
+        for (key, child) in self.children.iter() {
+            stack.push(&key);
+            child.find_dfs_dirty_first_last(stack, first, last);
+            stack.pop();
+        }
+    }
 }
 
 pub(crate) struct TxnKeyTrieLevelIterator<'a> {
@@ -145,7 +228,7 @@ impl<'a> Iterator for TxnKeyTrieLevelIterator<'a> {
 
             for (key_segment, child_node) in &node.children {
                 let mut child_path = path.clone();
-                child_path.append(key_segment);
+                child_path.push(key_segment);
                 self.queue.push_back((child_path, child_node));
             }
 
@@ -209,6 +292,20 @@ mod tests {
         trie.insert(key_path![b"read", b"read"], LockType::Read)
             .unwrap();
 
+        {
+            let n = trie.get(key_path![b"read"]).unwrap();
+            assert_eq!(n.lock_type, LockType::ReadChildWrite);
+            let n = trie.get(key_path![b"read", b"read_recur"]).unwrap();
+            assert_eq!(n.lock_type, LockType::ReadRecursive)
+        }
+
+        {
+            let n = trie.get_mut(key_path![b"read"]).unwrap();
+            assert_eq!(n.lock_type, LockType::ReadChildWrite);
+            let n = trie.get_mut(key_path![b"read", b"read_recur"]).unwrap();
+            assert_eq!(n.lock_type, LockType::ReadRecursive)
+        }
+
         assert!(trie.validate_read(&key_path![b"read"]).is_ok());
         assert!(
             trie.validate_read(&key_path![b"read", b"read_recur"])
@@ -242,5 +339,10 @@ mod tests {
 
         assert!(trie.validate_read(&key_path![b"rand"]).is_err());
         assert!(trie.validate_write(&key_path![b"rand"]).is_err());
+    }
+
+    #[test]
+    fn test_dirty_lca() {
+        // todo!("test")
     }
 }
