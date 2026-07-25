@@ -240,7 +240,9 @@ impl<'a> Iterator for TxnKeyTrieLevelIterator<'a> {
 
 #[cfg(test)]
 mod tests {
-    use crate::key_path;
+    use function_name::named;
+
+    use crate::{key, key_path, test_util::TempDir};
 
     use super::*;
 
@@ -342,7 +344,44 @@ mod tests {
     }
 
     #[test]
-    fn test_dirty_lca() {
-        // todo!("test")
+    #[named]
+    fn test_dirty_lca() -> Result<()> {
+        let temp_dir = TempDir::new(function_name!())?;
+        let (fio, _) = temp_dir.fio("db")?;
+
+        let mut trie = TxnKeyTrie::new();
+
+        trie.insert(key_path![b"1", b"2", b"4"], LockType::Read)?;
+        trie.insert(key_path![b"1", b"2", b"5"], LockType::Read)?;
+        trie.insert(key_path![b"1", b"3", b"6"], LockType::Read)?;
+        trie.insert(key_path![b"1", b"3", b"7"], LockType::Read)?;
+
+        trie.get_mut(key_path![b"1", b"2", b"4"]).unwrap().dirty = Some(fio.get_buf());
+
+        assert_eq!(
+            key_path![b"1", b"2", b"4"],
+            trie.dirty_lca().unwrap().as_path()
+        );
+
+        trie.get_mut(key_path![b"1", b"2", b"5"]).unwrap().dirty = Some(fio.get_buf());
+
+        assert_eq!(key_path![b"1", b"2"], trie.dirty_lca().unwrap().as_path());
+
+        trie.get_mut(key_path![b"1", b"3", b"7"]).unwrap().dirty = Some(fio.get_buf());
+
+        assert_eq!(key_path![b"1"], trie.dirty_lca().unwrap().as_path());
+
+        trie.get_mut(key_path![b"1", b"3", b"6"]).unwrap().dirty = Some(fio.get_buf());
+
+        assert_eq!(key_path![b"1"], trie.dirty_lca().unwrap().as_path());
+
+        trie.insert(key_path![b"8"], LockType::Read)?;
+        trie.get_mut(key_path![b"8"]).unwrap().dirty = Some(fio.get_buf());
+
+        assert_eq!(key_path![], trie.dirty_lca().unwrap().as_path());
+
+        // TODO: implement dirty clear operation and test it here
+
+        Ok(())
     }
 }
