@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::{
+    collections::{BTreeMap, HashSet, VecDeque},
+    marker::PhantomData,
+};
 
 use anyhow::{Context, Result, bail};
 
@@ -13,7 +16,7 @@ pub(crate) struct TxnKeyTrie {
     root: Option<TxnKeyTrieNode>,
 }
 
-struct TxnKeyTrieNode {
+pub(crate) struct TxnKeyTrieNode {
     lock_type: LockType,
     dirty: Option<PageBuf>,
     children: BTreeMap<Vec<u8>, TxnKeyTrieNode>,
@@ -24,8 +27,8 @@ impl TxnKeyTrie {
         Self { root: None }
     }
 
-    pub fn level_order_iter(&self) -> TxnKeyTrieLevelIterator<'_> {
-        TxnKeyTrieLevelIterator::new(self)
+    pub fn level_order_iter(&self) -> TxnKeyTrieLevelIter<'_> {
+        TxnKeyTrieLevelIter::new(self)
     }
 
     pub fn insert(&mut self, path: &KeyPath, lock_type: LockType) -> Result<()> {
@@ -174,6 +177,20 @@ impl TxnKeyTrie {
             ),
         }
     }
+
+    pub fn clear_dirty(&mut self) {
+        for n in self.iter_mut() {
+            n.dirty = None
+        }
+    }
+
+    pub fn iter(&self) -> TxnKeyTrieIter<'_> {
+        TxnKeyTrieIter::new(self)
+    }
+
+    pub fn iter_mut(&mut self) -> TxnKeyTrieIterMut<'_> {
+        TxnKeyTrieIterMut::new(self)
+    }
 }
 
 impl TxnKeyTrieNode {
@@ -205,11 +222,97 @@ impl TxnKeyTrieNode {
     }
 }
 
-pub(crate) struct TxnKeyTrieLevelIterator<'a> {
+pub(crate) struct TxnKeyTrieIter<'a> {
+    stack: Vec<*const TxnKeyTrieNode>,
+    visited: HashSet<*const TxnKeyTrieNode>,
+    _phantom: PhantomData<&'a bool>,
+}
+
+impl<'a> TxnKeyTrieIter<'a> {
+    pub fn new(trie: &TxnKeyTrie) -> Self {
+        let mut stack = Vec::new();
+        let mut visited = HashSet::new();
+
+        if let Some(root) = trie.root.as_ref() {
+            let root = root as *const TxnKeyTrieNode;
+            stack.push(root);
+            visited.insert(root);
+        }
+
+        Self {
+            stack,
+            visited,
+            _phantom: PhantomData::default(),
+        }
+    }
+}
+
+impl<'a> Iterator for TxnKeyTrieIter<'a> {
+    type Item = &'a TxnKeyTrieNode;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let cur = dfs_step(&mut self.stack, &mut self.visited)?;
+        Some(unsafe { &*cur })
+    }
+}
+
+pub(crate) struct TxnKeyTrieIterMut<'a> {
+    stack: Vec<*const TxnKeyTrieNode>,
+    visited: HashSet<*const TxnKeyTrieNode>,
+    _phantom: PhantomData<&'a bool>,
+}
+
+impl<'a> TxnKeyTrieIterMut<'a> {
+    pub fn new(trie: &mut TxnKeyTrie) -> Self {
+        let mut stack = Vec::new();
+        let mut visited = HashSet::new();
+
+        if let Some(root) = trie.root.as_ref() {
+            let root = root as *const TxnKeyTrieNode;
+            stack.push(root);
+            visited.insert(root);
+        }
+
+        Self {
+            stack,
+            visited,
+            _phantom: PhantomData::default(),
+        }
+    }
+}
+
+impl<'a> Iterator for TxnKeyTrieIterMut<'a> {
+    type Item = &'a mut TxnKeyTrieNode;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let cur = dfs_step(&mut self.stack, &mut self.visited)?;
+        Some(unsafe { &mut *(cur as *mut _) })
+    }
+}
+
+fn dfs_step(
+    stack: &mut Vec<*const TxnKeyTrieNode>,
+    visited: &mut HashSet<*const TxnKeyTrieNode>,
+) -> Option<*const TxnKeyTrieNode> {
+    let cur = stack.pop()?;
+    let cur = unsafe { &mut *(cur as *mut TxnKeyTrieNode) };
+
+    for (_, child) in cur.children.iter() {
+        let child = child as *const TxnKeyTrieNode;
+        if !visited.contains(&child) {
+            stack.push(child);
+            visited.insert(child);
+        }
+    }
+
+    Some(cur)
+}
+
+pub(crate) struct TxnKeyTrieLevelIter<'a> {
     queue: VecDeque<(KeyPathBuf, &'a TxnKeyTrieNode)>,
 }
 
-impl<'a> TxnKeyTrieLevelIterator<'a> {
+impl<'a> TxnKeyTrieLevelIter<'a> {
     pub fn new(trie: &'a TxnKeyTrie) -> Self {
         let mut queue = VecDeque::new();
         if let Some(root) = trie.root.as_ref() {
@@ -219,7 +322,7 @@ impl<'a> TxnKeyTrieLevelIterator<'a> {
     }
 }
 
-impl<'a> Iterator for TxnKeyTrieLevelIterator<'a> {
+impl<'a> Iterator for TxnKeyTrieLevelIter<'a> {
     type Item = (KeyPathBuf, LockType);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -242,7 +345,7 @@ impl<'a> Iterator for TxnKeyTrieLevelIterator<'a> {
 mod tests {
     use function_name::named;
 
-    use crate::{key, key_path, test_util::TempDir};
+    use crate::{key_path, test_util::TempDir};
 
     use super::*;
 
@@ -348,7 +451,6 @@ mod tests {
     fn test_dirty_lca() -> Result<()> {
         let temp_dir = TempDir::new(function_name!())?;
         let (fio, _) = temp_dir.fio("db")?;
-
         let mut trie = TxnKeyTrie::new();
 
         trie.insert(key_path![b"1", b"2", b"4"], LockType::Read)?;
@@ -380,7 +482,24 @@ mod tests {
 
         assert_eq!(key_path![], trie.dirty_lca().unwrap().as_path());
 
-        // TODO: implement dirty clear operation and test it here
+        trie.clear_dirty();
+
+        assert!(trie.dirty_lca().is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_iter() -> Result<()> {
+        let mut trie = TxnKeyTrie::new();
+
+        trie.insert(key_path![b"1", b"2"], LockType::Write)?;
+
+        let mut iter = trie.iter();
+        assert_eq!(iter.next().unwrap().lock_type, LockType::ReadChildWrite);
+        assert_eq!(iter.next().unwrap().lock_type, LockType::ReadChildWrite);
+        assert_eq!(iter.next().unwrap().lock_type, LockType::Write);
+        assert!(iter.next().is_none());
 
         Ok(())
     }
