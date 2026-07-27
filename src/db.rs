@@ -100,13 +100,13 @@ impl TxnBuilder {
 
     pub async fn begin(self) -> Txn {
         let mut guards = Vec::new();
-        for (lock_path, lock_type) in self.ops.level_order_iter() {
+        for (lock_path, node) in self.ops.bfs_iter() {
             guards.push(
                 self.db
                     .inner
                     .read_locks
                     .get(lock_path)
-                    .acquire(lock_type)
+                    .acquire(node.lock_type)
                     .await,
             );
         }
@@ -120,6 +120,7 @@ impl TxnBuilder {
             guards,
             allocs: AllocationSet::new(),
             free: Vec::new(),
+            ops: self.ops,
         }
     }
 }
@@ -130,6 +131,7 @@ pub struct Txn {
     pub(crate) guards: Vec<LockGuard>,
     pub(crate) allocs: AllocationSet,
     pub(crate) free: Vec<u64>,
+    pub(crate) ops: TxnKeyTrie,
 }
 
 impl Txn {
@@ -153,8 +155,11 @@ impl Txn {
     }
 
     pub async fn commit(&mut self) {
-        // collect write paths and then acquire in reverse/bottom-up order
-        todo!()
+        if let Some(lca) = self.ops.dirty_lca() {
+            for (key, lock) in self.ops.bfs_iter() {}
+
+            todo!("implement")
+        }
     }
 }
 
