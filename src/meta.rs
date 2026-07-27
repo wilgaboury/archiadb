@@ -236,7 +236,7 @@ mod tests {
     use anyhow::Result;
     use function_name::named;
 
-    use crate::meta::{MAGIC, Meta};
+    use crate::meta::{FMT_VERSION, MAGIC, Meta};
     use crate::test_util::TempDir;
     use crate::util::{from_bytes, from_bytes_mut, update_checksum};
 
@@ -304,7 +304,14 @@ mod tests {
 
     #[named]
     #[test]
-    fn test_version() -> Result<()> {
+    fn test_get() -> Result<()> {
+        let temp_dir = TempDir::new(function_name!())?;
+        let meta_hand = temp_dir.meta("sync.db")?;
+
+        assert_eq!(meta_hand.fmt_version(), FMT_VERSION);
+        assert_eq!(meta_hand.root1(), 3);
+        assert_eq!(meta_hand.root2(), 4);
+
         Ok(())
     }
 

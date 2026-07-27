@@ -1008,7 +1008,6 @@ mod tests {
         Ok(())
     }
 
-    #[named]
     #[tokio::test]
     async fn test_single_inner_insert() -> Result<()> {
         let mut page = vec![0u8; 4096];
@@ -1061,7 +1060,6 @@ mod tests {
         Ok(())
     }
 
-    #[named]
     #[tokio::test]
     async fn test_single_leaf_insert() -> Result<()> {
         let mut page = vec![0u8; 4096];
