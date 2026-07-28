@@ -96,6 +96,15 @@ impl KeyPath {
     pub fn as_bytes(&self) -> &[u8] {
         &self.data
     }
+
+    pub fn starts_with<P: AsRef<KeyPath>>(&self, other: P) -> bool {
+        self.len()
+            == self
+                .into_iter()
+                .zip(other.as_ref().into_iter())
+                .take_while(|(p1, p2)| *p1 == *p2)
+                .count()
+    }
 }
 
 impl Ord for KeyPath {

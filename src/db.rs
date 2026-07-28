@@ -156,7 +156,11 @@ impl Txn {
 
     pub async fn commit(&mut self) {
         if let Some(lca) = self.ops.dirty_lca() {
-            for (key, lock) in self.ops.bfs_iter() {}
+            for (key, node) in self.ops.dfs_iter_mut() {
+                if key.as_path().starts_with(&lca) {
+                    todo!("implement")
+                }
+            }
 
             todo!("implement")
         }
