@@ -8,7 +8,7 @@ use crate::{
     alloc::{AllocationSet, PageAllocator},
     concache::ConCache,
     file::DbFile,
-    fio::{DEFAULT_CQ_SIZE, DEFAULT_SQ_SIZE, Fio},
+    fio::{DEFAULT_CQ_SIZE, DEFAULT_SQ_SIZE, Fio, PageBuf},
     key::{KeyPath, KeyPathBuf},
     lock::{Lock, LockGuard, LockType},
     meta::MetaHandler,
@@ -79,36 +79,29 @@ impl Db {
 
 pub struct TxnBuilder {
     db: Db,
-    ops: TxnKeyTrie,
+    ops: TxnKeyTrie<LockType>,
 }
 
 impl TxnBuilder {
     pub fn read(mut self, path: &KeyPath) -> Result<Self> {
-        self.ops.insert(path, LockType::Read)?;
+        self.ops.insert_lock(path, LockType::Read)?;
         Ok(self)
     }
 
     pub fn write(mut self, path: &KeyPath) -> Result<Self> {
-        self.ops.insert(path, LockType::Write)?;
+        self.ops.insert_lock(path, LockType::Write)?;
         Ok(self)
     }
 
     pub fn read_recur(mut self, path: &KeyPath) -> Result<Self> {
-        self.ops.insert(path, LockType::ReadRecursive)?;
+        self.ops.insert_lock(path, LockType::ReadRecursive)?;
         Ok(self)
     }
 
     pub async fn begin(self) -> Txn {
         let mut guards = Vec::new();
-        for (lock_path, node) in self.ops.bfs_iter() {
-            guards.push(
-                self.db
-                    .inner
-                    .read_locks
-                    .get(lock_path)
-                    .acquire(node.lock_type)
-                    .await,
-            );
+        for (path, lock_type) in self.ops.bfs_iter() {
+            guards.push(self.db.inner.read_locks.get(path).acquire(*lock_type).await);
         }
         guards.reverse();
 
@@ -121,6 +114,7 @@ impl TxnBuilder {
             allocs: AllocationSet::new(),
             free: Vec::new(),
             ops: self.ops,
+            writes: TxnKeyTrie::new(),
         }
     }
 }
@@ -131,7 +125,8 @@ pub struct Txn {
     pub(crate) guards: Vec<LockGuard>,
     pub(crate) allocs: AllocationSet,
     pub(crate) free: Vec<u64>,
-    pub(crate) ops: TxnKeyTrie,
+    pub(crate) ops: TxnKeyTrie<LockType>,
+    pub(crate) writes: TxnKeyTrie<Option<PageBuf>>,
 }
 
 impl Txn {
@@ -155,7 +150,7 @@ impl Txn {
     }
 
     pub async fn commit(&mut self) {
-        if let Some(lca) = self.ops.dirty_lca() {
+        if let Some(lca) = self.writes.lca(|v| v.is_some()) {
             for (key, node) in self.ops.dfs_iter_mut() {
                 if key.as_path().starts_with(&lca) {
                     todo!("implement")

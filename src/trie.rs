@@ -6,115 +6,62 @@ use std::{
 use anyhow::{Context, Result, bail};
 
 use crate::{
-    fio::PageBuf,
     key::{KeyPath, KeyPathBuf},
     lock::LockType,
 };
 
 /// Benefit of tries is that it automatically merges common prefixes, detects conflicts, and is sorted for locking.
-pub(crate) struct TxnKeyTrie {
-    root: Option<TxnKeyTrieNode>,
+pub(crate) struct TxnKeyTrie<T> {
+    root: Option<TxnKeyTrieNode<T>>,
 }
 
-pub(crate) struct TxnKeyTrieNode {
-    pub(crate) lock_type: LockType,
-    pub(crate) dirty: Option<PageBuf>,
-    children: BTreeMap<Vec<u8>, TxnKeyTrieNode>,
+pub(crate) struct TxnKeyTrieNode<T> {
+    value: T,
+    children: BTreeMap<Vec<u8>, TxnKeyTrieNode<T>>,
 }
 
-impl TxnKeyTrie {
+impl<T> TxnKeyTrie<T> {
     pub fn new() -> Self {
         Self { root: None }
     }
 
-    pub fn insert(&mut self, path: &KeyPath, lock_type: LockType) -> Result<()> {
-        let next_lock_type = if path.len() == 0 {
-            lock_type
-        } else {
-            lock_type.inner_node_type()
+    pub fn upsert<F: Fn() -> T>(&mut self, path: &KeyPath, value_inter: F, value: T) -> Result<()> {
+        let mut node = match self.root.as_mut() {
+            Some(node) => node,
+            None => {
+                if path.len() > 0 {
+                    self.root = Some(TxnKeyTrieNode::new(value_inter()));
+                    self.root.as_mut().unwrap()
+                } else {
+                    self.root = Some(TxnKeyTrieNode::new(value));
+                    return Ok(());
+                }
+            }
         };
-
-        if self.root.is_some() {
-            let node = self.root.as_mut().unwrap();
-            node.lock_type = node
-                .lock_type
-                .is_compatible(&next_lock_type)
-                .context("incompatible lock types")?;
-        } else {
-            self.root = Some(TxnKeyTrieNode::new(next_lock_type))
-        }
-        let mut node = self.root.as_mut().unwrap();
 
         let mut iter = path.into_iter().peekable();
         while let Some(key) = iter.next() {
-            let next_lock_type = if iter.peek().is_none() {
-                lock_type
+            if iter.peek().is_some() {
+                if !node.children.contains_key(key) {
+                    node.children
+                        .insert(key.to_vec(), TxnKeyTrieNode::new(value_inter()));
+                }
             } else {
-                lock_type.inner_node_type()
-            };
-
-            node = if node.children.contains_key(key) {
-                let next = node.children.get_mut(key).unwrap();
-                next.lock_type = next
-                    .lock_type
-                    .is_compatible(&next_lock_type)
-                    .context("incompatible lock types")?;
-                next
-            } else {
-                node.children
-                    .insert(key.to_vec(), TxnKeyTrieNode::new(next_lock_type));
-                node.children.get_mut(key).unwrap()
+                if node.children.contains_key(key) {
+                    node.children.get_mut(key).unwrap().value = value;
+                } else {
+                    node.children
+                        .insert(key.to_vec(), TxnKeyTrieNode::new(value));
+                }
+                break;
             }
+            node = node.children.get_mut(key).unwrap()
         }
 
         Ok(())
     }
 
-    fn validate_read(&self, key_path: &KeyPath) -> Result<()> {
-        let mut node = match self.root.as_ref() {
-            Some(node) => node,
-            None => bail!("Cannot read node outside transaction bounds"),
-        };
-
-        for key in key_path.into_iter() {
-            if node.lock_type == LockType::ReadRecursive || node.lock_type == LockType::Write {
-                return Ok(());
-            } else if let Some(next_node) = node.children.get(key) {
-                node = next_node;
-            } else {
-                bail!("Cannot read node outside transaction bounds");
-            }
-        }
-
-        Ok(())
-    }
-
-    fn validate_write(&self, key_path: &KeyPath) -> Result<()> {
-        let mut node = match self.root.as_ref() {
-            Some(node) => node,
-            None => bail!("Cannot read node outside transaction bounds"),
-        };
-
-        for key in key_path.into_iter() {
-            if node.lock_type == LockType::Write {
-                return Ok(());
-            } else if node.lock_type != LockType::ReadChildWrite {
-                bail!("Cannot write read nodes");
-            } else if let Some(next_node) = node.children.get(key) {
-                node = next_node;
-            } else {
-                bail!("Cannot read node outside transaction bounds");
-            }
-        }
-
-        if node.lock_type != LockType::Write {
-            bail!("Cannot write read nodes");
-        }
-
-        Ok(())
-    }
-
-    fn get(&mut self, key_path: &KeyPath) -> Option<&TxnKeyTrieNode> {
+    fn get(&mut self, key_path: &KeyPath) -> Option<&T> {
         let mut node = match self.root.as_ref() {
             Some(node) => node,
             None => return None,
@@ -128,10 +75,10 @@ impl TxnKeyTrie {
             }
         }
 
-        Some(node)
+        Some(&node.value)
     }
 
-    fn get_mut(&mut self, key_path: &KeyPath) -> Option<&mut TxnKeyTrieNode> {
+    fn get_mut(&mut self, key_path: &KeyPath) -> Option<&mut T> {
         let mut node = match self.root.as_mut() {
             Some(node) => node,
             None => return None,
@@ -145,15 +92,15 @@ impl TxnKeyTrie {
             }
         }
 
-        Some(node)
+        Some(&mut node.value)
     }
 
     /// Lowest common ancestor of dirty nodes
-    pub fn dirty_lca(&self) -> Option<KeyPathBuf> {
+    pub fn lca<F: Fn(&T) -> bool>(&self, cond: F) -> Option<KeyPathBuf> {
         let mut first: Option<KeyPathBuf> = None;
         let mut last: Option<KeyPathBuf> = None;
         if let Some(root) = self.root.as_ref() {
-            root.find_dfs_dirty_first_last(&mut KeyPathBuf::new(), &mut first, &mut last);
+            root.find_dfs_dirty_first_last(cond, &mut KeyPathBuf::new(), &mut first, &mut last);
         }
 
         match (first, last) {
@@ -174,46 +121,128 @@ impl TxnKeyTrie {
         }
     }
 
-    pub fn clear_dirty(&mut self) {
-        // TODO: this does a lot of uneccesary copying
-        for (_, node) in self.dfs_iter_mut() {
-            node.dirty = None
-        }
-    }
-
-    pub fn bfs_iter(&self) -> TxnKeyTrieBfsIter<'_> {
+    pub fn bfs_iter(&self) -> TxnKeyTrieBfsIter<'_, T> {
         TxnKeyTrieBfsIter::new(self)
     }
 
-    pub fn bfs_iter_mut(&mut self) -> TxnKeyTrieBfsIterMut<'_> {
+    pub fn bfs_iter_mut(&mut self) -> TxnKeyTrieBfsIterMut<'_, T> {
         TxnKeyTrieBfsIterMut::new(self)
     }
 
-    pub fn dfs_iter(&self) -> TxnKeyTrieDfsIter<'_> {
+    pub fn dfs_iter(&self) -> TxnKeyTrieDfsIter<'_, T> {
         TxnKeyTrieDfsIter::new(self)
     }
 
-    pub fn dfs_iter_mut(&mut self) -> TxnKeyTrieDfsIterMut<'_> {
+    pub fn dfs_iter_mut(&mut self) -> TxnKeyTrieDfsIterMut<'_, T> {
         TxnKeyTrieDfsIterMut::new(self)
     }
 }
 
-impl TxnKeyTrieNode {
-    pub fn new(lock_type: LockType) -> Self {
+impl TxnKeyTrie<LockType> {
+    pub fn insert_lock(&mut self, path: &KeyPath, lock_type: LockType) -> Result<()> {
+        let next_lock_type = if path.len() == 0 {
+            lock_type
+        } else {
+            lock_type.inner_node_type()
+        };
+
+        if self.root.is_some() {
+            let node = self.root.as_mut().unwrap();
+            node.value = node
+                .value
+                .is_compatible(&next_lock_type)
+                .context("incompatible lock types")?;
+        } else {
+            self.root = Some(TxnKeyTrieNode::new(next_lock_type))
+        }
+        let mut node = self.root.as_mut().unwrap();
+
+        let mut iter = path.into_iter().peekable();
+        while let Some(key) = iter.next() {
+            let next_lock_type = if iter.peek().is_none() {
+                lock_type
+            } else {
+                lock_type.inner_node_type()
+            };
+
+            node = if node.children.contains_key(key) {
+                let next = node.children.get_mut(key).unwrap();
+                next.value = next
+                    .value
+                    .is_compatible(&next_lock_type)
+                    .context("incompatible lock types")?;
+                next
+            } else {
+                node.children
+                    .insert(key.to_vec(), TxnKeyTrieNode::new(next_lock_type));
+                node.children.get_mut(key).unwrap()
+            }
+        }
+
+        Ok(())
+    }
+
+    fn validate_read(&self, key_path: &KeyPath) -> Result<()> {
+        let mut node = match self.root.as_ref() {
+            Some(node) => node,
+            None => bail!("Cannot read node outside transaction bounds"),
+        };
+
+        for key in key_path.into_iter() {
+            if node.value == LockType::ReadRecursive || node.value == LockType::Write {
+                return Ok(());
+            } else if let Some(next_node) = node.children.get(key) {
+                node = next_node;
+            } else {
+                bail!("Cannot read node outside transaction bounds");
+            }
+        }
+
+        Ok(())
+    }
+
+    fn validate_write(&self, key_path: &KeyPath) -> Result<()> {
+        let mut node = match self.root.as_ref() {
+            Some(node) => node,
+            None => bail!("Cannot read node outside transaction bounds"),
+        };
+
+        for key in key_path.into_iter() {
+            if node.value == LockType::Write {
+                return Ok(());
+            } else if node.value != LockType::ReadChildWrite {
+                bail!("Cannot write read nodes");
+            } else if let Some(next_node) = node.children.get(key) {
+                node = next_node;
+            } else {
+                bail!("Cannot read node outside transaction bounds");
+            }
+        }
+
+        if node.value != LockType::Write {
+            bail!("Cannot write read nodes");
+        }
+
+        Ok(())
+    }
+}
+
+impl<T> TxnKeyTrieNode<T> {
+    pub fn new(value: T) -> Self {
         Self {
-            lock_type,
-            dirty: None,
+            value,
             children: BTreeMap::new(),
         }
     }
 
-    fn find_dfs_dirty_first_last(
+    fn find_dfs_dirty_first_last<F: Fn(&T) -> bool>(
         &self,
+        mut cond: F,
         stack: &mut KeyPathBuf,
         first: &mut Option<KeyPathBuf>,
         last: &mut Option<KeyPathBuf>,
-    ) {
-        if matches!(self.dirty, Some(_)) {
+    ) -> F {
+        if cond(&self.value) {
             if matches!(first, None) {
                 *first = Some(stack.clone())
             }
@@ -221,20 +250,21 @@ impl TxnKeyTrieNode {
         }
         for (key, child) in self.children.iter() {
             stack.push(&key);
-            child.find_dfs_dirty_first_last(stack, first, last);
+            cond = child.find_dfs_dirty_first_last(cond, stack, first, last);
             stack.pop();
         }
+        cond
     }
 }
 
-pub(crate) struct TxnKeyTrieDfsIter<'a> {
-    stack: Vec<(KeyPathBuf, *const TxnKeyTrieNode)>,
-    visited: HashSet<*const TxnKeyTrieNode>,
-    _phantom: PhantomData<&'a TxnKeyTrie>,
+pub(crate) struct TxnKeyTrieDfsIter<'a, T> {
+    stack: Vec<(KeyPathBuf, *const TxnKeyTrieNode<T>)>,
+    visited: HashSet<*const TxnKeyTrieNode<T>>,
+    _phantom: PhantomData<&'a TxnKeyTrie<T>>,
 }
 
-impl<'a> TxnKeyTrieDfsIter<'a> {
-    pub fn new(trie: &TxnKeyTrie) -> Self {
+impl<'a, T> TxnKeyTrieDfsIter<'a, T> {
+    pub fn new(trie: &TxnKeyTrie<T>) -> Self {
         let mut ret = Self {
             stack: Vec::new(),
             visited: HashSet::new(),
@@ -247,23 +277,23 @@ impl<'a> TxnKeyTrieDfsIter<'a> {
     }
 }
 
-impl<'a> Iterator for TxnKeyTrieDfsIter<'a> {
-    type Item = (KeyPathBuf, &'a TxnKeyTrieNode);
+impl<'a, T> Iterator for TxnKeyTrieDfsIter<'a, T> {
+    type Item = (KeyPathBuf, &'a T);
 
     fn next(&mut self) -> Option<Self::Item> {
         let (path, cur) = dfs_step(&mut self.stack, &mut self.visited)?;
-        Some((path, unsafe { &*cur }))
+        Some((path, unsafe { &(*cur).value }))
     }
 }
 
-pub(crate) struct TxnKeyTrieDfsIterMut<'a> {
-    stack: Vec<(KeyPathBuf, *const TxnKeyTrieNode)>,
-    visited: HashSet<*const TxnKeyTrieNode>,
-    _phantom: PhantomData<&'a TxnKeyTrie>,
+pub(crate) struct TxnKeyTrieDfsIterMut<'a, T> {
+    stack: Vec<(KeyPathBuf, *const TxnKeyTrieNode<T>)>,
+    visited: HashSet<*const TxnKeyTrieNode<T>>,
+    _phantom: PhantomData<&'a TxnKeyTrie<T>>,
 }
 
-impl<'a> TxnKeyTrieDfsIterMut<'a> {
-    pub fn new(trie: &mut TxnKeyTrie) -> Self {
+impl<'a, T> TxnKeyTrieDfsIterMut<'a, T> {
+    pub fn new(trie: &mut TxnKeyTrie<T>) -> Self {
         let mut ret = Self {
             stack: Vec::new(),
             visited: HashSet::new(),
@@ -276,36 +306,38 @@ impl<'a> TxnKeyTrieDfsIterMut<'a> {
     }
 }
 
-impl<'a> Iterator for TxnKeyTrieDfsIterMut<'a> {
-    type Item = (KeyPathBuf, &'a mut TxnKeyTrieNode);
+impl<'a, T> Iterator for TxnKeyTrieDfsIterMut<'a, T> {
+    type Item = (KeyPathBuf, &'a mut T);
 
     fn next(&mut self) -> Option<Self::Item> {
         let (path, cur) = dfs_step(&mut self.stack, &mut self.visited)?;
-        Some((path, unsafe { &mut *(cur as *mut _) }))
+        Some((path, unsafe {
+            &mut (*(cur as *mut TxnKeyTrieNode<T>)).value
+        }))
     }
 }
 
-fn dfs_iter_init(
-    trie: &TxnKeyTrie,
-    stack: &mut Vec<(KeyPathBuf, *const TxnKeyTrieNode)>,
-    visited: &mut HashSet<*const TxnKeyTrieNode>,
+fn dfs_iter_init<T>(
+    trie: &TxnKeyTrie<T>,
+    stack: &mut Vec<(KeyPathBuf, *const TxnKeyTrieNode<T>)>,
+    visited: &mut HashSet<*const TxnKeyTrieNode<T>>,
 ) {
     if let Some(root) = trie.root.as_ref() {
-        let root = root as *const TxnKeyTrieNode;
+        let root = root as *const _;
         stack.push((KeyPathBuf::new(), root));
         visited.insert(root);
     }
 }
 
-fn dfs_step(
-    stack: &mut Vec<(KeyPathBuf, *const TxnKeyTrieNode)>,
-    visited: &mut HashSet<*const TxnKeyTrieNode>,
-) -> Option<(KeyPathBuf, *const TxnKeyTrieNode)> {
+fn dfs_step<T>(
+    stack: &mut Vec<(KeyPathBuf, *const TxnKeyTrieNode<T>)>,
+    visited: &mut HashSet<*const TxnKeyTrieNode<T>>,
+) -> Option<(KeyPathBuf, *const TxnKeyTrieNode<T>)> {
     let (path, cur) = stack.pop()?;
-    let cur = unsafe { &mut *(cur as *mut TxnKeyTrieNode) };
+    let cur = unsafe { &mut *(cur as *mut TxnKeyTrieNode<T>) };
 
     for (key, child) in cur.children.iter().rev() {
-        let child = child as *const TxnKeyTrieNode;
+        let child = child as *const _;
         if !visited.contains(&child) {
             let mut child_path = path.clone();
             child_path.push(key);
@@ -317,13 +349,13 @@ fn dfs_step(
     Some((path, cur))
 }
 
-pub(crate) struct TxnKeyTrieBfsIter<'a> {
-    queue: VecDeque<(KeyPathBuf, *const TxnKeyTrieNode)>,
-    _phantom: PhantomData<&'a TxnKeyTrie>,
+pub(crate) struct TxnKeyTrieBfsIter<'a, T> {
+    queue: VecDeque<(KeyPathBuf, *const TxnKeyTrieNode<T>)>,
+    _phantom: PhantomData<&'a TxnKeyTrie<T>>,
 }
 
-impl<'a> TxnKeyTrieBfsIter<'a> {
-    pub fn new(trie: &'a TxnKeyTrie) -> Self {
+impl<'a, T> TxnKeyTrieBfsIter<'a, T> {
+    pub fn new(trie: &'a TxnKeyTrie<T>) -> Self {
         let mut ret = Self {
             queue: VecDeque::new(),
             _phantom: PhantomData::default(),
@@ -335,22 +367,22 @@ impl<'a> TxnKeyTrieBfsIter<'a> {
     }
 }
 
-impl<'a> Iterator for TxnKeyTrieBfsIter<'a> {
-    type Item = (KeyPathBuf, &'a TxnKeyTrieNode);
+impl<'a, T> Iterator for TxnKeyTrieBfsIter<'a, T> {
+    type Item = (KeyPathBuf, &'a T);
 
     fn next(&mut self) -> Option<Self::Item> {
         let (path, node) = bfs_step(&mut self.queue)?;
-        Some((path, unsafe { &*node }))
+        Some((path, unsafe { &(*node).value }))
     }
 }
 
-pub(crate) struct TxnKeyTrieBfsIterMut<'a> {
-    queue: VecDeque<(KeyPathBuf, *const TxnKeyTrieNode)>,
-    _phantom: PhantomData<&'a TxnKeyTrie>,
+pub(crate) struct TxnKeyTrieBfsIterMut<'a, T> {
+    queue: VecDeque<(KeyPathBuf, *const TxnKeyTrieNode<T>)>,
+    _phantom: PhantomData<&'a TxnKeyTrie<T>>,
 }
 
-impl<'a> TxnKeyTrieBfsIterMut<'a> {
-    pub fn new(trie: &'a mut TxnKeyTrie) -> Self {
+impl<'a, T> TxnKeyTrieBfsIterMut<'a, T> {
+    pub fn new(trie: &'a mut TxnKeyTrie<T>) -> Self {
         let mut ret = Self {
             queue: VecDeque::new(),
             _phantom: PhantomData::default(),
@@ -362,24 +394,29 @@ impl<'a> TxnKeyTrieBfsIterMut<'a> {
     }
 }
 
-impl<'a> Iterator for TxnKeyTrieBfsIterMut<'a> {
-    type Item = (KeyPathBuf, &'a mut TxnKeyTrieNode);
+impl<'a, T> Iterator for TxnKeyTrieBfsIterMut<'a, T> {
+    type Item = (KeyPathBuf, &'a T);
 
     fn next(&mut self) -> Option<Self::Item> {
         let (path, node) = bfs_step(&mut self.queue)?;
-        Some((path, unsafe { &mut *(node as *mut _) }))
+        Some((path, unsafe {
+            &mut (*(node as *mut TxnKeyTrieNode<T>)).value
+        }))
     }
 }
 
-fn bfs_iter_init(trie: &TxnKeyTrie, queue: &mut VecDeque<(KeyPathBuf, *const TxnKeyTrieNode)>) {
+fn bfs_iter_init<T>(
+    trie: &TxnKeyTrie<T>,
+    queue: &mut VecDeque<(KeyPathBuf, *const TxnKeyTrieNode<T>)>,
+) {
     if let Some(root) = trie.root.as_ref() {
         queue.push_back((KeyPathBuf::new(), root as *const _));
     }
 }
 
-fn bfs_step(
-    queue: &mut VecDeque<(KeyPathBuf, *const TxnKeyTrieNode)>,
-) -> Option<(KeyPathBuf, *const TxnKeyTrieNode)> {
+fn bfs_step<T>(
+    queue: &mut VecDeque<(KeyPathBuf, *const TxnKeyTrieNode<T>)>,
+) -> Option<(KeyPathBuf, *const TxnKeyTrieNode<T>)> {
     while let Some((path, node)) = queue.pop_front() {
         let result = Some((path.clone(), node));
 
@@ -396,9 +433,7 @@ fn bfs_step(
 
 #[cfg(test)]
 mod tests {
-    use function_name::named;
-
-    use crate::{key_path, test_util::TempDir};
+    use crate::key_path;
 
     use super::*;
 
@@ -406,19 +441,21 @@ mod tests {
     fn test_level_order_iterator_with_empty_path() {
         let mut trie = TxnKeyTrie::new();
 
-        trie.insert(key_path![], LockType::Read).unwrap();
-        trie.insert(key_path![b"a", b"b"], LockType::Write).unwrap();
-        trie.insert(key_path![b"a", b"c"], LockType::Write).unwrap();
-        trie.insert(key_path![b"b"], LockType::Read).unwrap();
+        trie.insert_lock(key_path![], LockType::Read).unwrap();
+        trie.insert_lock(key_path![b"a", b"b"], LockType::Write)
+            .unwrap();
+        trie.insert_lock(key_path![b"a", b"c"], LockType::Write)
+            .unwrap();
+        trie.insert_lock(key_path![b"b"], LockType::Read).unwrap();
 
         assert!(matches!(
-            trie.insert(key_path![b"a", b"b", b"d"], LockType::Write,),
+            trie.insert_lock(key_path![b"a", b"b", b"d"], LockType::Write,),
             Err(_)
         ));
 
         let results: Vec<(KeyPathBuf, LockType)> = trie
             .bfs_iter()
-            .map(|(path, node)| (path, node.lock_type))
+            .map(|(path, lock_type)| (path, *lock_type))
             .collect();
         let expected = [
             (key_path![].to_owned(), LockType::ReadChildWrite),
@@ -446,25 +483,25 @@ mod tests {
     fn test_read_write_validation() {
         let mut trie = TxnKeyTrie::new();
 
-        trie.insert(key_path![b"read", b"read_recur"], LockType::ReadRecursive)
+        trie.insert_lock(key_path![b"read", b"read_recur"], LockType::ReadRecursive)
             .unwrap();
-        trie.insert(key_path![b"read", b"write"], LockType::Write)
+        trie.insert_lock(key_path![b"read", b"write"], LockType::Write)
             .unwrap();
-        trie.insert(key_path![b"read", b"read"], LockType::Read)
+        trie.insert_lock(key_path![b"read", b"read"], LockType::Read)
             .unwrap();
 
         {
-            let n = trie.get(key_path![b"read"]).unwrap();
-            assert_eq!(n.lock_type, LockType::ReadChildWrite);
-            let n = trie.get(key_path![b"read", b"read_recur"]).unwrap();
-            assert_eq!(n.lock_type, LockType::ReadRecursive)
+            let lock_type = trie.get(key_path![b"read"]).unwrap();
+            assert_eq!(*lock_type, LockType::ReadChildWrite);
+            let lock_type = trie.get(key_path![b"read", b"read_recur"]).unwrap();
+            assert_eq!(*lock_type, LockType::ReadRecursive)
         }
 
         {
-            let n = trie.get_mut(key_path![b"read"]).unwrap();
-            assert_eq!(n.lock_type, LockType::ReadChildWrite);
-            let n = trie.get_mut(key_path![b"read", b"read_recur"]).unwrap();
-            assert_eq!(n.lock_type, LockType::ReadRecursive)
+            let lock_type = trie.get_mut(key_path![b"read"]).unwrap();
+            assert_eq!(*lock_type, LockType::ReadChildWrite);
+            let lock_type = trie.get_mut(key_path![b"read", b"read_recur"]).unwrap();
+            assert_eq!(*lock_type, LockType::ReadRecursive)
         }
 
         assert!(trie.validate_read(&key_path![b"read"]).is_ok());
@@ -503,44 +540,43 @@ mod tests {
     }
 
     #[test]
-    #[named]
-    fn test_dirty_lca() -> Result<()> {
-        let temp_dir = TempDir::new(function_name!())?;
-        let (fio, _) = temp_dir.fio("db")?;
+    fn test_lca() -> Result<()> {
         let mut trie = TxnKeyTrie::new();
 
-        trie.insert(key_path![b"1", b"2", b"4"], LockType::Read)?;
-        trie.insert(key_path![b"1", b"2", b"5"], LockType::Read)?;
-        trie.insert(key_path![b"1", b"3", b"6"], LockType::Read)?;
-        trie.insert(key_path![b"1", b"3", b"7"], LockType::Read)?;
+        trie.upsert(key_path![b"1", b"2", b"4"], || false, false)?;
+        trie.upsert(key_path![b"1", b"2", b"5"], || false, false)?;
+        trie.upsert(key_path![b"1", b"3", b"6"], || false, false)?;
+        trie.upsert(key_path![b"1", b"3", b"7"], || false, false)?;
 
-        trie.get_mut(key_path![b"1", b"2", b"4"]).unwrap().dirty = Some(fio.get_buf());
+        *trie.get_mut(key_path![b"1", b"2", b"4"]).unwrap() = true;
 
         assert_eq!(
             key_path![b"1", b"2", b"4"],
-            trie.dirty_lca().unwrap().as_path()
+            trie.lca(|v| *v).unwrap().as_path()
         );
 
-        trie.get_mut(key_path![b"1", b"2", b"5"]).unwrap().dirty = Some(fio.get_buf());
+        *trie.get_mut(key_path![b"1", b"2", b"5"]).unwrap() = true;
 
-        assert_eq!(key_path![b"1", b"2"], trie.dirty_lca().unwrap().as_path());
+        assert_eq!(key_path![b"1", b"2"], trie.lca(|v| *v).unwrap().as_path());
 
-        trie.get_mut(key_path![b"1", b"3", b"7"]).unwrap().dirty = Some(fio.get_buf());
+        *trie.get_mut(key_path![b"1", b"3", b"7"]).unwrap() = true;
 
-        assert_eq!(key_path![b"1"], trie.dirty_lca().unwrap().as_path());
+        assert_eq!(key_path![b"1"], trie.lca(|v| *v).unwrap().as_path());
 
-        trie.get_mut(key_path![b"1", b"3", b"6"]).unwrap().dirty = Some(fio.get_buf());
+        *trie.get_mut(key_path![b"1", b"3", b"6"]).unwrap() = true;
 
-        assert_eq!(key_path![b"1"], trie.dirty_lca().unwrap().as_path());
+        assert_eq!(key_path![b"1"], trie.lca(|v| *v).unwrap().as_path());
 
-        trie.insert(key_path![b"8"], LockType::Read)?;
-        trie.get_mut(key_path![b"8"]).unwrap().dirty = Some(fio.get_buf());
+        trie.upsert(key_path![b"8"], || false, false)?;
+        *trie.get_mut(key_path![b"8"]).unwrap() = true;
 
-        assert_eq!(key_path![], trie.dirty_lca().unwrap().as_path());
+        assert_eq!(key_path![], trie.lca(|v| *v).unwrap().as_path());
 
-        trie.clear_dirty();
+        for (_, v) in trie.dfs_iter_mut() {
+            *v = false;
+        }
 
-        assert!(trie.dirty_lca().is_none());
+        assert!(trie.lca(|v| *v).is_none());
 
         Ok(())
     }
@@ -549,10 +585,10 @@ mod tests {
     fn test_iter() -> Result<()> {
         let mut trie = TxnKeyTrie::new();
 
-        trie.insert(key_path![b"1", b"2"], LockType::Write)?;
-        trie.insert(key_path![b"3", b"4"], LockType::Read)?;
+        trie.insert_lock(key_path![b"1", b"2"], LockType::Write)?;
+        trie.insert_lock(key_path![b"3", b"4"], LockType::Read)?;
 
-        let mut iter = trie.dfs_iter().map(|(buf, node)| (buf, node.lock_type));
+        let mut iter = trie.dfs_iter().map(|(buf, lock_type)| (buf, *lock_type));
         assert_eq!(
             iter.next().unwrap(),
             (key_path![].to_owned(), LockType::ReadChildWrite)
@@ -575,7 +611,9 @@ mod tests {
         );
         assert!(iter.next().is_none());
 
-        let mut iter = trie.dfs_iter_mut().map(|(buf, node)| (buf, node.lock_type));
+        let mut iter = trie
+            .dfs_iter_mut()
+            .map(|(buf, lock_type)| (buf, *lock_type));
         assert_eq!(
             iter.next().unwrap(),
             (key_path![].to_owned(), LockType::ReadChildWrite)
@@ -598,7 +636,7 @@ mod tests {
         );
         assert!(iter.next().is_none());
 
-        let mut iter = trie.bfs_iter().map(|(buf, node)| (buf, node.lock_type));
+        let mut iter = trie.bfs_iter().map(|(buf, lock_type)| (buf, *lock_type));
         assert_eq!(
             iter.next().unwrap(),
             (key_path![].to_owned(), LockType::ReadChildWrite)
@@ -621,7 +659,9 @@ mod tests {
         );
         assert!(iter.next().is_none());
 
-        let mut iter = trie.bfs_iter_mut().map(|(buf, node)| (buf, node.lock_type));
+        let mut iter = trie
+            .bfs_iter_mut()
+            .map(|(buf, lock_type)| (buf, *lock_type));
         assert_eq!(
             iter.next().unwrap(),
             (key_path![].to_owned(), LockType::ReadChildWrite)
