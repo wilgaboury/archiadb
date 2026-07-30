@@ -658,8 +658,6 @@ enum InsertResult {
 impl Txn {
     // TODO: batch all the writes into a single vec so they can be executed at once after the fact
     async fn upsert(&mut self, key: &[u8], value: &[u8], mut root: PageBuf) -> Result<PageBuf> {
-        // TODO: handle case of empty root
-
         let version = root.get_mut().root_header().version;
         match self
             .upsert_inner(key, LeafValue::Value(value), root)
@@ -682,7 +680,6 @@ impl Txn {
         }
     }
 
-    // TODO: modify upsert_inner to handle root. If statement to create inners from root on split.
     async fn upsert_inner(
         &mut self,
         key: &[u8],
@@ -694,9 +691,15 @@ impl Txn {
             self.upsert_leaf(key, value, pg).await
         } else {
             let search = search_inner(pg.get(), key).idx();
-            let child_idx = get_page_ptr(pg.get(), search);
-            self.free.push(child_idx);
-            let child_pg = self.db.inner.fio.read(child_idx).await?;
+            let child_pg = if pg.get().header().len > 0 {
+                let child_pg_idx = get_page_ptr(pg.get(), search);
+                self.free.push(child_pg_idx);
+                self.db.inner.fio.read(child_pg_idx).await?
+            } else {
+                let mut child_pg = self.db.inner.fio.get_buf();
+                child_pg.get_mut().header_mut().init(BTreeNodeKind::Leaf);
+                child_pg
+            };
             let insert = Box::pin(self.upsert_inner(key, value, child_pg)).await?;
 
             match insert {
@@ -704,11 +707,15 @@ impl Txn {
                     let child_pg_idx = self.alloc().await?;
                     self.db.inner.fio.write(child_pg_idx, child_pg).await?;
 
-                    write_page_ptr(pg.get_mut(), search, child_idx);
+                    write_page_ptr(pg.get_mut(), search, child_pg_idx);
                     update_checksum(pg.get_mut());
                     Ok(InsertResult::Single(pg))
                 }
                 InsertResult::Split(left, split, right) => {
+                    if pg.get().header().kind == BTreeNodeKind::Root {
+                        todo!("implement root -> inner procedure");
+                    }
+
                     let can_insert = pg.get().remaining() > PAGE_PTR_SIZE + split.len() + SLOT_SIZE;
                     if can_insert {
                         insert_at_inner(pg.get_mut(), search, left, &split, right);
@@ -912,10 +919,10 @@ mod tests {
         assert_eq!(
             node,
             [
-                /* kind */ 1u8, /* parent */ 0, 0, 0, 0, 0, 0, 0, 0, /* len */ 1, 0,
+                /* kind */ 1u8, /* len */ 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                0, 0, 0, 0, 0, 0, 0, 0, 0, /* ptr 0 */ 1, 0, 0, 0, 0, 0, 0, 0,
-                /* checksum */ 0, 0, 0, 0, 0, 0, 0, 0
+                0, 0, 0, /* ptr 0 */ 1, 0, 0, 0, 0, 0, 0, 0, /* checksum */ 0, 0, 0, 0,
+                0, 0, 0, 0
             ]
         );
         assert_eq!(1, get_page_ptr(&node, 0));
@@ -925,11 +932,11 @@ mod tests {
         assert_eq!(
             node,
             [
-                /* kind */ 1u8, /* parent */ 0, 0, 0, 0, 0, 0, 0, 0, /* len */ 2, 0,
-                0, 0, /* slot 0 */ 47, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                0, 0, 0, 0, 0, 0, 0, /* ptr 1 */ 3, 0, 0, 0, 0, 0, 0, 0,
-                /* key 0 */ b'a', /* ptr 0 */ 2, 0, 0, 0, 0, 0, 0, 0,
-                /* checksum */ 0, 0, 0, 0, 0, 0, 0, 0
+                /* kind */ 1u8, /* len */ 2, 0, 0, 0, /* slot 0 */ 47, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, /* ptr 1 */ 3, 0, 0, 0, 0, 0, 0, 0, /* key 0 */ b'a',
+                /* ptr 0 */ 2, 0, 0, 0, 0, 0, 0, 0, /* checksum */ 0, 0, 0, 0, 0, 0, 0,
+                0
             ]
         );
         assert_eq!(2, get_page_ptr(&node, 0));
@@ -941,11 +948,11 @@ mod tests {
         assert_eq!(
             node,
             [
-                /* kind */ 1u8, /* parent */ 0, 0, 0, 0, 0, 0, 0, 0, /* len */ 3, 0,
-                0, 0, /* slot 0 */ 47, 0, 0, 0, /* slot 1 */ 38, 0, 0, 0, 0, 0, 0, 0, 0,
-                0, 0, 0, 0, /* ptr 2 */ 3, 0, 0, 0, 0, 0, 0, 0, /* key 1 */ b'a',
-                /* ptr 1 */ 5, 0, 0, 0, 0, 0, 0, 0, /* key 0 */ b'b', /* ptr 0 */ 4,
-                0, 0, 0, 0, 0, 0, 0, /* checksum */ 0, 0, 0, 0, 0, 0, 0, 0
+                /* kind */ 1u8, /* len */ 3, 0, 0, 0, /* slot 0 */ 47, 0, 0, 0,
+                /* slot 1 */ 38, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                /* ptr 2 */ 3, 0, 0, 0, 0, 0, 0, 0, /* key 1 */ b'a', /* ptr 1 */ 5,
+                0, 0, 0, 0, 0, 0, 0, /* key 0 */ b'b', /* ptr 0 */ 4, 0, 0, 0, 0, 0, 0,
+                0, /* checksum */ 0, 0, 0, 0, 0, 0, 0, 0
             ]
         );
         assert_eq!(4, node.get_page_ptr(0));
@@ -968,10 +975,10 @@ mod tests {
         assert_eq!(
             node,
             [
-                /* kind */ 1u8, /* parent */ 0, 0, 0, 0, 0, 0, 0, 0, /* len */ 1, 0,
+                /* kind */ 1u8, /* len */ 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                0, 0, 0, 0, 0, 0, 0, 0, 0, /* ptr 0 */ 1, 0, 0, 0, 0, 0, 0, 0,
-                /* checksum */ 0, 0, 0, 0, 0, 0, 0, 0
+                0, 0, 0, /* ptr 0 */ 1, 0, 0, 0, 0, 0, 0, 0, /* checksum */ 0, 0, 0, 0,
+                0, 0, 0, 0
             ]
         );
 
@@ -982,11 +989,11 @@ mod tests {
         assert_eq!(
             node,
             [
-                /* kind */ 1u8, /* parent */ 0, 0, 0, 0, 0, 0, 0, 0, /* len */ 2, 0,
-                0, 0, /* slot 0 */ 47, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                0, 0, 0, 0, 0, 0, 0, /* ptr 1 */ 3, 0, 0, 0, 0, 0, 0, 0,
-                /* key 0 */ b'a', /* ptr 0 */ 2, 0, 0, 0, 0, 0, 0, 0,
-                /* checksum */ 0, 0, 0, 0, 0, 0, 0, 0
+                /* kind */ 1u8, /* len */ 2, 0, 0, 0, /* slot 0 */ 47, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, /* ptr 1 */ 3, 0, 0, 0, 0, 0, 0, 0, /* key 0 */ b'a',
+                /* ptr 0 */ 2, 0, 0, 0, 0, 0, 0, 0, /* checksum */ 0, 0, 0, 0, 0, 0, 0,
+                0
             ]
         );
 
@@ -999,11 +1006,11 @@ mod tests {
         assert_eq!(
             node,
             [
-                /* kind */ 1u8, /* parent */ 0, 0, 0, 0, 0, 0, 0, 0, /* len */ 3, 0,
-                0, 0, /* slot 0 */ 47, 0, 0, 0, /* slot 1 */ 38, 0, 0, 0, 0, 0, 0, 0, 0,
-                0, 0, 0, 0, /* ptr 2 */ 5, 0, 0, 0, 0, 0, 0, 0, /* key 1 */ b'b',
-                /* ptr 1 */ 4, 0, 0, 0, 0, 0, 0, 0, /* key 0 */ b'a', /* ptr 0 */ 2,
-                0, 0, 0, 0, 0, 0, 0, /* checksum */ 0, 0, 0, 0, 0, 0, 0, 0
+                /* kind */ 1u8, /* len */ 3, 0, 0, 0, /* slot 0 */ 47, 0, 0, 0,
+                /* slot 1 */ 38, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                /* ptr 2 */ 5, 0, 0, 0, 0, 0, 0, 0, /* key 1 */ b'b', /* ptr 1 */ 4,
+                0, 0, 0, 0, 0, 0, 0, /* key 0 */ b'a', /* ptr 0 */ 2, 0, 0, 0, 0, 0, 0,
+                0, /* checksum */ 0, 0, 0, 0, 0, 0, 0, 0
             ]
         );
 
