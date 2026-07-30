@@ -16,12 +16,16 @@ pub const MAX_KEY_SIZE: usize = u8::MAX as usize;
 pub const MIN_PAGE_SIZE: u64 = 4096; // 4kb
 pub const MAX_PAGE_SIZE: u64 = 65536; // 64kb
 
-/// file must exist
-pub fn pick_page_size<P: AsRef<Path>>(path: P) -> Result<u64> {
+pub fn get_fs_block_size<P: AsRef<Path>>(path: P) -> Result<u64> {
     let file = File::open(path)?;
     let fd = file.as_fd();
     let fstatvfs = fstatvfs(fd)?;
-    let block_size = fstatvfs.f_bsize;
+    Ok(fstatvfs.f_bsize)
+}
+
+/// file must exist
+pub fn pick_page_size<P: AsRef<Path>>(path: P) -> Result<u64> {
+    let block_size = get_fs_block_size(path)?;
     if block_size >= MIN_PAGE_SIZE && block_size <= MAX_PAGE_SIZE && block_size % MIN_PAGE_SIZE == 0
     {
         Ok(block_size)
@@ -83,8 +87,10 @@ mod tests {
 
     #[test]
     fn test_pick_block_size() {
-        let block_size = pick_page_size(Path::new("/")).unwrap();
-        println!("Auto picked size: {}", block_size);
+        let block_size = get_fs_block_size(Path::new("/")).unwrap();
+        println!("Filesystem block size: {}", block_size);
+        let page_size = pick_page_size(Path::new("/")).unwrap();
+        println!("Picked page size: {}", page_size);
     }
 
     #[test]

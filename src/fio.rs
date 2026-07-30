@@ -26,7 +26,11 @@ use libc::{O_DIRECT, iovec};
 use parking_lot::Mutex;
 use rustix::fs::fstatvfs;
 
-use crate::{file::DbFile, meta::MetaHandler};
+use crate::{
+    file::DbFile,
+    meta::MetaHandler,
+    util::{get_fs_block_size, pick_page_size},
+};
 
 pub const MIN_PAGE_SIZE: u64 = 4096; // smallest supported page size and most common filesystem block size
 pub const MAX_PAGE_SIZE: u64 = 65536;
@@ -237,12 +241,16 @@ impl Fio {
         let page_buf_pool = page_buf_pool.unwrap_or_else(|| 2 * cq);
         let generic_op_state_pool = generic_op_state_pool.unwrap_or_else(|| cq);
 
-        let fio_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .custom_flags(O_DIRECT) // TODO: if filesystem block size does not match db page (the file was moved to another computers/filesystem), O_DIRECT will not work
-            .open(file.path())?;
+        let fio_file = {
+            let mut open = OpenOptions::new();
+            open.read(true);
+            open.write(true);
+            open.create(true);
+            if get_fs_block_size(file.path())? == meta.page_size() {
+                open.custom_flags(O_DIRECT);
+            }
+            open.open(file.path())?
+        };
 
         let fd = fio_file.as_raw_fd();
         let len = meta.len();
@@ -304,11 +312,6 @@ impl Fio {
 
     pub fn page_size(&self) -> usize {
         self.inner.page_size
-    }
-
-    // TODO: deprecate, tracking len in meta now
-    pub fn len(&self) -> u64 {
-        self.inner.len.load(Ordering::Acquire)
     }
 
     pub fn get_buf(&self) -> PageBuf {
@@ -1243,11 +1246,11 @@ mod tests {
     #[tokio::test]
     async fn test_simple_alloc() -> Result<()> {
         let temp_dir = TempDir::new(function_name!())?;
-        let (fio, _) = temp_dir.fio("db")?;
-        assert_eq!(NUM_HEADER_PAGES, fio.len());
+        let (fio, meta) = temp_dir.fio("db")?;
+        assert_eq!(NUM_HEADER_PAGES, meta.len());
 
         fio.alloc(NUM_HEADER_PAGES + 1).await?;
-        assert_eq!(NUM_HEADER_PAGES + 1, fio.len());
+        assert!(NUM_HEADER_PAGES + 1 <= fs::metadata(fio.file().path())?.len());
         assert_eq!(
             fio.page_size() * (NUM_HEADER_PAGES + 1) as usize,
             fs::metadata(fio.file().path())?.len() as usize
@@ -1256,7 +1259,7 @@ mod tests {
         let _read_test = fio.read(0).await?;
 
         fio.alloc(1000).await?;
-        assert_eq!(1000, fio.len());
+        assert!(1000 <= fs::metadata(fio.file().path())?.len());
         assert_eq!(
             1000 * fio.page_size(),
             fs::metadata(fio.file().path())?.len() as usize

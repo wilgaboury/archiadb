@@ -402,7 +402,6 @@ mod tests {
         let (alloc, fio, meta) = temp_dir.alloc("file").await?;
 
         assert_eq!(2, meta.len());
-        assert_eq!(2, fio.len());
 
         let len = NUM_HEADER_PAGES + 1 + meta.page_size() as u64 * BITS_PER_BYTE;
         alloc.fio.alloc(len).await?;
