@@ -156,20 +156,12 @@ impl From<u8> for LeafValueKind {
 #[repr(C, packed)]
 struct BTreeHeader {
     kind: BTreeNodeKind,
-    parent: u64,
     len: u32,
 }
 
 impl BTreeHeader {
-    pub fn init_inner(&mut self, parent: u64) {
-        self.kind = BTreeNodeKind::Inner.into();
-        self.parent = parent;
-        self.len = 0;
-    }
-
-    pub fn init_leaf(&mut self, parent: u64) {
-        self.kind = BTreeNodeKind::Leaf.into();
-        self.parent = parent;
+    pub fn init(&mut self, kind: BTreeNodeKind) {
+        self.kind = kind.into();
         self.len = 0;
     }
 }
@@ -178,7 +170,13 @@ impl BTreeHeader {
 struct BTreeRootHeader {
     header: BTreeHeader,
     version: u64,
-    sibling: u64,
+}
+
+impl BTreeRootHeader {
+    pub fn init(&mut self) {
+        self.header.init(BTreeNodeKind::Root);
+        self.version = 0;
+    }
 }
 
 const_assert!(size_of::<BTreeRootHeader>() + CHECKSUM_SIZE < MIN_PAGE_SIZE as usize);
@@ -653,49 +651,71 @@ impl RootDoublePageBuf {
 }
 
 enum InsertResult {
-    Single(u64),
+    Single(PageBuf),
     Split(u64, Box<[u8]>, u64),
 }
 
 impl Txn {
-    // TODO: batch all the writes into a single array so they can be executed at once
-    async fn upsert(&mut self, _key: &[u8], _value: &[u8], root: PageBuf) {
-        todo!("implement")
+    // TODO: batch all the writes into a single vec so they can be executed at once after the fact
+    async fn upsert(&mut self, key: &[u8], value: &[u8], mut root: PageBuf) -> Result<PageBuf> {
+        // TODO: handle case of empty root
+
+        let version = root.get_mut().root_header().version;
+        match self
+            .upsert_inner(key, LeafValue::Value(value), root)
+            .await?
+        {
+            InsertResult::Single(mut page_buf) => {
+                page_buf.get_mut().root_header_mut().version += 1;
+                Ok(page_buf)
+            }
+            InsertResult::Split(left, split, right) => {
+                let mut page_buf = self.db.inner.fio.get_buf();
+
+                page_buf.get_mut().root_header_mut().init();
+                page_buf.get_mut().root_header_mut().version = version + 1;
+                insert_at_inner(page_buf.get_mut(), 0, left, &split, right);
+                update_checksum(page_buf.get_mut());
+
+                Ok(page_buf)
+            }
+        }
     }
 
+    // TODO: modify upsert_inner to handle root. If statement to create inners from root on split.
     async fn upsert_inner(
         &mut self,
         key: &[u8],
         value: LeafValue<'_>,
         mut pg: PageBuf,
-        parent_pg_idx: u64,
     ) -> Result<InsertResult> {
         let header = from_bytes::<BTreeHeader>(pg.get());
         if header.kind == BTreeNodeKind::Leaf {
-            self.upsert_leaf(key, value, pg, parent_pg_idx).await
+            self.upsert_leaf(key, value, pg).await
         } else {
             let search = search_inner(pg.get(), key).idx();
             let child_idx = get_page_ptr(pg.get(), search);
             self.free.push(child_idx);
             let child_pg = self.db.inner.fio.read(child_idx).await?;
-            let pg_idx = self.alloc().await?;
-            let insert = Box::pin(self.upsert_inner(key, value, child_pg, pg_idx)).await?;
+            let insert = Box::pin(self.upsert_inner(key, value, child_pg)).await?;
 
             match insert {
-                InsertResult::Single(child_idx) => {
+                InsertResult::Single(child_pg) => {
+                    let child_pg_idx = self.alloc().await?;
+                    self.db.inner.fio.write(child_pg_idx, child_pg).await?;
+
                     write_page_ptr(pg.get_mut(), search, child_idx);
-                    self.db.inner.fio.write(pg_idx, pg).await?;
-                    Ok(InsertResult::Single(pg_idx))
+                    update_checksum(pg.get_mut());
+                    Ok(InsertResult::Single(pg))
                 }
                 InsertResult::Split(left, split, right) => {
                     let can_insert = pg.get().remaining() > PAGE_PTR_SIZE + split.len() + SLOT_SIZE;
                     if can_insert {
                         insert_at_inner(pg.get_mut(), search, left, &split, right);
-                        self.db.inner.fio.write(pg_idx, pg).await?;
-                        Ok(InsertResult::Single(pg_idx))
+                        update_checksum(pg.get_mut());
+                        Ok(InsertResult::Single(pg))
                     } else {
-                        self.split_inner(left, split, right, pg, parent_pg_idx)
-                            .await
+                        self.split_inner(left, split, right, pg).await
                     }
                 }
             }
@@ -708,12 +728,11 @@ impl Txn {
         split: Box<[u8]>,
         right_idx: u64,
         pg: PageBuf,
-        parent_pg_idx: u64,
     ) -> Result<InsertResult> {
         let mut left = pg;
         let mut right = self.db.inner.fio.get_buf();
 
-        right.get_mut().header_mut().init_leaf(parent_pg_idx);
+        right.get_mut().header_mut().init(BTreeNodeKind::Leaf);
 
         let len = left.get().len();
         let start = len / 2;
@@ -742,7 +761,9 @@ impl Txn {
 
         let key = right.get().get_key_leaf(0).to_vec().into_boxed_slice();
 
+        update_checksum(left.get_mut());
         self.db.inner.fio.write(left_idx, left).await?;
+        update_checksum(right.get_mut());
         self.db.inner.fio.write(right_idx, right).await?;
 
         Ok(InsertResult::Split(left_idx, key, right_idx))
@@ -753,7 +774,6 @@ impl Txn {
         key: &[u8],
         value: LeafValue<'_>,
         mut pg: PageBuf,
-        parent_pg_idx: u64,
     ) -> Result<InsertResult> {
         let encoded_value = value.encode(self).await?;
 
@@ -764,9 +784,8 @@ impl Txn {
                 remove_at_leaf(pg.get_mut(), idx);
             }
             insert_at_leaf(pg.get_mut(), search.idx(), key, &encoded_value);
-            let pg_idx = self.alloc().await?;
-            self.db.inner.fio.write(pg_idx, pg).await?;
-            Ok(InsertResult::Single(pg_idx))
+            update_checksum(pg.get_mut());
+            Ok(InsertResult::Single(pg))
         } else {
             let left_idx = self.alloc().await?;
             let right_idx = self.alloc().await?;
@@ -774,7 +793,7 @@ impl Txn {
             let mut left = pg;
             let mut right = self.db.inner.fio.get_buf();
 
-            right.get_mut().header_mut().init_leaf(parent_pg_idx);
+            right.get_mut().header_mut().init(BTreeNodeKind::Leaf);
 
             let len = left.get().len();
             let start = len / 2;
@@ -801,7 +820,9 @@ impl Txn {
 
             let key = right.get().get_key_leaf(0).to_vec().into_boxed_slice();
 
+            update_checksum(left.get_mut());
             self.db.inner.fio.write(left_idx, left).await?;
+            update_checksum(right.get_mut());
             self.db.inner.fio.write(right_idx, right).await?;
 
             Ok(InsertResult::Split(left_idx, key, right_idx))
@@ -860,8 +881,6 @@ fn test_access() {
     let header = from_bytes::<BTreeRootHeader>(slice);
     assert_eq!({ header.header.kind.clone() }, BTreeNodeKind::Root);
     assert_eq!({ header.version }, 0);
-    assert_eq!({ header.header.parent }, 0);
-    assert_eq!({ header.sibling }, 0);
     assert_eq!({ header.header.len }, 0);
 }
 
@@ -872,8 +891,9 @@ mod tests {
 
     use crate::{
         btree::{
-            BTreeHeader, BTreeNodeBuf, LeafValueEncoded, get_key_inner, get_key_leaf, get_page_ptr,
-            get_value_leaf, insert_at_inner, insert_at_leaf, insert_init_inner, remove_at_leaf,
+            BTreeHeader, BTreeNodeBuf, BTreeNodeKind, LeafValueEncoded, get_key_inner,
+            get_key_leaf, get_page_ptr, get_value_leaf, insert_at_inner, insert_at_leaf,
+            insert_init_inner, remove_at_leaf,
         },
         test_util::TempDir,
         util::from_bytes_mut,
@@ -884,7 +904,7 @@ mod tests {
         let mut node = [0u8; 64];
         {
             let header = from_bytes_mut::<BTreeHeader>(&mut node);
-            header.init_inner(0);
+            header.init(BTreeNodeKind::Inner);
         }
 
         insert_init_inner(&mut node, 1);
@@ -940,7 +960,7 @@ mod tests {
         let mut node = [0u8; 64];
         {
             let header = from_bytes_mut::<BTreeHeader>(&mut node);
-            header.init_inner(0);
+            header.init(BTreeNodeKind::Inner);
         }
 
         insert_init_inner(&mut node, 1);
@@ -1014,7 +1034,7 @@ mod tests {
         let mut page = vec![0u8; 4096];
 
         {
-            page.header_mut().init_inner(0);
+            page.header_mut().init(BTreeNodeKind::Inner);
         }
         assert_eq!(0, { page.header().len });
 
@@ -1066,7 +1086,7 @@ mod tests {
         let mut page = vec![0u8; 4096];
 
         {
-            page.header_mut().init_leaf(0);
+            page.header_mut().init(BTreeNodeKind::Leaf);
         }
 
         assert_eq!(0, { page.header().len });
