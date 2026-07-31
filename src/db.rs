@@ -149,9 +149,15 @@ impl Txn {
         todo!()
     }
 
+    // TODO: significant work idea, batch all write futures from btree operations and allocations
+    // at once into a batch. That way each commit would be
+    // 1. submit batch of all writes (btree + allocations)
+    // 2. fsync
+    // 3. swap buf root
+    // 4. fysnc
     pub async fn commit(&mut self) {
         if let Some(lca) = self.writes.lca(|v| v.is_some()) {
-            for (key, node) in self.ops.dfs_iter_mut() {
+            for (key, _node) in self.ops.dfs_iter_mut() {
                 if key.as_path().starts_with(&lca) {
                     todo!("implement")
                 }

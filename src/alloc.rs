@@ -291,6 +291,11 @@ impl PageAllocator {
         seg.bitfield[in_seg_idx as usize].fetch_and(mask, Ordering::Relaxed);
     }
 
+    // TODO: add flush_all method to page allocator. This is important for two reasons
+    // 1) on shutdown make sure allocations are properly synced to disk,
+    // 2) testing
+    // should be easy to implement, increment version on free, iterate over all chunks calling flush with current version
+
     pub fn is_free(&self, pg_idx: u64) -> bool {
         let pg_idx = self.remove_headers_from_page_index(pg_idx);
         let x_seg_idx = pg_idx / BITS_PER_UNIT;
@@ -399,7 +404,7 @@ mod tests {
     #[tokio::test]
     async fn simple_test() -> Result<()> {
         let temp_dir = TempDir::new(function_name!())?;
-        let (alloc, fio, meta) = temp_dir.alloc("file").await?;
+        let (alloc, _fio, meta) = temp_dir.alloc("file").await?;
 
         assert_eq!(2, meta.len());
 

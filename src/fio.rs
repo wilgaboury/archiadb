@@ -26,11 +26,7 @@ use libc::{O_DIRECT, iovec};
 use parking_lot::Mutex;
 use rustix::fs::fstatvfs;
 
-use crate::{
-    file::DbFile,
-    meta::MetaHandler,
-    util::{get_fs_block_size, pick_page_size},
-};
+use crate::{file::DbFile, meta::MetaHandler, util::get_fs_block_size};
 
 pub const MIN_PAGE_SIZE: u64 = 4096; // smallest supported page size and most common filesystem block size
 pub const MAX_PAGE_SIZE: u64 = 65536;
@@ -847,6 +843,10 @@ impl IoLoop {
                         self.ops[id] = Some(FioOp::Write(data));
                     }
                     FioOp::Commit(data) => {
+                        // TODO: significant work, but would be better if there was only one fsync call
+                        // occuring at any given time. In other words, commit's would be batched across
+                        // submit/reap cycle, and submitted when previous one finished.
+
                         if commit_batch.is_empty() {
                             submitted += 1;
                         }

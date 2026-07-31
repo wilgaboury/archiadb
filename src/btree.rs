@@ -200,6 +200,7 @@ trait BTreeNodeBuf {
     fn get_value_leaf(&self, idx: usize) -> LeafValueEncoded<'_>;
     fn get_page_ptr(&self, idx: usize) -> u64;
     fn get_key_inner(&self, idx: usize) -> &[u8];
+    fn root_to_inner(&mut self);
 }
 
 impl BTreeNodeBuf for [u8] {
@@ -271,6 +272,13 @@ impl BTreeNodeBuf for [u8] {
 
     fn get_key_inner(&self, idx: usize) -> &[u8] {
         get_key_inner(self, idx)
+    }
+
+    fn root_to_inner(&mut self) {
+        let slots_start = size_of::<BTreeRootHeader>();
+        let slots_end = slots_start + self.header().len as usize * SLOT_SIZE;
+        let dest = size_of::<BTreeHeader>();
+        self.copy_within(slots_start..slots_end, dest);
     }
 }
 
@@ -656,7 +664,6 @@ enum InsertResult {
 }
 
 impl Txn {
-    // TODO: batch all the writes into a single vec so they can be executed at once after the fact
     async fn upsert(&mut self, key: &[u8], value: &[u8], mut root: PageBuf) -> Result<PageBuf> {
         let version = root.get_mut().root_header().version;
         match self
@@ -713,7 +720,7 @@ impl Txn {
                 }
                 InsertResult::Split(left, split, right) => {
                     if pg.get().header().kind == BTreeNodeKind::Root {
-                        todo!("implement root -> inner procedure");
+                        pg.get_mut().root_to_inner();
                     }
 
                     let can_insert = pg.get().remaining() > PAGE_PTR_SIZE + split.len() + SLOT_SIZE;
