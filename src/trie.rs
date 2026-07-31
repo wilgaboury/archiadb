@@ -686,4 +686,53 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn try_all_lock_compatability() {
+        let mut trie = TxnKeyTrie::new();
+        trie.insert_lock(key_path![], LockType::Read).unwrap();
+        trie.insert_lock(key_path![], LockType::Read).unwrap();
+        trie.insert_lock(key_path![], LockType::ReadRecursive)
+            .unwrap();
+        let mut trie = TxnKeyTrie::new();
+        trie.insert_lock(key_path![], LockType::Read).unwrap();
+        assert!(trie.insert_lock(key_path![], LockType::Write).is_err());
+
+        let mut trie = TxnKeyTrie::new();
+        trie.insert_lock(key_path![b"write1"], LockType::Write)
+            .unwrap();
+        trie.insert_lock(key_path![], LockType::Read).unwrap();
+        trie.insert_lock(key_path![b"write2"], LockType::Write)
+            .unwrap();
+        assert!(
+            trie.insert_lock(key_path![], LockType::ReadRecursive)
+                .is_err()
+        );
+        assert!(trie.insert_lock(key_path![], LockType::Write).is_err());
+
+        let mut trie = TxnKeyTrie::new();
+        trie.insert_lock(key_path![], LockType::ReadRecursive)
+            .unwrap();
+        trie.insert_lock(key_path![], LockType::Read).unwrap();
+        assert!(
+            trie.insert_lock(key_path![b"write"], LockType::Write)
+                .is_err()
+        );
+        trie.insert_lock(key_path![], LockType::ReadRecursive)
+            .unwrap();
+        assert!(trie.insert_lock(key_path![], LockType::Write).is_err());
+
+        let mut trie = TxnKeyTrie::new();
+        trie.insert_lock(key_path![], LockType::Write).unwrap();
+        assert!(trie.insert_lock(key_path![], LockType::Read).is_err());
+        assert!(
+            trie.insert_lock(key_path![b"write"], LockType::Write)
+                .is_err()
+        );
+        assert!(
+            trie.insert_lock(key_path![], LockType::ReadRecursive)
+                .is_err()
+        );
+        assert!(trie.insert_lock(key_path![], LockType::Write).is_err());
+    }
 }
