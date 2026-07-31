@@ -238,7 +238,7 @@ macro_rules! key_path {
             }
             arr
         };
-        unsafe { &*(&PACKED as *const [u8] as *const KeyPath) }
+        unsafe { &*(&PACKED as *const [u8] as *const $crate::key::KeyPath) }
     }};
 }
 

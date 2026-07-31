@@ -794,7 +794,9 @@ impl Txn {
         let can_insert = pg.get().remaining() > key.len() + encoded_value.len() + SLOT_SIZE;
         if can_insert {
             let search = search_leaf(pg.get(), key);
-            if let SearchResult::Exact(idx) = search {
+            if let SearchResult::Exact(idx) = search
+                && pg.get().header().len > 0
+            {
                 remove_at_leaf(pg.get_mut(), idx);
             }
             insert_at_leaf(pg.get_mut(), search.idx(), key, &encoded_value);
@@ -909,6 +911,8 @@ mod tests {
             get_key_leaf, get_page_ptr, get_value_leaf, insert_at_inner, insert_at_leaf,
             insert_init_inner, remove_at_leaf,
         },
+        db::Db,
+        key_path,
         test_util::TempDir,
         util::from_bytes_mut,
     };
@@ -1250,6 +1254,22 @@ mod tests {
             }
         );
         assert_eq!(3, { page.header().len });
+
+        Ok(())
+    }
+
+    #[named]
+    #[tokio::test]
+    async fn test_upsert() -> Result<()> {
+        let dir = TempDir::new(function_name!()).unwrap();
+        let db = Db::builder().path(dir.path().join("file")).build().await?;
+        {
+            let mut txn = db.txn().write(key_path![])?.begin().await;
+            let mut page = db.inner.fio.get_buf();
+            page.get_mut().root_header_mut().init();
+            let page = txn.upsert(b"key", b"value", page).await?;
+            let _page = txn.upsert(b"key", b"value", page).await?;
+        }
 
         Ok(())
     }
