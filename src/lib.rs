@@ -5,6 +5,7 @@ pub mod concache;
 pub mod db;
 pub mod file;
 pub mod fio;
+pub mod flux;
 pub mod intrusive;
 pub mod key;
 pub mod lock;

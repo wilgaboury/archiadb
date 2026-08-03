@@ -5,15 +5,7 @@ use bon::bon;
 use tokio::sync::Mutex;
 
 use crate::{
-    alloc::{AllocationSet, PageAllocator},
-    concache::ConCache,
-    file::DbFile,
-    fio::{DEFAULT_CQ_SIZE, DEFAULT_SQ_SIZE, Fio, PageBuf},
-    key::{KeyPath, KeyPathBuf},
-    lock::{Lock, LockGuard, LockType},
-    meta::MetaHandler,
-    trie::TxnKeyTrie,
-    txnmap::TxnFreeDeferMap,
+    alloc::{AllocationSet, PageAllocator}, concache::ConCache, file::DbFile, fio::{DEFAULT_CQ_SIZE, DEFAULT_SQ_SIZE, Fio, PageBuf}, flux::Flux, key::{KeyPath, KeyPathBuf}, lock::{Lock, LockGuard, LockType}, meta::MetaHandler, trie::TxnKeyTrie, txnmap::TxnFreeDeferMap,
 };
 
 #[derive(Clone)]
@@ -114,6 +106,7 @@ impl TxnBuilder {
             allocs: AllocationSet::new(),
             free: Vec::new(),
             ops: self.ops,
+            flux: Flux::new(),
             writes: TxnKeyTrie::new(),
         }
     }
@@ -126,7 +119,8 @@ pub struct Txn {
     pub(crate) allocs: AllocationSet,
     pub(crate) free: Vec<u64>,
     pub(crate) ops: TxnKeyTrie<LockType>,
-    pub(crate) writes: TxnKeyTrie<Option<PageBuf>>,
+    pub(crate) flux: Flux,
+    pub(crate) writes: TxnKeyTrie<Option<u64>>,
 }
 
 impl Txn {
