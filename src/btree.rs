@@ -6,11 +6,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 
 use crate::{
-    const_assert,
-    db::{Db, Txn},
-    fio::{Fio, MIN_PAGE_SIZE, PageBuf},
-    key::KeyPath,
-    util::{
+    const_assert, db::{Db, Txn}, fio::{Fio, MIN_PAGE_SIZE, PageBuf}, flux::FluxBuf, key::KeyPath, util::{
         CHECKSUM_SIZE, from_bytes, from_bytes_mut, has_valid_checksum, update_checksum,
         validate_checksum,
     },
@@ -659,12 +655,12 @@ impl RootDoublePageBuf {
 }
 
 enum InsertResult {
-    Single(PageBuf),
+    Single(FluxBuf),
     Split(u64, Box<[u8]>, u64),
 }
 
 impl Txn {
-    async fn upsert(&mut self, key: &[u8], value: &[u8], mut root: PageBuf) -> Result<PageBuf> {
+    async fn upsert(&mut self, key: &[u8], value: &[u8], mut root: FluxBuf) -> Result<FluxBuf> {
         let version = root.get_mut().root_header().version;
         match self
             .upsert_inner(key, LeafValue::Value(value), root)
@@ -675,14 +671,14 @@ impl Txn {
                 Ok(page_buf)
             }
             InsertResult::Split(left, split, right) => {
-                let mut page_buf = self.db.inner.fio.get_buf();
+                let mut pg_buf = self.flux_buf();
 
-                page_buf.get_mut().root_header_mut().init();
-                page_buf.get_mut().root_header_mut().version = version + 1;
-                insert_at_inner(page_buf.get_mut(), 0, left, &split, right);
-                update_checksum(page_buf.get_mut());
+                pg_buf.get_mut().root_header_mut().init();
+                pg_buf.get_mut().root_header_mut().version = version + 1;
+                insert_at_inner(pg_buf.get_mut(), 0, left, &split, right);
+                update_checksum(pg_buf.get_mut());
 
-                Ok(page_buf)
+                Ok(pg_buf)
             }
         }
     }
@@ -691,7 +687,7 @@ impl Txn {
         &mut self,
         key: &[u8],
         value: LeafValue<'_>,
-        mut pg: PageBuf,
+        mut pg: FluxBuf,
     ) -> Result<InsertResult> {
         let header = from_bytes::<BTreeHeader>(pg.get());
         if header.kind == BTreeNodeKind::Leaf {
@@ -701,9 +697,9 @@ impl Txn {
             let child_pg = if pg.get().header().len > 0 {
                 let child_pg_idx = get_page_ptr(pg.get(), search);
                 self.free.push(child_pg_idx);
-                self.db.inner.fio.read(child_pg_idx).await?
+                self.flux_read(child_pg_idx).await?
             } else {
-                let mut child_pg = self.db.inner.fio.get_buf();
+                let mut child_pg = self.flux_buf();
                 child_pg.get_mut().header_mut().init(BTreeNodeKind::Leaf);
                 child_pg
             };
@@ -711,8 +707,7 @@ impl Txn {
 
             match insert {
                 InsertResult::Single(child_pg) => {
-                    let child_pg_idx = self.alloc().await?;
-                    self.db.inner.fio.write(child_pg_idx, child_pg).await?;
+                    let child_pg_idx = self.flux_write(child_pg).await?;
 
                     write_page_ptr(pg.get_mut(), search, child_pg_idx);
                     update_checksum(pg.get_mut());
@@ -741,10 +736,10 @@ impl Txn {
         left_idx: u64,
         split: Box<[u8]>,
         right_idx: u64,
-        pg: PageBuf,
+        pg: FluxBuf,
     ) -> Result<InsertResult> {
         let mut left = pg;
-        let mut right = self.db.inner.fio.get_buf();
+        let mut right = self.flux_buf();
 
         right.get_mut().header_mut().init(BTreeNodeKind::Leaf);
 
@@ -776,18 +771,18 @@ impl Txn {
         let key = right.get().get_key_leaf(0).to_vec().into_boxed_slice();
 
         update_checksum(left.get_mut());
-        self.db.inner.fio.write(left_idx, left).await?;
+        let ret_left_idx = self.flux_write(left).await?;
         update_checksum(right.get_mut());
-        self.db.inner.fio.write(right_idx, right).await?;
+        let ret_right_idx = self.flux_write(right).await?;
 
-        Ok(InsertResult::Split(left_idx, key, right_idx))
+        Ok(InsertResult::Split(ret_left_idx, key, ret_right_idx))
     }
 
     async fn upsert_leaf(
         &mut self,
         key: &[u8],
         value: LeafValue<'_>,
-        mut pg: PageBuf,
+        mut pg: FluxBuf,
     ) -> Result<InsertResult> {
         let encoded_value = value.encode(self).await?;
 
@@ -803,11 +798,8 @@ impl Txn {
             update_checksum(pg.get_mut());
             Ok(InsertResult::Single(pg))
         } else {
-            let left_idx = self.alloc().await?;
-            let right_idx = self.alloc().await?;
-
             let mut left = pg;
-            let mut right = self.db.inner.fio.get_buf();
+            let mut right = self.flux_buf();
 
             right.get_mut().header_mut().init(BTreeNodeKind::Leaf);
 
@@ -837,9 +829,9 @@ impl Txn {
             let key = right.get().get_key_leaf(0).to_vec().into_boxed_slice();
 
             update_checksum(left.get_mut());
-            self.db.inner.fio.write(left_idx, left).await?;
+            let left_idx = self.flux_write(left).await?;
             update_checksum(right.get_mut());
-            self.db.inner.fio.write(right_idx, right).await?;
+            let right_idx = self.flux_write(right).await?;
 
             Ok(InsertResult::Split(left_idx, key, right_idx))
         }
@@ -1265,7 +1257,7 @@ mod tests {
         let db = Db::builder().path(dir.path().join("file")).build().await?;
         {
             let mut txn = db.txn().write(key_path![])?.begin().await;
-            let mut page = db.inner.fio.get_buf();
+            let mut page = txn.flux_buf();
             page.get_mut().root_header_mut().init();
             let page = txn.upsert(b"key", b"value", page).await?;
             let _page = txn.upsert(b"key", b"value", page).await?;
