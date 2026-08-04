@@ -873,7 +873,7 @@ impl Txn {
         Ok(())
     }
 
-    async fn alloc(&mut self) -> Result<u64> {
+    pub(crate) async fn alloc(&mut self) -> Result<u64> {
         self.db
             .inner
             .alloc

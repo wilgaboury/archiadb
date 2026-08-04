@@ -182,7 +182,7 @@ impl TxnKeyTrie<LockType> {
         Ok(())
     }
 
-    fn validate_read(&self, key_path: &KeyPath) -> Result<()> {
+    pub(crate)fn validate_read(&self, key_path: &KeyPath) -> Result<()> {
         let mut node = match self.root.as_ref() {
             Some(node) => node,
             None => bail!("Cannot read node outside transaction bounds"),
@@ -201,7 +201,7 @@ impl TxnKeyTrie<LockType> {
         Ok(())
     }
 
-    fn validate_write(&self, key_path: &KeyPath) -> Result<()> {
+    pub(crate) fn validate_write(&self, key_path: &KeyPath) -> Result<()> {
         let mut node = match self.root.as_ref() {
             Some(node) => node,
             None => bail!("Cannot read node outside transaction bounds"),
