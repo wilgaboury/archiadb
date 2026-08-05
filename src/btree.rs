@@ -6,7 +6,12 @@ use std::{
 use anyhow::{Context, Result, bail};
 
 use crate::{
-    const_assert, db::{Db, Txn}, fio::{Fio, MIN_PAGE_SIZE, PageBuf}, flux::FluxBuf, key::KeyPath, util::{
+    const_assert,
+    db::{Db, Txn},
+    fio::{Fio, MIN_PAGE_SIZE, PageBuf},
+    flux::FluxBuf,
+    key::KeyPath,
+    util::{
         CHECKSUM_SIZE, from_bytes, from_bytes_mut, has_valid_checksum, update_checksum,
         validate_checksum,
     },
@@ -78,38 +83,45 @@ enum LeafValueEncoded<'a> {
 #[derive(Debug)]
 enum LeafValueGetResult {
     Btree { pg_idx_1: u64, pg_idx_2: u64 },
-    ValueEmbedded {
-        loc: usize,
-        len: usize
-    },
+    ValueEmbedded { loc: usize, len: usize },
     ValueLinkedList { pg_idx: u64, len: u64 },
 }
 
 impl LeafValueGetResult {
     fn encode<'a>(&self, buf: &'a [u8]) -> LeafValueEncoded<'a> {
         match self {
-            LeafValueGetResult::Btree { pg_idx_1, pg_idx_2 } => {
-                LeafValueEncoded::Btree { pg_idx_1: *pg_idx_1, pg_idx_2: *pg_idx_2 }
-            }
+            LeafValueGetResult::Btree { pg_idx_1, pg_idx_2 } => LeafValueEncoded::Btree {
+                pg_idx_1: *pg_idx_1,
+                pg_idx_2: *pg_idx_2,
+            },
             LeafValueGetResult::ValueEmbedded { loc, len } => {
                 LeafValueEncoded::ValueEmbedded(&buf[*loc..*loc + *len])
             }
             LeafValueGetResult::ValueLinkedList { pg_idx, len } => {
-                LeafValueEncoded::ValueLinkedList { pg_idx: *pg_idx, len: *len }
+                LeafValueEncoded::ValueLinkedList {
+                    pg_idx: *pg_idx,
+                    len: *len,
+                }
             }
         }
     }
 
     fn with_page(&self, buf: FluxBuf) -> BtreeGetResult {
         match self {
-            LeafValueGetResult::Btree { pg_idx_1, pg_idx_2 } => {
-                BtreeGetResult::Btree { pg_idx_1: *pg_idx_1, pg_idx_2: *pg_idx_2 }
-            }
-            LeafValueGetResult::ValueEmbedded { loc, len } => {
-                BtreeGetResult::ValueEmbedded { buf, loc: *loc, len: *len }
-            }
+            LeafValueGetResult::Btree { pg_idx_1, pg_idx_2 } => BtreeGetResult::Btree {
+                pg_idx_1: *pg_idx_1,
+                pg_idx_2: *pg_idx_2,
+            },
+            LeafValueGetResult::ValueEmbedded { loc, len } => BtreeGetResult::ValueEmbedded {
+                buf,
+                loc: *loc,
+                len: *len,
+            },
             LeafValueGetResult::ValueLinkedList { pg_idx, len } => {
-                BtreeGetResult::ValueLinkedList { pg_idx: *pg_idx, len: *len }
+                BtreeGetResult::ValueLinkedList {
+                    pg_idx: *pg_idx,
+                    len: *len,
+                }
             }
         }
     }
@@ -117,13 +129,19 @@ impl LeafValueGetResult {
 
 #[derive(Debug)]
 enum BtreeGetResult {
-    Btree { pg_idx_1: u64, pg_idx_2: u64 },
+    Btree {
+        pg_idx_1: u64,
+        pg_idx_2: u64,
+    },
     ValueEmbedded {
         buf: FluxBuf,
         loc: usize,
-        len: usize
+        len: usize,
     },
-    ValueLinkedList { pg_idx: u64, len: u64 },
+    ValueLinkedList {
+        pg_idx: u64,
+        len: u64,
+    },
 }
 
 enum LeafValue<'a> {
@@ -557,7 +575,10 @@ fn get_value_leaf(buf: &[u8], idx: usize) -> LeafValueGetResult {
             let len_idx = val_key_idx + 1;
             let len = buf[val_key_idx + 1] as usize;
             let value_idx = len_idx + 1;
-            LeafValueGetResult::ValueEmbedded { loc: value_idx, len }
+            LeafValueGetResult::ValueEmbedded {
+                loc: value_idx,
+                len,
+            }
         }
         LeafValueKind::ValueLinkedList => {
             let b_idx_1 = val_key_idx + 1;
@@ -735,7 +756,12 @@ impl Txn {
         }
     }
 
-    async fn btree_upsert(&mut self, key: &[u8], value: &[u8], mut root: FluxBuf) -> Result<FluxBuf> {
+    async fn btree_upsert(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+        mut root: FluxBuf,
+    ) -> Result<FluxBuf> {
         let version = root.get_mut().root_header().version;
         match self
             .btree_upsert_inner(key, LeafValue::Value(value), root)

@@ -1,8 +1,13 @@
-use std::{cell::RefCell, collections::{HashMap, HashSet}, ptr, rc::Rc};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+    ptr,
+    rc::Rc,
+};
 
 use anyhow::Result;
 
-use crate:: {db::Txn, fio::PageBuf};
+use crate::{db::Txn, fio::PageBuf};
 
 /// Stores "in-flux" transaction pages in memory. That way non-persisted pages are not
 /// copied on write multiple times.
@@ -13,14 +18,17 @@ pub(crate) struct Flux {
 
 impl Flux {
     pub(crate) fn new() -> Self {
-        Flux { map: HashMap::new(), free: Rc::new(RefCell::new(HashSet::new())) }
+        Flux {
+            map: HashMap::new(),
+            free: Rc::new(RefCell::new(HashSet::new())),
+        }
     }
 }
 
 #[derive(Debug)]
 pub enum FluxBuf {
     Unalloc(PageBuf),
-    Alloc(FluxBufAlloc)
+    Alloc(FluxBufAlloc),
 }
 
 #[derive(Debug)]
@@ -53,7 +61,11 @@ impl Txn {
 
     pub(crate) async fn flux_read(&mut self, pg_idx: u64) -> Result<FluxBuf> {
         if let Some(buf) = self.flux.map.remove(&pg_idx) {
-            Ok(FluxBuf::Alloc(FluxBufAlloc { idx: pg_idx, buf, free: self.flux.free.clone() }))
+            Ok(FluxBuf::Alloc(FluxBufAlloc {
+                idx: pg_idx,
+                buf,
+                free: self.flux.free.clone(),
+            }))
         } else {
             Ok(FluxBuf::Unalloc(self.db.inner.fio.read(pg_idx).await?))
         }

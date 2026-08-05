@@ -5,7 +5,16 @@ use bon::bon;
 use tokio::sync::Mutex;
 
 use crate::{
-    alloc::{AllocationSet, PageAllocator}, concache::ConCache, file::DbFile, fio::{DEFAULT_CQ_SIZE, DEFAULT_SQ_SIZE, Fio}, flux::{Flux, FluxBuf}, key::{KeyPath, KeyPathBuf}, lock::{Lock, LockGuard, LockType}, meta::MetaHandler, trie::TxnKeyTrie, txnmap::TxnFreeDeferMap,
+    alloc::{AllocationSet, PageAllocator},
+    concache::ConCache,
+    file::DbFile,
+    fio::{DEFAULT_CQ_SIZE, DEFAULT_SQ_SIZE, Fio},
+    flux::Flux,
+    key::{KeyPath, KeyPathBuf},
+    lock::{Lock, LockGuard, LockType},
+    meta::MetaHandler,
+    trie::TxnKeyTrie,
+    txnmap::TxnFreeDeferMap,
 };
 
 #[derive(Clone)]
@@ -125,13 +134,17 @@ pub struct Txn {
 
 impl Txn {
     pub async fn read(&self, _path: &KeyPath) -> Result<&[u8]> {
-        self.ops.validate_read(_path).context("read validation failed")?;
+        self.ops
+            .validate_read(_path)
+            .context("read validation failed")?;
 
         todo!()
     }
 
     pub async fn write(&mut self, _path: &KeyPath, _value: &[u8]) -> Result<()> {
-        self.ops.validate_write(_path).context("write validation failed")?;
+        self.ops
+            .validate_write(_path)
+            .context("write validation failed")?;
 
         todo!()
     }
