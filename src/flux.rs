@@ -17,15 +17,17 @@ impl Flux {
     }
 }
 
+#[derive(Debug)]
 pub enum FluxBuf {
     Unalloc(PageBuf),
     Alloc(FluxBufAlloc)
 }
 
+#[derive(Debug)]
 pub struct FluxBufAlloc {
     idx: u64,
-        buf: PageBuf,
-        free: Rc<RefCell<HashSet<u64>>>,
+    buf: PageBuf,
+    free: Rc<RefCell<HashSet<u64>>>,
 }
 
 impl FluxBuf {

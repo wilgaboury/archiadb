@@ -109,6 +109,7 @@ pub struct Fio {
     join: Arc<IoLoopHandle>,
 }
 
+#[derive(Debug)]
 struct Inner {
     fio_file: File,
     file: Arc<DbFile>,
@@ -166,6 +167,7 @@ impl Drop for PoolGenericOpState {
     }
 }
 
+#[derive(Debug)]
 pub enum PageBuf {
     Pool(PoolBuf),
     Dynamic(Box<[u8]>),
@@ -193,6 +195,7 @@ impl PageBuf {
     }
 }
 
+#[derive(Debug)]
 pub struct PoolBuf {
     idx: usize,
     fio: Arc<Inner>,

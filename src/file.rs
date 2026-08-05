@@ -5,6 +5,7 @@ use std::{
 
 use anyhow::Result;
 
+#[derive(Debug)]
 pub struct DbFile {
     path: PathBuf,
     file: File,
