@@ -32,4 +32,4 @@ The internal workings are outlined in more detail here: [Design Doc](design.md)
 
 ## Design Intentions
 
-ArchiaDB was designed with an eye towards server-side applications that benefit from dead simple database administration, for instance, those intended for self-hosting, and I believe it offers a compelling feature combination for this use case. However, it is a quite simple and immature. For high throughput, high uptime applications, LSM-tree based data stores or traditional OLTP DBMS's are likely worth the increase in complexity.
+ArchiaDB was designed for SSD storage with an eye towards and server-side applications that benefit from dead simple database administration, for instance, those intended for self-hosting, and I believe it offers a compelling feature combination for this use case. However, it is quite simple and immature. For high throughput, high uptime applications, LSM-tree based data stores or traditional OLTP DBMS's are likely worth the increase in complexity.
