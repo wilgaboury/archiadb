@@ -2,7 +2,7 @@
 
 ## Introduction
 
-ArchiaDB is a hiercharchial, embedded, transactional database. This document provides a broad overview of how it is implemented and reasoning behind certain design decisions.
+ArchiaDB is a hierarchical, embedded, transactional database. This document provides a broad overview of its implementation and some reasoning behind certain design decisions.
 
 ## Hierarchical Modeling
 
@@ -31,7 +31,7 @@ COW, on the other hand, maintains integrity by not modifying B+tree nodes once t
 
 ### Path Copying
 
-This is a ubiquitous technique used by persistent immutable data structures; however, Archia uses it instead to keep its on-disk format crash safe. For just about any tree structure, which consists of nodes and pointers, instead of modifying nodes directly, mutated nodes are first copied. This is done recursively until reaching the root, where path copying creates a new root node. This results in two roots, one pointing to the unmodified previous version, and one pointing to a new structure, containing the modification, composed of both new and old nodes. This is exactly what ArchiaDB does when modifying B+trees, the only difference being that nodes are stored on disk.
+This is a ubiquitous technique used by persistent immutable data structures; however, Archia uses it to keep its on-disk format crash safe. For just about any tree structure, which consists of nodes and pointers, instead of modifying nodes directly, mutated nodes are first copied. This is done recursively until reaching the root, where path copying creates a new root node. This results in two roots, one pointing to the unmodified previous version, and one pointing to a new structure, containing the modification, composed of both new and old nodes. This is exactly what ArchiaDB does when modifying B+trees, the only difference being that nodes are stored on disk.
 
 ![path-copying](https://upload.wikimedia.org/wikipedia/commons/5/56/Purely_functional_tree_after.svg?utm_source=en.wikipedia.org&utm_campaign=index&utm_content=original)
 
@@ -47,19 +47,19 @@ In order to atomically commit transactions, which may touch multiple B+trees, Ar
 
 ### Background
 
-Transactions in ArchiaDB use conservative two phase locking (2PL). In the Archia API, this translates to declaring the entire read/write set upfront. This design makes it difficult to create transactions that do not know their full read/write set ahead of time; consider, for instance, a bank transfer where the two usernames are known but not the account ids. However, this issue can be mitigated by utilizing non-blocking reads combined with optimistic concurrency control, or by pessimistically locking more of the node tree.
+Transactions in ArchiaDB use conservative two phase locking (2PL). In the API, this translates to declaring the entire read/write set upfront. This design makes it difficult to create transactions that do not know their full read/write set ahead of time; consider, for instance, a bank transfer where the two usernames are known but not the account ids. However, this issue can be mitigated by utilizing non-blocking reads combined with optimistic concurrency control, or by pessimistically locking more of the node tree.
 
 One of the main benefits of conservative 2PL is that it can entirely avoid deadlocks and livelocks. Many traditional DBMS's perform the first phase dynamically; locks are acquired as the transaction makes progress based on what data it attempts to read or write. For those unfamiliar with this problem space, when two concurrent processes compete for mutual exclusion on two resources but in opposite order, it's possible for each one to lock the resource the other one needs, causing both processes to enter a stuck state. Traditional DBMS's get around this using complex deadlock detection systems, which monitor locks, identify deadlocked processes, and force cancellation so that at least one of them can make progress. However, on high throughput systems, complex transactions may end up livelocked. When more data is touched, there is a higher probability of cancellation, creating the possibility that a transaction is stuck retrying and never completes. The solution to deadlocks when using conservative 2PL is to give locks a global ordering, such that each process always acquires/releases them in the same order.
 
-### Top Down Locking
+### Top-Down Locking
 
 Top-down locks refer to the locks acquired at the very beginning of a transaction and released at the very end. The database utilizes a unique scheme in order to best take advantage of its hierarchical structure. Each node in the B+tree hierarchy has effectively a read/write lock following the golden rule of single writer XOR multiple readers. Locks for the node tree are acquired in BFS order and lexicographically across siblings. Each one uses a fair, FIFO wait queue, to make sure that transactions, regardless of complexity, are always eventually processed.
 
 Users may declare one of three transaction operations on a given node: read, write, and read recursive. The first two are self explanatory, the last one effectively acquires a read lock on a given node and all of its descendants. There is an additional hidden lock type, not directly exposed to the user called read-child-write. This lock is acquired on each ancestor on the path to a write lock and ensures that a read recursive lock can never acquire a sub-tree with an ongoing write and vice versa.
 
-### Bottom Up Locking
+### Bottom-Up Locking
 
-These refer to locks that are acquired/released during the commit procedure, which can be triggered by the user any number of times during a transaction. The main issue addressed by this algorithm is that the least common ancestor (LCA) of the dirty nodes may not be in the write lock set of a given transaction, so doing an atomic double-buffered root page write is not trivial to do safely. Consider the case of three nodes: A, B, C, where A is the parent of B and C, and we have a transaction which has acquired top-down write locks on B and C. To properly do path-copying and double-buffered atomic commit, we must modify A. Concurrent runs of this transaction could conflict, so the database acquires "bottom-up" write locks on the dirty node's ancestors up to the LCA. These are locked in reverse BFS order, and the commit algorithm roughly follows this procedure:
+These refer to locks that are acquired/released during the commit procedure, which can be triggered by the user any number of times during a transaction. The main issue addressed by this algorithm is that the least common ancestor (LCA) of the dirty nodes may not be in the write lock set of a given transaction, so doing an atomic double-buffered root page write is not trivial to do safely. Consider the case of three nodes: A, B, C, where A is the parent of B and C, and we have a transaction which has acquired top-down write locks on B and C. To properly do path-copying and double-buffered atomic commit, we must modify node A. Concurrent transactions that also have node A as their LCA could conflict, so the database acquires "bottom-up" write locks on the dirty node's ancestors up to the LCA. These are locked in reverse BFS order, and the commit algorithm roughly follows this procedure:
 
 1. write dirty transaction pages
 2. acquire bottom-up locks
@@ -85,16 +85,40 @@ Another optimization is use of DMA and pools for zero-copy buffers. FIO register
 
 ## Page Allocation
 
+### Local Allocation
+
+Each B+tree in ArchiaDB maintains its own local allocation system that consists of two components: a list of arenas and a list of free pages.
+
+Arenas are simple bump allocators, where each one points to a chunk of pages. The free list is simply a list of free page indexes. The most interesting thing about this system is the data is encoded and stored as an on-disk linked list of pages. This linked list is also COW and a pointer is stored in the double buffered B+tree root header. Modifications always are performed starting from the head, so regardless of free list length, write transaction overhead is proportional to the amount of allocation work done.
+
 ### Global Allocation
 
-### Local Allocation
+When new B+tree roots are first created or when one runs out of pages in their local allocator, a new arena is created for it by the global allocator which bumps the size of the file. The procedure works like so:
+
+1. acquire global alloc lock
+2. falloc, extend file to create new arena
+3. write tuple (previous file len, root page index) and checksum to the last page of file, one past arena end.
+4. fsync
+5. write new file length to meta page
+6. fsync
+7. prepend arena information to B+tree root page
+9. fsync
+10. wipe last page
+11. fsync
+12. release lock
+
+This dance with the last page data is important for crash recovery, since this process is not committed atomically. A crash that occurs after extending the file but before the new arena has been committed to the B+tree is at risk of leaking a chunk of the file. On startup, if a crash is detected, the recovery process reads the last page. If the checksum is valid and a partial global alloc indicated, it checks the root that it points to and checks that it knows about the arena. If not, the root is updated to complete the allocation.
 
 ## File Format
 
-### Meta Pages
+### Storage Assumptions
 
-The first two pages of each database file contain metadata, information like: file size, page size, is currently open, etc. Just like B+tree roots, metadata is double buffered.
+There is really only one main assumption that ArchiaDB makes about the underlying storage device: after an fsync operation, all previously written pages are persisted. Unlike other databases/formats, there is no assumption of properties like atomic single byte write or powersafe overwrite, which makes ArchiaDB a very resilient format.
 
-### Chunks
+### Metadata
 
-### B+Tree Nodes
+The first two pages of each database file contain metadata and are double buffered just like B+tree roots.
+
+### B+tree
+
+### Allocator List
