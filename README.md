@@ -20,9 +20,9 @@ Like other OLTP data stores, the paradigm is defined by how records are organize
 
 - strictly serializable transactions using conservative 2PL
     - concurrent multi-writer when transactions do not conflict
-    - transaction locking is garunteed to succeed
+    - transaction locking is guaranteed to succeed
 - non-blocking snapshot serializable read transactions
-- persists data to a single file
+- single file with architecture independent format
 - uses COW B+trees, crash-safe without requiring a WAL
 - unopinionated about key/value serialization
 - relies on async rust, but is fully runtime agnostic
@@ -32,4 +32,4 @@ The internal workings are outlined in more detail here: [Design Doc](design.md)
 
 ## Design Intentions
 
-ArchiaDB was designed for SSD storage with an eye towards and server-side applications that benefit from dead simple database administration, for instance, those intended for self-hosting, and I believe it offers a compelling feature combination for this use case. However, it is quite simple and immature. For high throughput, high uptime applications, LSM-tree based data stores or traditional OLTP DBMS's are likely worth the increase in complexity.
+ArchiaDB was designed with an eye towards server-side applications that benefit from dead simple database administration, for instance, those intended for self-hosting, and I believe it offers a compelling feature combination for this use case. However, it is quite simple and immature. For high throughput, high uptime applications, LSM-tree based data stores or traditional OLTP DBMS's are likely worth the increase in complexity.
