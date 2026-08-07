@@ -1,12 +1,12 @@
-# Design Doc (__WIP__)
+# Design Doc (WIP)
 
 ## Introduction
 
-ArchiaDB is a hierarchical, embedded, transactional database. This document provides a broad overview of its implementation and some reasoning behind certain design decisions.
+ArchiaDB is a hierarchical, embedded, transactional database. This document provides a broad overview of its implementation and design decisions.
 
 ## Hierarchical Modeling
 
-Fundamentally, ArchiaDB is a nestable key-value store. The following is an in-memory representation that is effectively equivalent:
+Hierarchical modelling is one paradigm among others like relational, document, or graph; providing a higher-level structure to a set of records. It may help to think of it as nothing more than a nestable key-value store. The following in-memory representation is effectively equivalent:
 
 ```rust
 struct DB(Map);
@@ -18,26 +18,21 @@ enum Value {
 }
 ```
 
-For this document, it suffices to say that hierarchical modelling is one paradigm among other alternatives like relational, document, or graph.
-
 ## COW B+trees
 
-B+trees are a ubiquitous data structure for on-disk database formats. In brief, for those unfamiliar, they are a form of self-balancing sorted tree map where there is a high branching factor and values are stored only in the leaves. What makes them especially suitable for databases is that they can be designed such that each node makes efficient use of a fixed amount of space, as most underlying storage devices are designed to work best with fixed size blocks (commonly 4kb, for instance).
+B+trees are a ubiquitous structure used in storage engines. For those unfamiliar, they are a self-balancing sorted tree map with a high branching factor and values only stored in leaves.  Most underlying storage devices (HDDs, SSDs) are designed to work best with fixed size blocks (commonly 4kb), so B+trees are suitable because their nodes can make efficient use of fixed size blocks.
 
-Before discussing the COW variant, it is pertinent for sake of comparison to discuss the in-place version used by many database systems. In such systems, modifying operations
- are carefully programmed to be idempotent; a record describing each operation is appended to a write ahead log (WAL) before it is actually executed. After an unexpected shutdown, operations from the WAL may be safely replayed, which will clean up any partially applied modifications to the B+tree, ultimately ensuring on-disk data integrity.
-
-COW, on the other hand, maintains integrity by not modifying B+tree nodes once they are written; though, there is one exception to this in ArchiaDB which will be covered shortly.
+In order to understand copy on write (COW) B+trees, it is pertinent to briefly explain the in-place versions used by many databases. In such systems, modifying operations are carefully programmed to be idempotent, and a record describing each operation is appended to a write ahead log (WAL) before it is actually executed. For recovery after an unexpected shutdown, operations from the WAL may be safely replayed, which will clean up any partially applied modifications to the B+tree, ultimately ensuring on-disk data integrity. COW maintains integrity by never overwriting data; instead, nodes are copied, modified and written to new locations in the file.
 
 ### Path Copying
 
-This is a ubiquitous technique used by persistent immutable data structures; however, Archia uses it to keep its on-disk format crash safe. For just about any tree structure, which consists of nodes and pointers, instead of modifying nodes directly, mutated nodes are first copied. This is done recursively until reaching the root, where path copying creates a new root node. This results in two roots, one pointing to the unmodified previous version, and one pointing to a new structure, containing the modification, composed of both new and old nodes. This is exactly what ArchiaDB does when modifying B+trees, the only difference being that nodes are stored on disk.
+This technique is widely employed by persistent immutable data structures. For B+trees, in order to modify leaf nodes which contain all the keys and values, node COW is performed recursively until reaching the root. This results in two roots, one pointing to the previous version and one pointing to a new version that contains the applied modification, but is composed of both new and old nodes.
 
 ![path-copying](https://upload.wikimedia.org/wikipedia/commons/5/56/Purely_functional_tree_after.svg?utm_source=en.wikipedia.org&utm_campaign=index&utm_content=original)
 
-### Double Buffered Root Node
+### Double Buffered Root
 
-The issue is that path copying cannot regress infinitely, if the goal is to replace the old version; at some point, it must terminate with a simple in-place modification. In-memory data structures can simply update a pointer to the root, but databases do not get that luxury. To solve this ArchiaDB adopts a clever technique from LMDB.
+Path copying cannot regress infinitely. If the goal is to replace the old version, at some point it must terminate with an in-place modification. In-memory data structures can simply update a pointer to the root, but databases do not get that luxury. To solve this, ArchiaDB adopts a clever technique from LMDB.
 
 Each root node comprises two pages (or buffers) and each contains two important fields: a version, which is a monotonically increasing integer, and a checksum, which is stored at the end of the page. The canonical root data is determined by choosing the page with the higher version and a correct checksum. To update the root, data containing an incremented version and calculated checksum is written to the old, non-canonical page. If a crash occurs during this process, a torn (partial) write can be detected by checksum, and the tree can be restored from the prior version.
 
@@ -57,7 +52,7 @@ Top-down locks refer to the locks acquired at the very beginning of a transactio
 
 Users may declare one of three transaction operations on a given node: read, write, and read recursive. The first two are self explanatory, the last one effectively acquires a read lock on a given node and all of its descendants. There is an additional hidden lock type, not directly exposed to the user called read-child-write. This lock is acquired on each ancestor on the path to a write lock and ensures that a read recursive lock can never acquire a sub-tree with an ongoing write and vice versa.
 
-### Bottom-Up Locking
+### Bottom-up Locking
 
 These refer to locks that are acquired/released during the commit procedure, which can be triggered by the user any number of times during a transaction. The main issue addressed by this algorithm is that the least common ancestor (LCA) of the dirty nodes may not be in the write lock set of a given transaction, so doing an atomic double-buffered root page write is not trivial to do safely. Consider the case of three nodes: A, B, C, where A is the parent of B and C, and we have a transaction which has acquired top-down write locks on B and C. To properly do path-copying and double-buffered atomic commit, we must modify node A. Concurrent transactions that also have node A as their LCA could conflict, so the database acquires "bottom-up" write locks on the dirty node's ancestors up to the LCA. These are locked in reverse BFS order, and the commit algorithm roughly follows this procedure:
 
