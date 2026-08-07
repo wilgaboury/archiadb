@@ -41,7 +41,7 @@ The issue is that path copying cannot regress infinitely, if the goal is to repl
 
 Each root node comprises two pages (or buffers) and each contains two important fields: a version, which is a monotonically increasing integer, and a checksum, which is stored at the end of the page. The canonical root data is determined by choosing the page with the higher version and a correct checksum. To update the root, data containing an incremented version and calculated checksum is written to the old, non-canonical page. If a crash occurs during this process, a torn (partial) write can be detected by checksum, and the tree can be restored from the prior version.
 
-In order to atomically commit transactions, which may touch multiple B+trees, ArchiaDB finds the least common ancestor (LCA) of all the dirty trees and applies path copying all the way up to the LCA B+tree’s root, where it then performs the double buffer root procedure. Transactions are covered in more detail in a separate section.
+In order to atomically commit transactions, which may touch multiple B+trees, ArchiaDB finds the least common ancestor (LCA) of all the dirty trees and applies path copying all the way up to the LCA B+tree’s root, where it then performs the double buffer root procedure.
 
 ## Transactions
 
@@ -80,6 +80,12 @@ In order to stay agnostic of async runtime, FIO runs its own background thread f
 One notable optimization is that commit operations, which are translated to fsync requests, are temporally batched such that there is only ever one inflight fsync at any given time. This means that IO code throughout the database can make liberal use of commit while only having to be concerned with latency but not magnitude of calls.
 
 Another optimization is use of DMA and pools for zero-copy buffers. FIO registers a fixed number of DMA buffers with io_uring on initialization. A portion of these buffers, equal to the size of the completion queue, are reserved for heap buffer copying, and the rest are used as a zero-copy pool. Page buffers are needed whenever client code requests one for use in a write request or when the background thread needs one for returning read results. First, FIO attempts to hand out what is effectively a pointer to a buffer in the zero-copy pool. However, because client code can hold onto these buffers for indeterminate amounts of time, FIO will fallback to a regular heap allocated buffer when none are available. These heap buffers then have their contents copied into/out of the reserved buffer range. This system ensures that the kernel is always operating on a fixed set of registered buffers, uses zero-copy when possible, and also never blocks CPU-bound work.
+
+## Page Allocation
+
+### Global Allocation
+
+### Local Allocation
 
 ## File Format
 
