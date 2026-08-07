@@ -6,7 +6,7 @@ ArchiaDB is a hiercharchial, embedded, transactional database. This document pro
 
 ## Hierarchical Modeling
 
-Fundamentally, Archia is a nestable key-value store. The following is a in-memory representation that is effectively equivilent:
+Fundamentally, ArchiaDB is a nestable key-value store. The following is an in-memory representation that is effectively equivalent:
 
 ```rust
 struct DB(Map);
@@ -18,7 +18,7 @@ enum Value {
 }
 ```
 
-For this document, it suffices to say that hierarchical modelling is one style among other alternatives like relational, document, or graph. An opinionated, persuasive treatment of it's benefits can be found here (TODO).
+For this document, it suffices to say that hierarchical modelling is one paradigm among other alternatives like relational, document, or graph.
 
 ## COW B+trees
 
@@ -47,9 +47,9 @@ In order to atomically commit transactions, which may touch multiple B+trees, Ar
 
 ### Background
 
-Transactions in ArchiaDB use conservative two phase locking (2PL). In the Archia API, this translates to declaring the read/write set before beginning the transaction. This makes difficult transactions that do not know their full read/write set ahead of time. However, this issue can be mitigated by utilizing non-blocking snapshot isolation read transactions combined with optimistic concurrency control, or by acquiring more coarse grain locks higher up in the node tree.
+Transactions in ArchiaDB use conservative two phase locking (2PL). In the Archia API, this translates to declaring the entire read/write set upfront. This design makes it difficult to create transactions that do not know their full read/write set ahead of time; consider, for instance, a bank transfer where the two usernames are known but not the account ids. However, this issue can be mitigated by utilizing non-blocking reads combined with optimistic concurrency control, or by pessimistically locking more of the node tree.
 
-One of the main benefits of conservative 2PL is that it can entirely avoid deadlocks and livelocks. Many traditional DBMS's perform the first phase dynamically; locks are acquired as the transaction makes progress based on what data it attempts to read or write. For those unfamiliar with this problem space, when two concurrent processes compete for mutual exclusion on two resources but in opposite order, it's possible for each one to lock the resource the other one needs, causing both processes to enter a stuck state. Traditional DBMS's get around this using complex deadlock detection systems, which monitor locks, identify deadlocked processes, and force cancellation so that at least one of them can make progress. However, on high throughput systems, complex transactions may end up livelocked. When more data is touched, there is a higher probability of cancellation, creating the possibility that a transaction is stuck retrying and never completes. The simple solution to deadlocks when using conservative 2PL is to give locks a global ordering, such that each process always acquires/releases them in the same order.
+One of the main benefits of conservative 2PL is that it can entirely avoid deadlocks and livelocks. Many traditional DBMS's perform the first phase dynamically; locks are acquired as the transaction makes progress based on what data it attempts to read or write. For those unfamiliar with this problem space, when two concurrent processes compete for mutual exclusion on two resources but in opposite order, it's possible for each one to lock the resource the other one needs, causing both processes to enter a stuck state. Traditional DBMS's get around this using complex deadlock detection systems, which monitor locks, identify deadlocked processes, and force cancellation so that at least one of them can make progress. However, on high throughput systems, complex transactions may end up livelocked. When more data is touched, there is a higher probability of cancellation, creating the possibility that a transaction is stuck retrying and never completes. The solution to deadlocks when using conservative 2PL is to give locks a global ordering, such that each process always acquires/releases them in the same order.
 
 ### Top Down Locking
 
@@ -70,6 +70,8 @@ These refer to locks that are acquired/released during the commit procedure, whi
 7. release bottom-up locks
 
 ### Read-Only
+
+While typical transactions can be either read or write, they are always strictly serializable and may block on other ongoing transactions. ArchiaDB also offers non-blocking read-only transactions at the lower snapshot serializable isolation level. From an implementation perspective, read-only transactions are trivial to implement due to the database's COW B+tree structure. The main concern is that read-only processes could read “dirty” pages referenced by the non-canonical B+tree root buffer, which have been written over; however, the database contains in-memory bookkeeping mechanisms to ensure that pages are not reused until there are no longer any transactions that could reference them.
 
 ## IO Layer
 
