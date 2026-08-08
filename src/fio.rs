@@ -11,7 +11,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
     task::{self, Poll, Waker},
     thread::{self, JoinHandle},
@@ -29,7 +29,6 @@ use thiserror::Error;
 
 use crate::{
     file::DbFile,
-    meta::MetaHandler,
     util::{get_fs_block_size, has_valid_checksum, update_checksum},
 };
 
