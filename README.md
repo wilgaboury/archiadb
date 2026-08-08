@@ -12,11 +12,11 @@ The 60s called and they want their database technology back. ArchiaDB is a moder
 
 LLMs were used sparingly, mostly for research, reference pseudo-code, or code review. This project has been my reprieve from extensive agent usage at work, so it is almost entirely hand written.
 
-## What is a hierarchical database?
+## What is a heirarchical database?
 
 Like other OLTP data stores, the paradigm is defined by how records are organized. For comparison, document databases use a set of collections, relational databases use a graph of tables, and key-value stores don't have any higher level structure. A hierarchical database organizes records into a canonical tree of one to many relationships.
 
-## What makes ArchiaDB unique?
+## Features
 
 - strictly serializable transactions using conservative 2PL
     - concurrent multi-writer when transactions do not conflict
@@ -30,6 +30,6 @@ Like other OLTP data stores, the paradigm is defined by how records are organize
 
 The internal workings are outlined in more detail here: [Design Doc](design.md)
 
-## What 
+## Design Intentions
 
 ArchiaDB was designed with an eye towards server-side applications that benefit from dead simple database administration, like those intended for self-hosting, and I believe it offers a compelling feature combination for this use case. However, it is quite simple and immature. For high throughput, high uptime applications, LSM-tree based data stores or traditional OLTP DBMS's are likely worth the increase in complexity.
