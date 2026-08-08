@@ -219,24 +219,21 @@ mod tests {
     #[named]
     #[tokio::test]
     async fn test_db_open_meta_flag() -> Result<()> {
-        let dir = TempDir::new(function_name!()).unwrap();
-        let path = dir.path().join("file");
-        let db = Db::builder().path(&path).build().await?;
+        let tmp = TempDir::new(function_name!()).unwrap();
+        let db = tmp.db("db").await?;
         {
             let _t1 = db.txn().read(key_path![b"key1"])?.begin().await;
         }
         db.close();
 
         {
-            let file = dir.db_file(&path)?;
-            let meta = MetaHandler::new(file.file())?;
+            let meta = tmp.meta("db")?;
             assert_eq!(false, meta.open_async().await);
         }
 
-        let _db = Db::builder().path(dir.path().join("file")).build().await?;
+        let _db = tmp.db("db").await?;
         {
-            let file = dir.db_file(&path)?;
-            let meta = MetaHandler::new(file.file())?;
+            let meta = tmp.meta("db")?;
             assert_eq!(true, meta.open_async().await);
         }
 

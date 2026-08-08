@@ -327,7 +327,7 @@ mod tests {
     fn test_mutate_sync() -> Result<()> {
         let temp_dir = TempDir::new(function_name!())?;
 
-        let file = temp_dir.file("sync.db")?;
+        let file = temp_dir.file_raw("sync.db")?;
         let meta_hand = temp_dir.meta("sync.db")?;
 
         let mut buf = vec![0u8; meta_hand.pg_size as usize];
@@ -412,7 +412,7 @@ mod tests {
 
         let temp_dir = TempDir::new(function_name!())?;
         let loc = "meta.db";
-        let file = temp_dir.file(loc)?;
+        let file = temp_dir.file_raw(loc)?;
         let page_size = {
             let meta_hand = temp_dir.meta(loc)?;
             meta_hand.pg_size

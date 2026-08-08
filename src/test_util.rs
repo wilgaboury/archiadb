@@ -34,15 +34,18 @@ impl TempDir {
     pub async fn db<P: AsRef<Path>>(&self, path: P) -> Result<Db> {
         Db::builder()
             .path(self.path.join(path.as_ref()))
+            .sq(2)
+            .cq(4)
+            .page_buf_pool(2)
             .build()
             .await
     }
 
-    pub fn db_file<P: AsRef<Path>>(&self, path: P) -> Result<DbFile> {
+    pub fn file<P: AsRef<Path>>(&self, path: P) -> Result<DbFile> {
         DbFile::open(self.path.join(path.as_ref()))
     }
 
-    pub fn file<P: AsRef<Path>>(&self, path: P) -> Result<File> {
+    pub fn file_raw<P: AsRef<Path>>(&self, path: P) -> Result<File> {
         Ok(OpenOptions::new()
             .read(true)
             .write(true)
@@ -51,12 +54,12 @@ impl TempDir {
     }
 
     pub fn meta<P: AsRef<Path>>(&self, path: P) -> Result<MetaHandler> {
-        let file = self.file(path)?;
+        let file = self.file_raw(path)?;
         MetaHandler::new(&file)
     }
 
     pub fn fio<P: AsRef<Path>>(&self, path: P) -> Result<(Fio, MetaHandler)> {
-        let file = self.db_file(path)?;
+        let file = self.file(path)?;
         let meta = MetaHandler::new(file.file())?;
         Ok((
             Fio::builder()
@@ -71,7 +74,7 @@ impl TempDir {
     }
 
     pub fn fio_cust<P: AsRef<Path>>(&self, path: P) -> Result<(Arc<DbFile>, MetaHandler)> {
-        let file = self.db_file(path)?;
+        let file = self.file(path)?;
         let meta = MetaHandler::new(file.file())?;
         Ok((Arc::new(file), meta))
     }
