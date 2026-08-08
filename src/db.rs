@@ -41,6 +41,8 @@ impl Db {
         generic_op_state_pool: Option<usize>,
     ) -> Result<Self> {
         let file = Arc::new(DbFile::open(path)?);
+        file.file().try_lock()?; // prevent multiple processes from operating on the same file
+
         let meta = MetaHandler::new(&file.file())?;
         let fio = Fio::new(
             file.clone(),
@@ -50,6 +52,11 @@ impl Db {
             page_buf_pool,
             generic_op_state_pool,
         )?;
+
+        meta.mutate_async(&fio, |meta| {
+            meta.set_open(true);
+        })
+        .await?;
 
         if meta.open_async().await {
             // TODO: run recovery
@@ -65,6 +72,10 @@ impl Db {
                 write_locks: ConCache::new(Box::new(|| Mutex::new(()))),
             }),
         })
+    }
+
+    pub fn page_size(&self) -> usize {
+        self.inner.meta.page_size() as usize
     }
 
     pub fn txn(&self) -> TxnBuilder {
@@ -207,11 +218,26 @@ mod tests {
 
     #[named]
     #[tokio::test]
-    async fn test_init() -> Result<()> {
+    async fn test_db_open_meta_flag() -> Result<()> {
         let dir = TempDir::new(function_name!()).unwrap();
-        let db = Db::builder().path(dir.path().join("file")).build().await?;
+        let path = dir.path().join("file");
+        let db = Db::builder().path(&path).build().await?;
         {
             let _t1 = db.txn().read(key_path![b"key1"])?.begin().await;
+        }
+        db.close();
+
+        {
+            let file = dir.db_file(&path)?;
+            let meta = MetaHandler::new(file.file())?;
+            assert_eq!(false, meta.open_async().await);
+        }
+
+        let _db = Db::builder().path(dir.path().join("file")).build().await?;
+        {
+            let file = dir.db_file(&path)?;
+            let meta = MetaHandler::new(file.file())?;
+            assert_eq!(true, meta.open_async().await);
         }
 
         Ok(())

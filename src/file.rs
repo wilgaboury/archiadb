@@ -19,8 +19,6 @@ impl DbFile {
             .create(true)
             .open(path.as_ref())?;
 
-        file.try_lock()?; // prevent multiple processes from operating on the same file
-
         Ok(Self {
             path: path.as_ref().to_path_buf(),
             file,

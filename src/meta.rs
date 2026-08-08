@@ -213,6 +213,7 @@ impl MetaHandler {
 
             let offset = if inner.is_first { self.pg_size } else { 0 };
             file.write_at(&inner.back, offset)?;
+            file.sync_all()?;
 
             std::mem::swap(&mut inner.front, &mut inner.back);
             inner.is_first = !inner.is_first;
@@ -239,6 +240,7 @@ impl MetaHandler {
                 let mut buf = fio.get_buf();
                 buf.get_mut().copy_from_slice(&inner.back);
                 fio.write(pg_idx, buf).await?;
+                fio.commit().await?;
             }
 
             std::mem::swap(&mut inner.front, &mut inner.back);
