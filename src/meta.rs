@@ -59,9 +59,10 @@ impl Meta {
         self.pg_size = u64::to_le(page_size);
         self.root1 = u64::to_le(NUM_HEADER_PAGES + 1);
         self.root2 = u64::to_le(NUM_HEADER_PAGES + 2);
-        self.version = u64::to_le(0);
-        self.open = 1;
-        self.len = u64::to_le(NUM_HEADER_PAGES);
+
+        self.set_version(0);
+        self.set_open(true);
+        self.set_len(NUM_HEADER_PAGES);
     }
 
     pub(crate) fn magic(&self) -> MagicType {
@@ -208,7 +209,7 @@ impl MetaHandler {
             let meta = from_bytes_mut::<Meta>(&mut inner.back);
             f(meta);
             meta.set_version(inner.version);
-            let len = meta.len;
+            let len = meta.len();
             update_checksum(&mut inner.back);
 
             let offset = if inner.is_first { self.pg_size } else { 0 };
@@ -233,7 +234,7 @@ impl MetaHandler {
             let meta = from_bytes_mut::<Meta>(&mut inner.back);
             f(meta);
             meta.set_version(inner.version);
-            let len = meta.len;
+            let len = meta.len();
 
             let pg_idx = if inner.is_first { 1 } else { 0 };
             {
@@ -332,20 +333,20 @@ mod tests {
 
         let mut buf = vec![0u8; meta_hand.pg_size as usize];
 
-        meta_hand.mutate(&file, |m| m.len = 100)?;
+        meta_hand.mutate(&file, |m| m.set_len(100))?;
         file.read_at(&mut buf, meta_hand.pg_size)?;
         let meta = from_bytes::<Meta>(&buf);
-        assert_eq!({ meta.len }, 100);
+        assert_eq!(meta.len(), 100);
 
-        meta_hand.mutate(&file, |m| m.len = 101)?;
+        meta_hand.mutate(&file, |m| m.set_len(101))?;
         file.read_at(&mut buf, 0)?;
         let meta = from_bytes::<Meta>(&buf);
-        assert_eq!({ meta.len }, 101);
+        assert_eq!(meta.len(), 101);
 
-        meta_hand.mutate(&file, |m| m.len = 102)?;
+        meta_hand.mutate(&file, |m| m.set_len(0x1FFFFFFFFFFFFFFF))?;
         file.read_at(&mut buf, meta_hand.pg_size)?;
         let meta = from_bytes::<Meta>(&buf);
-        assert_eq!({ meta.len }, 102);
+        assert_eq!(meta.len(), 0x1FFFFFFFFFFFFFFF);
 
         Ok(())
     }
@@ -362,20 +363,22 @@ mod tests {
             .build()?;
 
         let result: Result<()> = rt.block_on(async {
-            meta_hand.mutate_async(&fio, |m| m.len = 100).await?;
+            meta_hand.mutate_async(&fio, |m| m.set_len(100)).await?;
             let buf = fio.read(1).await?;
             let meta = from_bytes::<Meta>(&buf.get());
-            assert_eq!({ meta.len }, 100);
+            assert_eq!(meta.len(), 100);
 
-            meta_hand.mutate_async(&fio, |m| m.len = 101).await?;
+            meta_hand.mutate_async(&fio, |m| m.set_len(101)).await?;
             let buf = fio.read(0).await?;
             let meta = from_bytes::<Meta>(&buf.get());
-            assert_eq!({ meta.len }, 101);
+            assert_eq!(meta.len(), 101);
 
-            meta_hand.mutate_async(&fio, |m| m.len = 102).await?;
+            meta_hand
+                .mutate_async(&fio, |m| m.set_len(0x1FFFFFFFFFFFFFFF))
+                .await?;
             let buf = fio.read(1).await?;
             let meta = from_bytes::<Meta>(&buf.get());
-            assert_eq!({ meta.len }, 102);
+            assert_eq!(meta.len(), 0x1FFFFFFFFFFFFFFF);
 
             Ok(())
         });
