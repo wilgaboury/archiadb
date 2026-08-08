@@ -14,6 +14,7 @@ pub mod lock;
 pub mod meta;
 pub mod trie;
 pub mod txnmap;
+pub mod uint;
 pub mod util;
 
 #[cfg(test)]
