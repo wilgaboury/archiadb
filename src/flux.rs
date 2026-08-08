@@ -90,7 +90,8 @@ impl Txn {
 
     pub(crate) fn flux_free(&mut self, idx: u64) {
         if self.flux.map.remove(&idx).is_none() {
-            self.db.inner.alloc.free(idx);
+            // TODO: replace alloc system
+            // self.db.inner.alloc.free(idx);
         }
     }
 }

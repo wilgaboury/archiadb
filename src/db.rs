@@ -5,7 +5,6 @@ use bon::bon;
 use tokio::sync::Mutex;
 
 use crate::{
-    alloc::{AllocationSet, PageAllocator},
     concache::ConCache,
     file::DbFile,
     fio::{DEFAULT_CQ_SIZE, DEFAULT_SQ_SIZE, Fio},
@@ -26,7 +25,6 @@ pub(crate) struct DbInner {
     pub(crate) file: Arc<DbFile>,
     pub(crate) meta: MetaHandler,
     pub(crate) fio: Fio,
-    pub(crate) alloc: PageAllocator,
     pub(crate) txn_free_defer_map: TxnFreeDeferMap,
     pub(crate) read_locks: ConCache<KeyPathBuf, Lock>,
     pub(crate) write_locks: ConCache<KeyPathBuf, Mutex<()>>,
@@ -52,13 +50,12 @@ impl Db {
             page_buf_pool,
             generic_op_state_pool,
         )?;
-        let alloc = PageAllocator::new(fio.clone(), &meta).await?;
+
         Ok(Self {
             inner: Arc::new(DbInner {
                 file,
                 meta,
                 fio,
-                alloc,
                 txn_free_defer_map: TxnFreeDeferMap::new(),
                 read_locks: ConCache::new(Box::new(|| Lock::new())),
                 write_locks: ConCache::new(Box::new(|| Mutex::new(()))),
@@ -112,7 +109,6 @@ impl TxnBuilder {
             txn_free_defer_id,
             db: self.db,
             guards,
-            allocs: AllocationSet::new(),
             free: Vec::new(),
             ops: self.ops,
             flux: Flux::new(),
@@ -125,7 +121,6 @@ pub struct Txn {
     pub(crate) txn_free_defer_id: u64,
     pub(crate) db: Db,
     pub(crate) guards: Vec<LockGuard>,
-    pub(crate) allocs: AllocationSet,
     pub(crate) free: Vec<u64>,
     pub(crate) ops: TxnKeyTrie<LockType>,
     pub(crate) flux: Flux,
@@ -181,12 +176,10 @@ impl Txn {
 
 impl Drop for Txn {
     fn drop(&mut self) {
-        self.db.inner.txn_free_defer_map.finish(
-            self.txn_free_defer_id,
-            &mut self.free,
-            &self.db.inner.alloc,
-        );
-        self.allocs.free(&self.db.inner.alloc);
+        self.db
+            .inner
+            .txn_free_defer_map
+            .finish(self.txn_free_defer_id, &mut self.free);
     }
 }
 

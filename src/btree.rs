@@ -962,11 +962,8 @@ impl Txn {
     }
 
     pub(crate) async fn alloc(&mut self) -> Result<u64> {
-        self.db
-            .inner
-            .alloc
-            .alloc(&self.db.inner.meta, &mut self.allocs)
-            .await
+        // TODO: implement new local allocation scheme
+        return Ok(0);
     }
 }
 

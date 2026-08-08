@@ -6,7 +6,7 @@ use std::{
 
 use anyhow::Result;
 
-use crate::{alloc::PageAllocator, db::Db, file::DbFile, fio::Fio, meta::MetaHandler};
+use crate::{db::Db, file::DbFile, fio::Fio, meta::MetaHandler};
 
 pub struct TempDir {
     path: PathBuf,
@@ -74,14 +74,6 @@ impl TempDir {
         let file = self.db_file(path)?;
         let meta = MetaHandler::new(file.file())?;
         Ok((Arc::new(file), meta))
-    }
-
-    pub async fn alloc<P: AsRef<Path>>(
-        &self,
-        path: P,
-    ) -> Result<(PageAllocator, Fio, MetaHandler)> {
-        let (fio, meta) = self.fio(path)?;
-        Ok((PageAllocator::new(fio.clone(), &meta).await?, fio, meta))
     }
 }
 

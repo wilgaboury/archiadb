@@ -1,5 +1,4 @@
 #![allow(dead_code)]
-pub mod alloc;
 pub mod btree;
 pub mod concache;
 pub mod db;
