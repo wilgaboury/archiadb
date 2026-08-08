@@ -129,7 +129,6 @@ struct Inner {
     file: Arc<DbFile>,
 
     page_size: usize,
-    len: AtomicU64, // number of pages
     stop: AtomicBool,
     queue: SegQueue<FioOp>,
 
@@ -234,18 +233,25 @@ impl Fio {
     #[builder]
     pub(crate) fn builder(
         file: Arc<DbFile>,
-        meta: &MetaHandler,
+        page_size: u64,
         #[builder(default = DEFAULT_SQ_SIZE)] sq: usize,
         #[builder(default = DEFAULT_CQ_SIZE)] cq: usize,
         page_buf_pool: Option<usize>,
         generic_op_state_pool: Option<usize>,
     ) -> Result<Self> {
-        Self::new(file, meta, sq, cq, page_buf_pool, generic_op_state_pool)
+        Self::new(
+            file,
+            page_size,
+            sq,
+            cq,
+            page_buf_pool,
+            generic_op_state_pool,
+        )
     }
 
     pub(crate) fn new(
         file: Arc<DbFile>,
-        meta: &MetaHandler,
+        page_size: u64,
         sq: usize,
         cq: usize,
         page_buf_pool: Option<usize>,
@@ -259,15 +265,14 @@ impl Fio {
             open.read(true);
             open.write(true);
             open.create(true);
-            if get_fs_block_size(file.path())? == meta.page_size() {
+            if get_fs_block_size(file.path())? == page_size {
                 open.custom_flags(O_DIRECT);
             }
             open.open(file.path())?
         };
 
         let fd = fio_file.as_raw_fd();
-        let len = meta.len();
-        let page_size = meta.page_size() as usize;
+        let page_size = page_size as usize;
 
         let stop = AtomicBool::new(false);
         let queue = SegQueue::new();
@@ -295,7 +300,6 @@ impl Fio {
             fio_file,
             file,
             page_size,
-            len: AtomicU64::new(len as u64),
             stop,
             queue,
             bufs,
@@ -1005,12 +1009,15 @@ impl IoLoop {
                     }
                     Some(FioOp::Alloc(AllocData { len, waker, state })) => {
                         if cqe.result() >= 0 {
-                            self.inner.len.fetch_max(len as u64, Ordering::AcqRel);
                             state
                                 .get()
                                 .store(GenericOpState::Ready as u32, Ordering::Release);
                         } else {
-                            eprintln!("Alloc failed with error: {}", cqe.result());
+                            eprintln!(
+                                "File alloc for len {} failed with error: {}",
+                                len,
+                                cqe.result()
+                            );
                             state
                                 .get()
                                 .store(GenericOpState::Err as u32, Ordering::Release);
@@ -1099,7 +1106,7 @@ mod tests {
 
         let fio = Fio::builder()
             .file(file)
-            .meta(&meta)
+            .page_size(meta.page_size())
             .sq(2)
             .cq(4)
             .page_buf_pool(2)
@@ -1152,7 +1159,7 @@ mod tests {
 
         let fio = Fio::builder()
             .file(file.clone())
-            .meta(&meta)
+            .page_size(meta.page_size())
             .sq(2)
             .cq(4)
             .page_buf_pool(0)
@@ -1215,7 +1222,7 @@ mod tests {
 
         let fio = Fio::builder()
             .file(file.clone())
-            .meta(&meta)
+            .page_size(meta.page_size())
             .sq(2)
             .cq(4)
             .page_buf_pool(0)

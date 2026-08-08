@@ -61,7 +61,7 @@ impl TempDir {
         Ok((
             Fio::builder()
                 .file(Arc::new(file))
-                .meta(&meta)
+                .page_size(meta.page_size())
                 .sq(2)
                 .cq(4)
                 .page_buf_pool(2)

@@ -92,8 +92,8 @@ impl Meta {
         self.version = u64::to_le(ver);
     }
 
-    pub(crate) fn open(&self) -> u8 {
-        self.open
+    pub(crate) fn open(&self) -> bool {
+        if self.open > 0 { true } else { false }
     }
 
     pub(crate) fn set_open(&mut self, is_open: bool) {
@@ -179,10 +179,30 @@ impl MetaHandler {
         self.len.load(Ordering::Acquire)
     }
 
+    pub(crate) async fn open_async(&self) -> bool {
+        let lock = self.inner.lock().await;
+        from_bytes::<Meta>(&lock.front).open()
+    }
+
+    pub(crate) fn try_mutate(&self, file: &File, f: impl FnOnce(&mut Meta)) -> Result<()> {
+        let mut inner_guard = self.inner.try_lock()?;
+        let inner = &mut *inner_guard;
+        self.mutate_helper(file, f, inner)
+    }
+
     pub(crate) fn mutate(&self, file: &File, f: impl FnOnce(&mut Meta)) -> Result<()> {
         let mut inner_guard = self.inner.blocking_lock();
+        let inner = &mut *inner_guard;
+        self.mutate_helper(file, f, inner)
+    }
+
+    fn mutate_helper(
+        &self,
+        file: &File,
+        f: impl FnOnce(&mut Meta),
+        inner: &mut Inner,
+    ) -> Result<()> {
         let len = {
-            let inner = &mut *inner_guard;
             inner.version += 1;
             inner.back.copy_from_slice(&inner.front);
             let meta = from_bytes_mut::<Meta>(&mut inner.back);
@@ -205,8 +225,8 @@ impl MetaHandler {
 
     pub(crate) async fn mutate_async(&self, fio: &Fio, f: impl FnOnce(&mut Meta)) -> Result<()> {
         let mut inner_guard = self.inner.lock().await;
+        let inner = &mut *inner_guard;
         let len = {
-            let inner = &mut *inner_guard;
             inner.version += 1;
             inner.back.copy_from_slice(&inner.front);
             let meta = from_bytes_mut::<Meta>(&mut inner.back);

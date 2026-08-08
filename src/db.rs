@@ -44,12 +44,16 @@ impl Db {
         let meta = MetaHandler::new(&file.file())?;
         let fio = Fio::new(
             file.clone(),
-            &meta,
+            meta.page_size(),
             sq,
             cq,
             page_buf_pool,
             generic_op_state_pool,
         )?;
+
+        if meta.open_async().await {
+            // TODO: run recovery
+        }
 
         Ok(Self {
             inner: Arc::new(DbInner {
@@ -72,6 +76,16 @@ impl Db {
 
     pub fn close(self) {
         drop(self)
+    }
+}
+
+impl Drop for DbInner {
+    fn drop(&mut self) {
+        if let Err(e) = self.meta.try_mutate(self.file.file(), |meta| {
+            meta.set_open(false);
+        }) {
+            eprintln!("Failed to set close flag: {}", e);
+        }
     }
 }
 
