@@ -1,18 +1,24 @@
 use std::{hash::Hash, ops::Deref, ptr::NonNull, sync::Arc};
 
+use derive_more::Debug; // This is the key!
+
 use dashmap::DashMap;
 
 /// Can be thought of like a keyed Arc. Values are retained in cache so long as there is
 /// at least one reference to it, and removed when no longer referenced. The effect is that
 /// for a given key, there is always exactly one value that all concurrent operation reference.
+
+#[derive(Debug)]
 pub struct ConCache<K, V>
 where
     K: Hash + Eq + Clone,
 {
+    #[debug(skip)]
     create: Box<dyn Fn() -> V>,
     maps: Arc<Maps<K, V>>,
 }
 
+#[derive(Debug)]
 struct Maps<K, V>
 where
     K: Hash + Eq + Clone,
@@ -62,6 +68,7 @@ where
     }
 }
 
+#[derive(Debug)]
 pub struct Carc<K, V>
 where
     K: Hash + Eq + Clone,
@@ -90,6 +97,7 @@ where
     }
 }
 
+#[derive(Debug)]
 struct CarcInner<K, V>
 where
     K: Hash + Eq + Clone,

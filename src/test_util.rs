@@ -27,13 +27,17 @@ impl TempDir {
         Ok(Self { path })
     }
 
-    pub fn path(&self) -> &Path {
+    pub fn root(&self) -> &Path {
         &self.path
+    }
+
+    pub fn path<P: AsRef<Path>>(&self, path: P) -> PathBuf {
+        self.path.join(path)
     }
 
     pub async fn db<P: AsRef<Path>>(&self, path: P) -> Result<Db> {
         Db::builder()
-            .path(self.path.join(path.as_ref()))
+            .path(self.path(path))
             .sq(2)
             .cq(4)
             .page_buf_pool(2)

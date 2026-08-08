@@ -110,6 +110,7 @@ impl Meta {
     }
 }
 
+#[derive(Debug)]
 pub(crate) struct MetaHandler {
     fmt_ver: FmtVer,
     pg_size: u64,
@@ -121,6 +122,7 @@ pub(crate) struct MetaHandler {
     inner: Mutex<Inner>,
 }
 
+#[derive(Debug)]
 struct Inner {
     version: u64,
     is_first: bool,
@@ -141,7 +143,15 @@ impl MetaHandler {
             let page_size = Self::read_page_size(&file)?;
             let buf1 = Self::read_buf(&file, page_size, 0)?;
             let buf2 = Self::read_buf(&file, page_size, page_size)?;
-            Self::choose_front_back(buf1, buf2)?
+            let front_back = Self::choose_front_back(buf1, buf2)?;
+
+            if from_bytes::<Meta>(&front_back.1).magic() != MAGIC {
+                return Err(anyhow!(
+                    "file is not an archia db file or magic number is corrupted",
+                ));
+            }
+
+            front_back
         };
 
         let meta = from_bytes::<Meta>(&front);

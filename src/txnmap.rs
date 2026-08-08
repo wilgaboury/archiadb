@@ -5,11 +5,12 @@ use parking_lot::Mutex;
 pub type TxnFreeDeferId = u64;
 
 /// Tracks currently running transactions and ensures that freeing of pages is deferred until no transactions reference them.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct TxnFreeDeferMap {
     inner: Arc<Mutex<Inner>>,
 }
 
+#[derive(Debug)]
 struct Inner {
     next: TxnFreeDeferId,
     map: BTreeMap<TxnFreeDeferId, Vec<u64>>,

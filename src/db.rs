@@ -16,11 +16,12 @@ use crate::{
     txnmap::TxnFreeDeferMap,
 };
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Db {
     pub(crate) inner: Arc<DbInner>,
 }
 
+#[derive(Debug)]
 pub(crate) struct DbInner {
     pub(crate) file: Arc<DbFile>,
     pub(crate) meta: MetaHandler,
@@ -41,8 +42,6 @@ impl Db {
         generic_op_state_pool: Option<usize>,
     ) -> Result<Self> {
         let file = Arc::new(DbFile::open(path)?);
-        file.file().try_lock()?; // prevent multiple processes from operating on the same file
-
         let meta = MetaHandler::new(&file.file())?;
         let fio = Fio::new(
             file.clone(),
@@ -210,7 +209,14 @@ impl Drop for Txn {
 
 #[cfg(test)]
 mod tests {
-    use crate::{key_path, test_util::TempDir};
+    use std::{fs::File, os::unix::fs::FileExt};
+
+    use crate::{
+        key_path,
+        meta::{MAGIC, MagicType},
+        test_util::TempDir,
+        util::update_checksum,
+    };
 
     use function_name::named;
 
@@ -218,7 +224,38 @@ mod tests {
 
     #[named]
     #[tokio::test]
-    async fn test_db_open_meta_flag() -> Result<()> {
+    async fn magic_check() -> Result<()> {
+        fn corrput_magic(page_size: usize, file: &File, loc: usize) -> Result<()> {
+            let mut buf = vec![0u8; page_size];
+            file.read_exact_at(&mut buf, (loc * page_size) as u64)?;
+            let bad_magic = MagicType::to_le_bytes(MAGIC + 1);
+            buf[0..size_of::<MagicType>()].copy_from_slice(&bad_magic);
+            update_checksum(&mut buf);
+            file.write_all_at(&buf, (loc * page_size) as u64)?;
+            Ok(())
+        }
+
+        const LOC: &str = "db";
+        let tmp = TempDir::new(function_name!()).unwrap();
+        let db = tmp.db(LOC).await?;
+        let page_size = db.page_size();
+        db.close();
+
+        corrput_magic(page_size, &tmp.file_raw(LOC)?, 0)?;
+        corrput_magic(page_size, &tmp.file_raw(LOC)?, 1)?;
+
+        let err = tmp.db(LOC).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("file is not an archia db file or magic number is corrupted")
+        );
+
+        Ok(())
+    }
+
+    #[named]
+    #[tokio::test]
+    async fn db_open_meta_flag() -> Result<()> {
         let tmp = TempDir::new(function_name!()).unwrap();
         let db = tmp.db("db").await?;
         {

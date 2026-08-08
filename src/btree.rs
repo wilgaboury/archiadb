@@ -1339,7 +1339,7 @@ mod tests {
     #[tokio::test]
     async fn test_upsert() -> Result<()> {
         let dir = TempDir::new(function_name!()).unwrap();
-        let db = Db::builder().path(dir.path().join("file")).build().await?;
+        let db = Db::builder().path(dir.root().join("file")).build().await?;
         {
             let mut txn = db.txn().write(key_path![])?.begin().await;
             let mut page = txn.flux_buf();

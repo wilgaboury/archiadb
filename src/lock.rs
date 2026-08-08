@@ -51,7 +51,7 @@ impl LockType {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Lock {
     inner: Arc<Mutex<LockInner>>,
 }
@@ -233,6 +233,7 @@ impl Drop for LockGuard {
     }
 }
 
+#[derive(Debug)]
 pub struct LockInner {
     lock_type: LockType,
     locked: u32,

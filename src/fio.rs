@@ -111,12 +111,13 @@ struct AllocData {
     state: GenericOpStateRef,
 }
 
+#[derive(Debug)]
 pub struct IoLoopHandle {
     join: Option<JoinHandle<()>>,
     inner: Arc<Inner>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Fio {
     inner: Arc<Inner>,
     join: Arc<IoLoopHandle>,
