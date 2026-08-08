@@ -1,6 +1,6 @@
 use std::{path::Path, sync::Arc};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use bon::bon;
 use tokio::sync::Mutex;
 
@@ -9,6 +9,7 @@ use crate::{
     file::DbFile,
     fio::{DEFAULT_CQ_SIZE, DEFAULT_SQ_SIZE, Fio},
     flux::Flux,
+    galloc::Galloc,
     key::{KeyPath, KeyPathBuf},
     lock::{Lock, LockGuard, LockType},
     meta::MetaHandler,
@@ -26,6 +27,7 @@ pub(crate) struct DbInner {
     pub(crate) file: Arc<DbFile>,
     pub(crate) meta: MetaHandler,
     pub(crate) fio: Fio,
+    pub(crate) galloc: Galloc,
     pub(crate) txn_free_defer_map: TxnFreeDeferMap,
     pub(crate) read_locks: ConCache<KeyPathBuf, Lock>,
     pub(crate) write_locks: ConCache<KeyPathBuf, Mutex<()>>,
@@ -52,20 +54,21 @@ impl Db {
             generic_op_state_pool,
         )?;
 
+        if meta.open_async().await {
+            // TODO: run recovery
+        }
+
         meta.mutate_async(&fio, |meta| {
             meta.set_open(true);
         })
         .await?;
-
-        if meta.open_async().await {
-            // TODO: run recovery
-        }
 
         Ok(Self {
             inner: Arc::new(DbInner {
                 file,
                 meta,
                 fio,
+                galloc: Galloc::new(),
                 txn_free_defer_map: TxnFreeDeferMap::new(),
                 read_locks: ConCache::new(Box::new(|| Lock::new())),
                 write_locks: ConCache::new(Box::new(|| Mutex::new(()))),
@@ -84,8 +87,10 @@ impl Db {
         }
     }
 
-    pub fn close(self) {
-        drop(self)
+    pub fn try_close(self) -> Result<()> {
+        let _inner = Arc::try_unwrap(self.inner)
+            .map_err(|_| anyhow!("could not close database, multiple references still exist"))?;
+        Ok(())
     }
 }
 
@@ -239,7 +244,7 @@ mod tests {
         let tmp = TempDir::new(function_name!()).unwrap();
         let db = tmp.db(LOC).await?;
         let page_size = db.page_size();
-        db.close();
+        db.try_close()?;
 
         corrput_magic(page_size, &tmp.file_raw(LOC)?, 0)?;
         corrput_magic(page_size, &tmp.file_raw(LOC)?, 1)?;
@@ -261,7 +266,7 @@ mod tests {
         {
             let _t1 = db.txn().read(key_path![b"key1"])?.begin().await;
         }
-        db.close();
+        db.try_close()?;
 
         {
             let meta = tmp.meta("db")?;

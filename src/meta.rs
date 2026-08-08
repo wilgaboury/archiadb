@@ -61,7 +61,7 @@ impl Meta {
         self.root2 = u64::to_le(NUM_HEADER_PAGES + 2);
 
         self.set_version(0);
-        self.set_open(true);
+        self.set_open(false);
         self.set_len(NUM_HEADER_PAGES);
     }
 

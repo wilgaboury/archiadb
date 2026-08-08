@@ -35,7 +35,7 @@ const LINKED_LIST_VALUE_LEN_SIZE: usize = size_of::<u64>();
 /// - checksum: u32
 
 #[repr(u8)]
-#[derive(PartialEq, Eq, Debug, Clone)]
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
 enum BTreeNodeKind {
     Root = 0,
     Inner,
@@ -224,21 +224,96 @@ struct BTreeHeader {
 
 impl BTreeHeader {
     pub fn init(&mut self, kind: BTreeNodeKind) {
-        self.kind = kind.into();
-        self.len = 0;
+        self.set_kind(kind);
+        self.set_len(0);
+    }
+
+    pub fn kind(&self) -> BTreeNodeKind {
+        self.kind
+    }
+
+    pub fn set_kind(&mut self, kind: BTreeNodeKind) {
+        self.kind = kind;
+    }
+
+    pub fn len(&self) -> u32 {
+        u32::from_le(self.len)
+    }
+
+    pub fn set_len(&mut self, len: u32) {
+        self.len = u32::to_le(len);
+    }
+}
+
+#[repr(C, packed)]
+pub(crate) struct Arena {
+    start: u64,
+    len: u64,
+    next: u64,
+}
+
+impl Arena {
+    pub(crate) fn init(&mut self) {
+        self.set_start(0);
+        self.set_len(0);
+        self.set_next(0);
+    }
+
+    pub(crate) fn start(&self) -> u64 {
+        u64::from_le(self.start)
+    }
+
+    pub(crate) fn set_start(&mut self, start: u64) {
+        self.start = u64::to_le(start);
+    }
+
+    pub(crate) fn len(&self) -> u64 {
+        u64::from_le(self.len)
+    }
+
+    pub(crate) fn set_len(&mut self, len: u64) {
+        self.len = u64::to_le(len);
+    }
+
+    pub(crate) fn next(&self) -> u64 {
+        u64::from_le(self.next)
+    }
+
+    pub(crate) fn set_next(&mut self, next: u64) {
+        self.next = u64::to_le(next);
     }
 }
 
 #[repr(C, packed)]
 struct BTreeRootHeader {
-    header: BTreeHeader,
+    pub(crate) header: BTreeHeader,
     version: u64,
+    free: u64,
+    pub(crate) arena: Arena,
 }
 
 impl BTreeRootHeader {
     pub fn init(&mut self) {
         self.header.init(BTreeNodeKind::Root);
         self.version = 0;
+        self.free = 0;
+        self.arena.init();
+    }
+
+    pub(crate) fn version(&self) -> u64 {
+        u64::from_le(self.version)
+    }
+
+    pub(crate) fn set_version(&mut self, version: u64) {
+        self.version = u64::to_le(version);
+    }
+
+    pub(crate) fn free(&self) -> u64 {
+        u64::from_le(self.free)
+    }
+
+    pub(crate) fn set_free(&mut self, free: u64) {
+        self.free = u64::to_le(free);
     }
 }
 
@@ -287,9 +362,13 @@ impl BTreeNodeBuf for [u8] {
         let header = self.header();
         match header.kind {
             BTreeNodeKind::Root | BTreeNodeKind::Inner => {
-                (if header.len > 0 { header.len - 1 } else { 0 }) as usize
+                (if header.len() > 0 {
+                    header.len() - 1
+                } else {
+                    0
+                }) as usize
             }
-            BTreeNodeKind::Leaf => header.len as usize,
+            BTreeNodeKind::Leaf => header.len() as usize,
         }
     }
 
@@ -339,7 +418,7 @@ impl BTreeNodeBuf for [u8] {
 
     fn root_to_inner(&mut self) {
         let slots_start = size_of::<BTreeRootHeader>();
-        let slots_end = slots_start + self.header().len as usize * SLOT_SIZE;
+        let slots_end = slots_start + self.header().len() as usize * SLOT_SIZE;
         let dest = size_of::<BTreeHeader>();
         self.copy_within(slots_start..slots_end, dest);
     }
@@ -347,7 +426,7 @@ impl BTreeNodeBuf for [u8] {
 
 fn insert_init_inner(buf: &mut [u8], ptr: u64) {
     let header = buf.header_mut();
-    header.len += 1;
+    header.set_len(header.len() + 1);
     let end = buf.len() - CHECKSUM_SIZE;
     let start = end - PAGE_PTR_SIZE;
     buf[start..end].copy_from_slice(&ptr.to_le_bytes());
@@ -398,7 +477,7 @@ fn insert_at_inner(buf: &mut [u8], idx: usize, left: PagePtr, key: &[u8], right:
 
     {
         let header = buf.header_mut();
-        header.len += 1;
+        header.set_len(header.len() + 1);
     }
 }
 
@@ -442,7 +521,7 @@ fn insert_at_leaf(buf: &mut [u8], idx: usize, key: &[u8], value: &LeafValueEncod
 
     {
         let header = buf.header_mut();
-        header.len += 1;
+        header.set_len(header.len() + 1);
     }
 }
 
@@ -484,7 +563,7 @@ fn remove_at_leaf(buf: &mut [u8], idx: usize) {
 
     {
         let header = buf.header_mut();
-        header.len -= 1;
+        header.set_len(header.len() - 1);
     }
 }
 
@@ -604,7 +683,7 @@ impl SearchResult {
 fn search_inner(buf: &[u8], target: &[u8]) -> SearchResult {
     let header = from_bytes::<BTreeHeader>(buf);
 
-    if header.len <= 1 {
+    if header.len() <= 1 {
         return SearchResult::Insert(0);
     }
 
@@ -742,7 +821,7 @@ impl Txn {
             }
             BTreeNodeKind::Root | BTreeNodeKind::Inner => {
                 let search = search_inner(node.get(), key);
-                let child_pg_idx = if node.get().header().len > 0 {
+                let child_pg_idx = if node.get().header().len() > 0 {
                     get_page_ptr(node.get(), search.idx())
                 } else {
                     bail!("empty inner node")
@@ -791,7 +870,7 @@ impl Txn {
             self.btree_upsert_leaf(key, value, pg).await
         } else {
             let search = search_inner(pg.get(), key).idx();
-            let child_pg = if pg.get().header().len > 0 {
+            let child_pg = if pg.get().header().len() > 0 {
                 let child_pg_idx = get_page_ptr(pg.get(), search);
                 self.free.push(child_pg_idx);
                 self.flux_read(child_pg_idx).await?
@@ -845,7 +924,7 @@ impl Txn {
             let value = left.get().get_value_leaf(idx).encode(left.get());
             insert_at_leaf(right.get_mut(), idx - start, key, &value);
         }
-        left.get_mut().header_mut().len = start as u32;
+        left.get_mut().header_mut().set_len(start as u32);
 
         {
             let insert = if split.as_ref().cmp(right.get().get_key_inner(0)) == Ordering::Less {
@@ -883,7 +962,7 @@ impl Txn {
         if can_insert {
             let search = search_leaf(pg.get(), key);
             if let SearchResult::Exact(idx) = search
-                && pg.get().header().len > 0
+                && pg.get().header().len() > 0
             {
                 remove_at_leaf(pg.get_mut(), idx);
             }
@@ -902,7 +981,7 @@ impl Txn {
                 let value = left.get().get_value_leaf(idx).encode(left.get());
                 insert_at_leaf(right.get_mut(), idx - start, key, &value);
             }
-            left.get_mut().header_mut().len = start as u32;
+            left.get_mut().header_mut().set_len(start as u32);
 
             {
                 let insert = if key.cmp(right.get().get_key_leaf(0)) == Ordering::Less {
@@ -974,7 +1053,7 @@ fn test_access() {
     let header = from_bytes::<BTreeRootHeader>(slice);
     assert_eq!({ header.header.kind.clone() }, BTreeNodeKind::Root);
     assert_eq!({ header.version }, 0);
-    assert_eq!({ header.header.len }, 0);
+    assert_eq!(header.header.len(), 0);
 }
 
 #[cfg(test)]
@@ -1131,7 +1210,7 @@ mod tests {
         {
             page.header_mut().init(BTreeNodeKind::Inner);
         }
-        assert_eq!(0, { page.header().len });
+        assert_eq!(0, page.header().len());
 
         insert_init_inner(&mut page, 1);
         assert_eq!(1, get_page_ptr(&page, 0));
