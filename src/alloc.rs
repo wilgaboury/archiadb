@@ -218,7 +218,7 @@ impl PageAllocator {
                 let new_len = len + 1 + self.pages_per_chunk();
                 self.fio.alloc(new_len).await?;
                 meta.mutate_async(&self.fio, |meta| {
-                    meta.len = meta.len.max(new_len);
+                    meta.set_len(meta.len().max(new_len));
                 })
                 .await?;
                 {

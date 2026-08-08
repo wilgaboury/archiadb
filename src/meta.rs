@@ -4,7 +4,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use tokio::sync::Mutex;
 
 use crate::{
@@ -13,44 +13,105 @@ use crate::{
     util::{CHECKSUM_SIZE, from_bytes, from_bytes_mut, has_valid_checksum, update_checksum},
 };
 
-type MagicType = u128;
-const MAGIC: MagicType = 0xa90e3b4b1b0833499933888e3933af0d; // Random GUID
-type FmtVersionType = u64;
-const FMT_VERSION: FmtVersionType = 0;
-pub const NUM_HEADER_PAGES: u64 = 2;
+pub(crate) type MagicType = u128;
+pub(crate) const MAGIC: MagicType = 0xa90e3b4b1b0833499933888e3933af0d; // Random GUID
+pub(crate) const NUM_HEADER_PAGES: u64 = 2;
+
+#[repr(u64)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FmtVer {
+    V1 = 0,
+}
+
+const CUR_FMT_VER: FmtVer = FmtVer::V1;
+
+impl TryFrom<u64> for FmtVer {
+    type Error = anyhow::Error;
+
+    fn try_from(value: u64) -> anyhow::Result<Self> {
+        match value {
+            0 => Ok(FmtVer::V1),
+            _ => Err(anyhow!("invalid format version")),
+        }
+    }
+}
 
 #[repr(C, packed)]
-pub struct Meta {
+pub(crate) struct Meta {
     magic: MagicType,
 
-    fmt_version: FmtVersionType,
-    page_size: u64,
+    fmt_ver: u64,
+    pg_size: u64,
     root1: u64,
     root2: u64,
 
     version: u64,
-    pub open: u8,
-    pub len: u64,
+    open: u8,
+    len: u64,
 }
 
 const_assert!(size_of::<Meta>() + CHECKSUM_SIZE < MIN_PAGE_SIZE as usize);
 
 impl Meta {
-    pub fn init(&mut self, page_size: u64) {
-        self.magic = MAGIC;
-        self.fmt_version = FMT_VERSION;
-        self.page_size = page_size;
-        self.root1 = NUM_HEADER_PAGES + 1;
-        self.root2 = NUM_HEADER_PAGES + 2;
-        self.version = 0;
+    pub(crate) fn init(&mut self, page_size: u64) {
+        self.magic = MagicType::to_le(MAGIC);
+        self.fmt_ver = u64::to_le(CUR_FMT_VER as u64);
+        self.pg_size = u64::to_le(page_size);
+        self.root1 = u64::to_le(NUM_HEADER_PAGES + 1);
+        self.root2 = u64::to_le(NUM_HEADER_PAGES + 2);
+        self.version = u64::to_le(0);
         self.open = 1;
-        self.len = NUM_HEADER_PAGES;
+        self.len = u64::to_le(NUM_HEADER_PAGES);
+    }
+
+    pub(crate) fn magic(&self) -> MagicType {
+        MagicType::from_le(self.magic)
+    }
+
+    pub(crate) fn fmt_ver(&self) -> FmtVer {
+        u64::from_le(self.fmt_ver).try_into().unwrap()
+    }
+
+    pub(crate) fn pg_size(&self) -> u64 {
+        u64::from_le(self.pg_size)
+    }
+
+    pub(crate) fn root1(&self) -> u64 {
+        u64::from_le(self.root1)
+    }
+
+    pub(crate) fn root2(&self) -> u64 {
+        u64::from_le(self.root2)
+    }
+
+    pub(crate) fn version(&self) -> u64 {
+        u64::from_le(self.version)
+    }
+
+    fn set_version(&mut self, ver: u64) {
+        self.version = u64::to_le(ver);
+    }
+
+    pub(crate) fn open(&self) -> u8 {
+        self.open
+    }
+
+    pub(crate) fn set_open(&mut self, is_open: bool) {
+        self.open = if is_open { 1 } else { 0 };
+    }
+
+    pub(crate) fn len(&self) -> u64 {
+        u64::from_le(self.len)
+    }
+
+    pub(crate) fn set_len(&mut self, len: u64) {
+        self.len = u64::to_le(len);
     }
 }
 
-pub struct MetaHandler {
-    fmt_version: FmtVersionType,
-    page_size: u64,
+pub(crate) struct MetaHandler {
+    fmt_ver: FmtVer,
+    pg_size: u64,
     root1: u64,
     root2: u64,
 
@@ -84,13 +145,13 @@ impl MetaHandler {
 
         let meta = from_bytes::<Meta>(&front);
         Ok(Self {
-            fmt_version: meta.fmt_version,
-            page_size: meta.page_size,
-            root1: meta.root1,
-            root2: meta.root2,
-            len: AtomicU64::new(meta.len),
+            fmt_ver: meta.fmt_ver(),
+            pg_size: meta.pg_size(),
+            root1: meta.root1(),
+            root2: meta.root2(),
+            len: AtomicU64::new(meta.len()),
             inner: Mutex::new(Inner {
-                version: meta.version,
+                version: meta.version(),
                 is_first,
                 front,
                 back,
@@ -98,27 +159,27 @@ impl MetaHandler {
         })
     }
 
-    pub fn fmt_version(&self) -> FmtVersionType {
-        self.fmt_version
+    pub(crate) fn fmt_ver(&self) -> FmtVer {
+        self.fmt_ver
     }
 
-    pub fn page_size(&self) -> u64 {
-        self.page_size
+    pub(crate) fn page_size(&self) -> u64 {
+        self.pg_size
     }
 
-    pub fn root1(&self) -> u64 {
+    pub(crate) fn root1(&self) -> u64 {
         self.root1
     }
 
-    pub fn root2(&self) -> u64 {
+    pub(crate) fn root2(&self) -> u64 {
         self.root2
     }
 
-    pub fn len(&self) -> u64 {
+    pub(crate) fn len(&self) -> u64 {
         self.len.load(Ordering::Acquire)
     }
 
-    pub fn mutate(&self, file: &File, f: impl FnOnce(&mut Meta)) -> Result<()> {
+    pub(crate) fn mutate(&self, file: &File, f: impl FnOnce(&mut Meta)) -> Result<()> {
         let mut inner_guard = self.inner.blocking_lock();
         let len = {
             let inner = &mut *inner_guard;
@@ -126,11 +187,11 @@ impl MetaHandler {
             inner.back.copy_from_slice(&inner.front);
             let meta = from_bytes_mut::<Meta>(&mut inner.back);
             f(meta);
-            meta.version = inner.version;
+            meta.set_version(inner.version);
             let len = meta.len;
             update_checksum(&mut inner.back);
 
-            let offset = if inner.is_first { self.page_size } else { 0 };
+            let offset = if inner.is_first { self.pg_size } else { 0 };
             file.write_at(&inner.back, offset)?;
 
             std::mem::swap(&mut inner.front, &mut inner.back);
@@ -142,7 +203,7 @@ impl MetaHandler {
         Ok(())
     }
 
-    pub async fn mutate_async(&self, fio: &Fio, f: impl FnOnce(&mut Meta)) -> Result<()> {
+    pub(crate) async fn mutate_async(&self, fio: &Fio, f: impl FnOnce(&mut Meta)) -> Result<()> {
         let mut inner_guard = self.inner.lock().await;
         let len = {
             let inner = &mut *inner_guard;
@@ -150,7 +211,7 @@ impl MetaHandler {
             inner.back.copy_from_slice(&inner.front);
             let meta = from_bytes_mut::<Meta>(&mut inner.back);
             f(meta);
-            meta.version = inner.version;
+            meta.set_version(inner.version);
             let len = meta.len;
 
             let pg_idx = if inner.is_first { 1 } else { 0 };
@@ -170,13 +231,13 @@ impl MetaHandler {
     }
 
     fn read_page_size(file: &File) -> Result<u64> {
-        let offset: u64 = (size_of::<MagicType>() + size_of::<FmtVersionType>()) as u64;
+        let offset: u64 = (size_of::<MagicType>() + size_of::<FmtVer>()) as u64;
         let mut buf = [0u8; size_of::<u64>()];
         let read = file.read_at(&mut buf, offset)?;
         if read < size_of::<u64>() {
             bail!("File too small to contain metadata");
         }
-        let page_size = u64::from_ne_bytes(buf);
+        let page_size = u64::from_le_bytes(buf);
         if page_size < MIN_PAGE_SIZE || page_size % MIN_PAGE_SIZE != 0 || page_size > MAX_PAGE_SIZE
         {
             bail!("Invalid page size in metadata");
@@ -208,7 +269,7 @@ impl MetaHandler {
             let keep_order = {
                 let meta1 = from_bytes::<Meta>(&buf1);
                 let meta2 = from_bytes::<Meta>(&buf2);
-                meta1.version >= meta2.version
+                meta1.version() >= meta2.version()
             };
             if keep_order {
                 Ok((true, buf1, buf2))
@@ -235,7 +296,7 @@ mod tests {
     use anyhow::Result;
     use function_name::named;
 
-    use crate::meta::{FMT_VERSION, MAGIC, Meta};
+    use crate::meta::{CUR_FMT_VER, MAGIC, Meta};
     use crate::test_util::TempDir;
     use crate::util::{from_bytes, from_bytes_mut, update_checksum};
 
@@ -247,10 +308,10 @@ mod tests {
         let file = temp_dir.file("sync.db")?;
         let meta_hand = temp_dir.meta("sync.db")?;
 
-        let mut buf = vec![0u8; meta_hand.page_size as usize];
+        let mut buf = vec![0u8; meta_hand.pg_size as usize];
 
         meta_hand.mutate(&file, |m| m.len = 100)?;
-        file.read_at(&mut buf, meta_hand.page_size)?;
+        file.read_at(&mut buf, meta_hand.pg_size)?;
         let meta = from_bytes::<Meta>(&buf);
         assert_eq!({ meta.len }, 100);
 
@@ -260,7 +321,7 @@ mod tests {
         assert_eq!({ meta.len }, 101);
 
         meta_hand.mutate(&file, |m| m.len = 102)?;
-        file.read_at(&mut buf, meta_hand.page_size)?;
+        file.read_at(&mut buf, meta_hand.pg_size)?;
         let meta = from_bytes::<Meta>(&buf);
         assert_eq!({ meta.len }, 102);
 
@@ -307,7 +368,7 @@ mod tests {
         let temp_dir = TempDir::new(function_name!())?;
         let meta_hand = temp_dir.meta("sync.db")?;
 
-        assert_eq!(meta_hand.fmt_version(), FMT_VERSION);
+        assert_eq!(meta_hand.fmt_ver(), CUR_FMT_VER);
         assert_eq!(meta_hand.root1(), 3);
         assert_eq!(meta_hand.root2(), 4);
 
@@ -323,7 +384,7 @@ mod tests {
         }
 
         fn fix_corrupt_page(file: &File, page_size: u64, page_num: u64) -> Result<()> {
-            file.write_all_at(&MAGIC.to_ne_bytes()[0..1], page_num * page_size)?;
+            file.write_all_at(&MAGIC.to_le_bytes()[0..1], page_num * page_size)?;
             Ok(())
         }
 
@@ -332,7 +393,7 @@ mod tests {
         let file = temp_dir.file(loc)?;
         let page_size = {
             let meta_hand = temp_dir.meta(loc)?;
-            meta_hand.page_size
+            meta_hand.pg_size
         };
 
         corrupt_page(&file, page_size, 0)?;
@@ -361,7 +422,7 @@ mod tests {
         {
             let meta = from_bytes_mut::<Meta>(&mut buf);
             meta.init(page_size);
-            meta.version += 1;
+            meta.set_version(meta.version() + 1);
         }
         update_checksum(&mut buf);
 

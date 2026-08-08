@@ -40,7 +40,7 @@ pub const CHECKSUM_SIZE: usize = size_of::<Checksum>();
 pub fn update_checksum(buf: &mut [u8]) {
     let len = buf.len();
     let checksum = xxh3_64(&buf[..len - CHECKSUM_SIZE]);
-    buf[len - CHECKSUM_SIZE..].clone_from_slice(&checksum.to_ne_bytes());
+    buf[len - CHECKSUM_SIZE..].clone_from_slice(&checksum.to_le_bytes());
 }
 
 pub fn has_valid_checksum(buf: &[u8]) -> bool {
@@ -48,7 +48,7 @@ pub fn has_valid_checksum(buf: &[u8]) -> bool {
     let checksum_bytes: [u8; CHECKSUM_SIZE] = buf[len - CHECKSUM_SIZE..]
         .try_into()
         .expect("buffer cannot fit checksum");
-    let checksum = Checksum::from_ne_bytes(checksum_bytes);
+    let checksum = Checksum::from_le_bytes(checksum_bytes);
     let content_checksum = xxh3_64(&buf[..len - CHECKSUM_SIZE]);
     content_checksum == checksum
 }

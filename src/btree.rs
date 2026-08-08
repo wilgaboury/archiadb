@@ -188,18 +188,18 @@ impl LeafValueEncoded<'_> {
         buf[0] = self.kind() as u8;
         match self {
             LeafValueEncoded::Btree { pg_idx_1, pg_idx_2 } => {
-                buf[1..1 + PAGE_PTR_SIZE].copy_from_slice(&pg_idx_1.to_ne_bytes());
+                buf[1..1 + PAGE_PTR_SIZE].copy_from_slice(&pg_idx_1.to_le_bytes());
                 buf[1 + PAGE_PTR_SIZE..1 + 2 * PAGE_PTR_SIZE]
-                    .copy_from_slice(&pg_idx_2.to_ne_bytes());
+                    .copy_from_slice(&pg_idx_2.to_le_bytes());
             }
             LeafValueEncoded::ValueEmbedded(v) => {
                 buf[1] = v.len() as u8;
                 buf[2..2 + v.len()].copy_from_slice(v);
             }
             LeafValueEncoded::ValueLinkedList { pg_idx, len } => {
-                buf[1..1 + PAGE_PTR_SIZE].copy_from_slice(&pg_idx.to_ne_bytes());
+                buf[1..1 + PAGE_PTR_SIZE].copy_from_slice(&pg_idx.to_le_bytes());
                 buf[1 + PAGE_PTR_SIZE..1 + PAGE_PTR_SIZE + LINKED_LIST_VALUE_LEN_SIZE]
-                    .copy_from_slice(&len.to_ne_bytes());
+                    .copy_from_slice(&len.to_le_bytes());
             }
         }
     }
@@ -350,7 +350,7 @@ fn insert_init_inner(buf: &mut [u8], ptr: u64) {
     header.len += 1;
     let end = buf.len() - CHECKSUM_SIZE;
     let start = end - PAGE_PTR_SIZE;
-    buf[start..end].copy_from_slice(&ptr.to_ne_bytes());
+    buf[start..end].copy_from_slice(&ptr.to_le_bytes());
 }
 
 /// will unconditionally copy the key into the node without checking if there is space, always inserts as ptr|key
@@ -380,9 +380,9 @@ fn insert_at_inner(buf: &mut [u8], idx: usize, left: PagePtr, key: &[u8], right:
             all_key_and_ptr_start..key_and_ptr_end,
             all_key_and_ptr_start - key_and_ptr_len,
         );
-        buf[key_and_ptr_start..key_start].copy_from_slice(&right.to_ne_bytes());
+        buf[key_and_ptr_start..key_start].copy_from_slice(&right.to_le_bytes());
         buf[key_start..key_and_ptr_end].copy_from_slice(key);
-        buf[key_and_ptr_end..key_and_ptr_end + PAGE_PTR_SIZE].copy_from_slice(&left.to_ne_bytes());
+        buf[key_and_ptr_end..key_and_ptr_end + PAGE_PTR_SIZE].copy_from_slice(&left.to_le_bytes());
 
         for i in idx..slots_len {
             let slot_value = read_slot(buf, i);
@@ -495,7 +495,7 @@ fn read_slot(buf: &[u8], idx: usize) -> usize {
     let end = start + SLOT_SIZE;
     let mut u32_buf = [0u8; 4];
     u32_buf.copy_from_slice(&buf[start..end]);
-    u32::from_ne_bytes(u32_buf) as usize
+    u32::from_le_bytes(u32_buf) as usize
 }
 
 fn write_slot(buf: &mut [u8], idx: usize, value: usize) {
@@ -503,7 +503,7 @@ fn write_slot(buf: &mut [u8], idx: usize, value: usize) {
     let slots_idx = header.kind.header_size();
     let start = slots_idx + SLOT_SIZE * idx;
     let end = start + SLOT_SIZE;
-    buf[start..end].copy_from_slice(&(value as Slot).to_ne_bytes());
+    buf[start..end].copy_from_slice(&(value as Slot).to_le_bytes());
 }
 
 fn get_page_ptr(buf: &[u8], idx: usize) -> u64 {
@@ -514,7 +514,7 @@ fn get_page_ptr(buf: &[u8], idx: usize) -> u64 {
         read_slot(buf, idx - 1) - PAGE_PTR_SIZE
     };
     u64_buf.copy_from_slice(&buf[loc..loc + PAGE_PTR_SIZE]);
-    u64::from_ne_bytes(u64_buf)
+    u64::from_le_bytes(u64_buf)
 }
 
 fn write_page_ptr(buf: &mut [u8], idx: usize, value: u64) {
@@ -523,7 +523,7 @@ fn write_page_ptr(buf: &mut [u8], idx: usize, value: u64) {
     } else {
         read_slot(buf, idx - 1) - PAGE_PTR_SIZE
     };
-    buf[loc..loc + PAGE_PTR_SIZE].copy_from_slice(&value.to_ne_bytes());
+    buf[loc..loc + PAGE_PTR_SIZE].copy_from_slice(&value.to_le_bytes());
 }
 
 fn get_key_inner(buf: &[u8], idx: usize) -> &[u8] {
@@ -555,7 +555,7 @@ fn get_key_leaf(buf: &[u8], idx: usize) -> &[u8] {
 fn read_u64_at(buf: &[u8], idx: usize) -> u64 {
     let mut u64_buf = [0u8; 8];
     u64_buf.copy_from_slice(&buf[idx..idx + 8]);
-    u64::from_ne_bytes(u64_buf)
+    u64::from_le_bytes(u64_buf)
 }
 
 fn get_value_leaf(buf: &[u8], idx: usize) -> LeafValueGetResult {
@@ -936,7 +936,7 @@ impl Txn {
             let b = buf.get_mut();
             let len = chunk.len();
             b[..len].copy_from_slice(chunk);
-            b[len..len + PAGE_PTR_SIZE].copy_from_slice(&prev_pg_idx.to_ne_bytes());
+            b[len..len + PAGE_PTR_SIZE].copy_from_slice(&prev_pg_idx.to_le_bytes());
             prev_pg_idx = pg_idx;
             self.db.inner.fio.write(pg_idx, buf).await?;
         }
@@ -955,7 +955,7 @@ impl Txn {
             empty -= cp_len;
             pg_idx = b[len..len + PAGE_PTR_SIZE]
                 .try_into()
-                .map(u64::from_ne_bytes)
+                .map(u64::from_le_bytes)
                 .context("buffer cannot fit page pointer")?;
         }
         Ok(())
