@@ -25,8 +25,13 @@ use io_uring::IoUring;
 use libc::{O_DIRECT, iovec};
 use parking_lot::Mutex;
 use rustix::fs::fstatvfs;
+use thiserror::Error;
 
-use crate::{file::DbFile, meta::MetaHandler, util::get_fs_block_size};
+use crate::{
+    file::DbFile,
+    meta::MetaHandler,
+    util::{get_fs_block_size, has_valid_checksum, update_checksum},
+};
 
 pub const MIN_PAGE_SIZE: u64 = 4096; // smallest supported page size and most common filesystem block size
 pub const MAX_PAGE_SIZE: u64 = 65536;
@@ -34,6 +39,14 @@ pub const MAX_PAGE_SIZE: u64 = 65536;
 pub const DEFAULT_SQ_SIZE: usize = 128;
 pub const DEFAULT_CQ_SIZE: usize = 256;
 const IO_URING_SPIN_LIMIT: u64 = 32;
+
+#[derive(Error, Debug)]
+pub(crate) enum ReadError {
+    #[error("invalid checksum")]
+    BadChecksum,
+    #[error("io error")]
+    Unknown(#[from] anyhow::Error),
+}
 
 enum FioOp {
     Read(ReadData),
@@ -84,7 +97,8 @@ enum ReadState {
 struct WriteData {
     pg_idx: u64,
     buf: PageBuf,
-    waker_state: Option<(Waker, GenericOpStateRef)>,
+    waker: Waker,
+    state: GenericOpStateRef,
 }
 
 struct CommitData {
@@ -325,8 +339,18 @@ impl Fio {
         self.join.as_ref().join.as_ref().unwrap()
     }
 
-    pub async fn read(&self, pg_idx: u64) -> Result<PageBuf> {
-        pub struct ReadFuture<'a> {
+    pub(crate) async fn read(&self, pg_idx: u64) -> std::result::Result<PageBuf, ReadError> {
+        let pg = self.read_unchecked(pg_idx).await?;
+
+        if !has_valid_checksum(pg.get()) {
+            return Err(ReadError::BadChecksum);
+        }
+
+        std::result::Result::Ok(pg)
+    }
+
+    pub(crate) async fn read_unchecked(&self, pg_idx: u64) -> Result<PageBuf> {
+        struct ReadFuture<'a> {
             fio: &'a Fio,
             idx: u64,
             state: Arc<Mutex<ReadState>>,
@@ -377,19 +401,13 @@ impl Fio {
         .await
     }
 
-    /// this function is fire-and-forget, the only way to wait for completion is using commit_flush
-    pub fn submit_write(&self, pg_idx: u64, buf: PageBuf) {
-        let op = FioOp::Write(WriteData {
-            pg_idx,
-            buf,
-            waker_state: None,
-        });
-        self.inner.queue.push(op);
-        self.join().thread().unpark();
+    pub(crate) async fn write(&self, pg_idx: u64, mut buf: PageBuf) -> Result<()> {
+        update_checksum(buf.get_mut());
+        self.write_unchecked(pg_idx, buf).await
     }
 
-    pub async fn write(&self, pg_idx: u64, buf: PageBuf) -> Result<()> {
-        pub struct WriteFuture<'a> {
+    pub(crate) async fn write_unchecked(&self, pg_idx: u64, buf: PageBuf) -> Result<()> {
+        struct WriteFuture<'a> {
             fio: &'a Fio,
             pg_idx: u64,
             buf: Option<PageBuf>,
@@ -410,7 +428,8 @@ impl Fio {
                         let op = FioOp::Write(WriteData {
                             pg_idx: self.pg_idx,
                             buf: std::mem::replace(&mut self.buf, None).unwrap(),
-                            waker_state: Some((cx.waker().clone(), self.state.clone())),
+                            waker: cx.waker().clone(),
+                            state: self.state.clone(),
                         });
                         self.fio.inner.queue.push(op);
                         self.fio.join().thread().unpark();
@@ -434,8 +453,8 @@ impl Fio {
         .await
     }
 
-    pub async fn commit(&self) -> Result<()> {
-        pub struct CommitFuture<'a> {
+    pub(crate) async fn commit(&self) -> Result<()> {
+        struct CommitFuture<'a> {
             fio: &'a Fio,
             state: GenericOpStateRef,
         }
@@ -609,10 +628,10 @@ impl Drop for IoLoopHandle {
 }
 
 struct IoLoop {
-    page_size: usize,
+    pg_size: usize,
     sq_size: usize,
     cq_size: usize,
-    page_buf_pool_size: usize,
+    pg_buf_pool_size: usize,
     fd: i32,
     inner: Arc<Inner>,
 
@@ -660,10 +679,10 @@ impl IoLoop {
         }
 
         Ok(Self {
-            page_size,
+            pg_size: page_size,
             sq_size,
             cq_size,
-            page_buf_pool_size,
+            pg_buf_pool_size: page_buf_pool_size,
             fd,
             inner,
             ring,
@@ -683,17 +702,11 @@ impl IoLoop {
                 }
                 waker.wake();
             }
-            FioOp::Write(WriteData {
-                waker_state: Some((waker, state)),
-                ..
-            }) => {
+            FioOp::Write(WriteData { waker, state, .. }) => {
                 state
                     .get()
                     .store(GenericOpState::Err as u32, Ordering::Release);
                 waker.wake();
-            }
-            FioOp::Write(_) => {
-                // no-op
             }
             FioOp::Commit(CommitData { waker, state, .. })
             | FioOp::CommitFlush(CommitData { waker, state, .. }) => {
@@ -778,17 +791,17 @@ impl IoLoop {
                         submitted += 1;
 
                         let id = ids.pop_front().unwrap();
-                        let offset = data.pgidx * self.page_size as u64;
+                        let offset = data.pgidx * self.pg_size as u64;
 
                         let (buf, len, idx) = match &data.buf {
                             PageBuf::Pool(shared) => (
                                 shared.ptr(),
-                                self.page_size as u32,
+                                self.pg_size as u32,
                                 (self.cq_size + shared.idx) as u16,
                             ),
                             PageBuf::Dynamic(_) => (
-                                self.bufs[id * self.page_size..].as_mut_ptr(),
-                                self.page_size as u32,
+                                self.bufs[id * self.pg_size..].as_mut_ptr(),
+                                self.pg_size as u32,
                                 id as u16,
                             ),
                         };
@@ -814,20 +827,21 @@ impl IoLoop {
                         submitted += 1;
 
                         let id = ids.pop_front().unwrap();
-                        let offset = data.pg_idx * self.page_size as u64;
+                        let offset = data.pg_idx * self.pg_size as u64;
 
                         let (buf, len, idx) = match &data.buf {
                             PageBuf::Pool(shared) => (
                                 shared.ptr(),
-                                self.page_size as u32,
+                                self.pg_size as u32,
                                 (self.cq_size + shared.idx) as u16,
                             ),
-                            PageBuf::Dynamic(vec) => {
-                                self.bufs[id * self.page_size..(id + 1) * self.page_size]
-                                    .copy_from_slice(vec);
+                            PageBuf::Dynamic(pg) => {
+                                self.bufs[id * self.pg_size..(id + 1) * self.pg_size]
+                                    .copy_from_slice(pg);
+                                drop(pg);
                                 (
-                                    self.bufs[id * self.page_size..].as_mut_ptr(),
-                                    self.page_size as u32,
+                                    self.bufs[id * self.pg_size..].as_mut_ptr(),
+                                    self.pg_size as u32,
                                     id as u16,
                                 )
                             }
@@ -881,7 +895,7 @@ impl IoLoop {
                         let id = ids.pop_front().unwrap();
                         let alloc = io_uring::opcode::Fallocate::new(
                             io_uring::types::Fd(self.fd),
-                            data.len * self.page_size as u64,
+                            data.len * self.pg_size as u64,
                         )
                         .build()
                         .user_data(id as u64);
@@ -937,7 +951,7 @@ impl IoLoop {
                             if cqe.result() >= 0 {
                                 if let PageBuf::Dynamic(buf) = &mut buf {
                                     buf.copy_from_slice(
-                                        &self.bufs[id * self.page_size..(id + 1) * self.page_size],
+                                        &self.bufs[id * self.pg_size..(id + 1) * self.pg_size],
                                     );
                                 }
                                 *inner = ReadState::Ready(buf);
@@ -948,10 +962,7 @@ impl IoLoop {
                         }
                         waker.wake();
                     }
-                    Some(FioOp::Write(WriteData {
-                        waker_state: Some((waker, state)),
-                        ..
-                    })) => {
+                    Some(FioOp::Write(WriteData { waker, state, .. })) => {
                         if cqe.result() >= 0 {
                             state
                                 .get()
@@ -963,9 +974,6 @@ impl IoLoop {
                                 .store(GenericOpState::Err as u32, Ordering::Release);
                         }
                         waker.wake();
-                    }
-                    Some(FioOp::Write(_)) => {
-                        // no-op
                     }
                     Some(FioOp::Commit(CommitData { state, waker }))
                     | Some(FioOp::CommitFlush(CommitData { state, waker })) => {
@@ -1115,7 +1123,10 @@ mod tests {
             .write(true)
             .append(true)
             .open(fio.file().path())?;
-        file.write_all(&vec![1u8; fio.page_size()])?;
+
+        let mut test_buf = vec![1u8; fio.page_size()];
+        update_checksum(&mut test_buf);
+        file.write_all(&test_buf)?;
         file.flush()?;
         file.sync_all()?;
 
@@ -1129,7 +1140,7 @@ mod tests {
             );
         }
 
-        assert_eq!(vec![1u8; fio.page_size()], data.get());
+        assert_eq!(&test_buf, data.get());
 
         Ok(())
     }
@@ -1151,7 +1162,9 @@ mod tests {
             .write(true)
             .append(true)
             .open(file.path())?;
-        file.write_all(&vec![1u8; fio.page_size()])?;
+        let mut test_buf = vec![1u8; fio.page_size()];
+        update_checksum(&mut test_buf);
+        file.write_all(&test_buf)?;
         file.flush()?;
         file.sync_all()?;
 
@@ -1165,30 +1178,7 @@ mod tests {
             );
         }
 
-        assert_eq!(vec![1u8; fio.page_size()], data.get());
-
-        Ok(())
-    }
-
-    #[named]
-    #[tokio::test]
-    async fn test_single_submit_write_page() -> Result<()> {
-        let temp_dir = TempDir::new(function_name!())?;
-        let (fio, _) = temp_dir.fio("db")?;
-
-        let mut buf = fio.get_buf();
-        buf.get_mut()[0..].fill(1u8);
-        fio.submit_write(0, buf);
-        fio.commit_flush().await?;
-
-        let mut file = OpenOptions::new()
-            .read(true)
-            .append(true)
-            .open(fio.file().path())?;
-        let mut buf = vec![0u8; fio.page_size()];
-        file.read_exact(&mut buf)?;
-
-        assert_eq!(vec![1u8; fio.page_size()], buf);
+        assert_eq!(&test_buf, data.get());
 
         Ok(())
     }
@@ -1211,14 +1201,16 @@ mod tests {
         let mut buf = vec![0u8; fio.page_size()];
         file.read_exact(&mut buf)?;
 
-        assert_eq!(vec![1u8; fio.page_size()], buf);
+        let mut res = vec![1u8; fio.page_size()];
+        update_checksum(&mut res);
+        assert_eq!(res, buf);
 
         Ok(())
     }
 
     #[named]
     #[tokio::test]
-    async fn test_single_submit_write_page_dynamic() -> Result<()> {
+    async fn test_single_write_page_dynamic() -> Result<()> {
         let temp_dir = TempDir::new(function_name!())?;
         let (file, meta) = temp_dir.fio_cust("db")?;
 
@@ -1231,7 +1223,7 @@ mod tests {
             .build()?;
         let mut buf = fio.get_buf();
         buf.get_mut()[0..].fill(1u8);
-        fio.submit_write(0, buf);
+        fio.write(0, buf).await?;
         fio.commit_flush().await?;
 
         let mut file = OpenOptions::new()
@@ -1241,7 +1233,9 @@ mod tests {
         let mut buf = vec![0u8; fio.page_size()];
         file.read_exact(&mut buf)?;
 
-        assert_eq!(vec![1u8; fio.page_size()], buf);
+        let mut res = vec![1u8; fio.page_size()];
+        update_checksum(&mut res);
+        assert_eq!(res, buf);
 
         Ok(())
     }
@@ -1260,7 +1254,7 @@ mod tests {
             fs::metadata(fio.file().path())?.len() as usize
         );
 
-        let _read_test = fio.read(0).await?;
+        let _read_test = fio.read_unchecked(0).await?;
 
         fio.alloc(1000).await?;
         assert!(1000 <= fs::metadata(fio.file().path())?.len());
@@ -1269,7 +1263,7 @@ mod tests {
             fs::metadata(fio.file().path())?.len() as usize
         );
 
-        let _read_test = fio.read(5).await?;
+        let _read_test = fio.read_unchecked(5).await?;
 
         Ok(())
     }

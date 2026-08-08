@@ -152,7 +152,6 @@ impl MetaHandler {
             f(meta);
             meta.version = inner.version;
             let len = meta.len;
-            update_checksum(&mut inner.back);
 
             let pg_idx = if inner.is_first { 1 } else { 0 };
             {

@@ -11,10 +11,7 @@ use crate::{
     fio::{Fio, MIN_PAGE_SIZE, PageBuf},
     flux::FluxBuf,
     key::KeyPath,
-    util::{
-        CHECKSUM_SIZE, from_bytes, from_bytes_mut, has_valid_checksum, update_checksum,
-        validate_checksum,
-    },
+    util::{CHECKSUM_SIZE, from_bytes, from_bytes_mut, has_valid_checksum},
 };
 
 type Slot = u32;
@@ -653,8 +650,8 @@ struct RootDoublePageBuf {
 
 impl RootDoublePageBuf {
     pub async fn new_no_retry(fio: &Fio, pg_idx1: u64, pg_idx2: u64) -> Result<Self> {
-        let pg1 = fio.read(pg_idx1).await?;
-        let pg2 = fio.read(pg_idx2).await?;
+        let pg1 = fio.read_unchecked(pg_idx1).await?;
+        let pg2 = fio.read_unchecked(pg_idx2).await?;
         let ((front_pg_idx, front), (back_pg_idx, back)) =
             Self::order_front_back(pg_idx1, pg1, pg_idx2, pg2)?;
         Ok(Self {
@@ -777,7 +774,6 @@ impl Txn {
                 pg_buf.get_mut().root_header_mut().init();
                 pg_buf.get_mut().root_header_mut().version = version + 1;
                 insert_at_inner(pg_buf.get_mut(), 0, left, &split, right);
-                update_checksum(pg_buf.get_mut());
 
                 Ok(pg_buf)
             }
@@ -811,7 +807,6 @@ impl Txn {
                     let child_pg_idx = self.flux_write(child_pg).await?;
 
                     write_page_ptr(pg.get_mut(), search, child_pg_idx);
-                    update_checksum(pg.get_mut());
                     Ok(InsertResult::Single(pg))
                 }
                 InsertResult::Split(left, split, right) => {
@@ -822,7 +817,6 @@ impl Txn {
                     let can_insert = pg.get().remaining() > PAGE_PTR_SIZE + split.len() + SLOT_SIZE;
                     if can_insert {
                         insert_at_inner(pg.get_mut(), search, left, &split, right);
-                        update_checksum(pg.get_mut());
                         Ok(InsertResult::Single(pg))
                     } else {
                         self.btree_split_inner(left, split, right, pg).await
@@ -871,9 +865,7 @@ impl Txn {
 
         let key = right.get().get_key_leaf(0).to_vec().into_boxed_slice();
 
-        update_checksum(left.get_mut());
         let ret_left_idx = self.flux_write(left).await?;
-        update_checksum(right.get_mut());
         let ret_right_idx = self.flux_write(right).await?;
 
         Ok(InsertResult::Split(ret_left_idx, key, ret_right_idx))
@@ -896,7 +888,6 @@ impl Txn {
                 remove_at_leaf(pg.get_mut(), idx);
             }
             insert_at_leaf(pg.get_mut(), search.idx(), key, &encoded_value);
-            update_checksum(pg.get_mut());
             Ok(InsertResult::Single(pg))
         } else {
             let mut left = pg;
@@ -929,9 +920,7 @@ impl Txn {
 
             let key = right.get().get_key_leaf(0).to_vec().into_boxed_slice();
 
-            update_checksum(left.get_mut());
             let left_idx = self.flux_write(left).await?;
-            update_checksum(right.get_mut());
             let right_idx = self.flux_write(right).await?;
 
             Ok(InsertResult::Split(left_idx, key, right_idx))
@@ -948,7 +937,6 @@ impl Txn {
             let len = chunk.len();
             b[..len].copy_from_slice(chunk);
             b[len..len + PAGE_PTR_SIZE].copy_from_slice(&prev_pg_idx.to_ne_bytes());
-            update_checksum(b);
             prev_pg_idx = pg_idx;
             self.db.inner.fio.write(pg_idx, buf).await?;
         }
@@ -960,7 +948,6 @@ impl Txn {
         while empty > 0 {
             let page = self.db.inner.fio.read(pg_idx).await?;
             let b = page.get();
-            validate_checksum(b)?;
             let len = b.len() - PAGE_PTR_SIZE - CHECKSUM_SIZE;
             let cp_len = std::cmp::min(len, empty);
             let cp_start = buf.len() - empty;

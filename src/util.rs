@@ -53,14 +53,6 @@ pub fn has_valid_checksum(buf: &[u8]) -> bool {
     content_checksum == checksum
 }
 
-pub fn validate_checksum(buf: &[u8]) -> Result<()> {
-    if has_valid_checksum(buf) {
-        Ok(())
-    } else {
-        Err(anyhow::anyhow!("invalid checksum"))
-    }
-}
-
 pub fn from_bytes<T>(buf: &[u8]) -> &T {
     assert!(buf.len() >= size_of::<T>(), "buffer too small for type");
     assert_eq!(
@@ -97,12 +89,9 @@ mod tests {
     fn test_checksum() {
         let mut content: [u8; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0, 0, 0, 0, 0];
         assert!(!has_valid_checksum(&content));
-        assert!(validate_checksum(&content).is_err());
         update_checksum(&mut content);
         assert!(has_valid_checksum(&content));
-        assert!(validate_checksum(&content).is_ok());
         content.fill(1);
         assert!(!has_valid_checksum(&content));
-        assert!(validate_checksum(&content).is_err());
     }
 }
