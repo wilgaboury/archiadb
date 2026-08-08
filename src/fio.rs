@@ -232,7 +232,7 @@ impl Drop for PoolBuf {
 #[bon]
 impl Fio {
     #[builder]
-    pub fn builder(
+    pub(crate) fn builder(
         file: Arc<DbFile>,
         meta: &MetaHandler,
         #[builder(default = DEFAULT_SQ_SIZE)] sq: usize,
@@ -243,7 +243,7 @@ impl Fio {
         Self::new(file, meta, sq, cq, page_buf_pool, generic_op_state_pool)
     }
 
-    pub fn new(
+    pub(crate) fn new(
         file: Arc<DbFile>,
         meta: &MetaHandler,
         sq: usize,
@@ -838,7 +838,6 @@ impl IoLoop {
                             PageBuf::Dynamic(pg) => {
                                 self.bufs[id * self.pg_size..(id + 1) * self.pg_size]
                                     .copy_from_slice(pg);
-                                drop(pg);
                                 (
                                     self.bufs[id * self.pg_size..].as_mut_ptr(),
                                     self.pg_size as u32,
