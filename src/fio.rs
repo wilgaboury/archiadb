@@ -29,6 +29,7 @@ use thiserror::Error;
 
 use crate::{
     file::DbFile,
+    uint::{InPgIdx, PgIdx},
     util::{get_fs_block_size, has_valid_checksum, update_checksum},
 };
 
@@ -94,7 +95,7 @@ enum ReadState {
 }
 
 struct WriteData {
-    pg_idx: u64,
+    pg_idx: PgIdx,
     buf: PageBuf,
     waker: Waker,
     state: GenericOpStateRef,
@@ -128,7 +129,7 @@ struct Inner {
     fio_file: File,
     file: Arc<DbFile>,
 
-    page_size: usize,
+    page_size: InPgIdx,
     stop: AtomicBool,
     queue: SegQueue<FioOp>,
 
@@ -216,7 +217,7 @@ pub struct PoolBuf {
 
 impl PoolBuf {
     pub fn ptr(&self) -> *mut u8 {
-        self.fio.bufs[self.idx * self.fio.page_size..].as_ptr() as *mut u8
+        self.fio.bufs[self.idx * self.fio.page_size as usize..].as_ptr() as *mut u8
     }
 }
 
@@ -251,7 +252,7 @@ impl Fio {
 
     pub(crate) fn new(
         file: Arc<DbFile>,
-        page_size: u64,
+        page_size: InPgIdx,
         sq: usize,
         cq: usize,
         page_buf_pool: Option<usize>,
@@ -272,11 +273,10 @@ impl Fio {
         };
 
         let fd = fio_file.as_raw_fd();
-        let page_size = page_size as usize;
 
         let stop = AtomicBool::new(false);
         let queue = SegQueue::new();
-        let bufs = alloc_aligned_buffer(page_buf_pool as usize, page_size)?;
+        let bufs = alloc_aligned_buffer(page_buf_pool, page_size as usize)?;
         let free_bufs = ArrayQueue::new(cmp::max(1, page_buf_pool as usize));
         for idx in 0usize..(page_buf_pool as usize) {
             free_bufs
@@ -327,7 +327,7 @@ impl Fio {
         &self.inner.file
     }
 
-    pub fn page_size(&self) -> usize {
+    pub fn page_size(&self) -> InPgIdx {
         self.inner.page_size
     }
 
@@ -539,7 +539,7 @@ impl Fio {
         .await
     }
 
-    pub async fn alloc(&self, len: u64) -> Result<()> {
+    pub async fn alloc(&self, len: PgIdx) -> Result<()> {
         pub struct AllocFuture<'a> {
             fio: &'a Fio,
             len: u64,
@@ -632,7 +632,7 @@ impl Drop for IoLoopHandle {
 }
 
 struct IoLoop {
-    pg_size: usize,
+    pg_size: InPgIdx,
     sq_size: usize,
     cq_size: usize,
     pg_buf_pool_size: usize,
@@ -649,7 +649,7 @@ struct IoLoop {
 
 impl IoLoop {
     fn new(
-        page_size: usize,
+        pg_size: InPgIdx,
         sq_size: usize,
         cq_size: usize,
         page_buf_pool_size: usize,
@@ -659,16 +659,16 @@ impl IoLoop {
         let ring = IoUring::builder()
             .setup_cqsize(cq_size as u32)
             .build(sq_size as u32)?;
-        let mut bufs = alloc_aligned_buffer(cq_size as usize, page_size)?;
+        let mut bufs = alloc_aligned_buffer(cq_size, pg_size as usize)?;
 
         let iovecs: Vec<iovec> = (0usize..cq_size as usize)
             .map(|i| iovec {
-                iov_base: (bufs[i * page_size..].as_mut_ptr()) as *mut c_void,
-                iov_len: page_size,
+                iov_base: (bufs[i * pg_size as usize..].as_mut_ptr()) as *mut c_void,
+                iov_len: pg_size as usize,
             })
             .chain((0usize..(page_buf_pool_size as usize)).map(|i| iovec {
-                iov_base: (inner.bufs[i * page_size..].as_ptr() as *mut u8) as *mut c_void,
-                iov_len: page_size,
+                iov_base: (inner.bufs[i * pg_size as usize..].as_ptr() as *mut u8) as *mut c_void,
+                iov_len: pg_size as usize,
             }))
             .collect();
 
@@ -683,7 +683,7 @@ impl IoLoop {
         }
 
         Ok(Self {
-            pg_size: page_size,
+            pg_size,
             sq_size,
             cq_size,
             pg_buf_pool_size: page_buf_pool_size,
@@ -804,7 +804,7 @@ impl IoLoop {
                                 (self.cq_size + shared.idx) as u16,
                             ),
                             PageBuf::Dynamic(_) => (
-                                self.bufs[id * self.pg_size..].as_mut_ptr(),
+                                self.bufs[id * self.pg_size as usize..].as_mut_ptr(),
                                 self.pg_size as u32,
                                 id as u16,
                             ),
@@ -840,10 +840,10 @@ impl IoLoop {
                                 (self.cq_size + shared.idx) as u16,
                             ),
                             PageBuf::Dynamic(pg) => {
-                                self.bufs[id * self.pg_size..(id + 1) * self.pg_size]
-                                    .copy_from_slice(pg);
+                                let pg_size = self.pg_size as usize;
+                                self.bufs[id * pg_size..(id + 1) * pg_size].copy_from_slice(pg);
                                 (
-                                    self.bufs[id * self.pg_size..].as_mut_ptr(),
+                                    self.bufs[id * pg_size..].as_mut_ptr(),
                                     self.pg_size as u32,
                                     id as u16,
                                 )
@@ -954,7 +954,8 @@ impl IoLoop {
                             if cqe.result() >= 0 {
                                 if let PageBuf::Dynamic(buf) = &mut buf {
                                     buf.copy_from_slice(
-                                        &self.bufs[id * self.pg_size..(id + 1) * self.pg_size],
+                                        &self.bufs[id * self.pg_size as usize
+                                            ..(id + 1) * self.pg_size as usize],
                                     );
                                 }
                                 *inner = ReadState::Ready(buf);
@@ -1130,7 +1131,7 @@ mod tests {
             .append(true)
             .open(fio.file().path())?;
 
-        let mut test_buf = vec![1u8; fio.page_size()];
+        let mut test_buf = vec![1u8; fio.page_size() as usize];
         update_checksum(&mut test_buf);
         file.write_all(&test_buf)?;
         file.flush()?;
@@ -1168,7 +1169,7 @@ mod tests {
             .write(true)
             .append(true)
             .open(file.path())?;
-        let mut test_buf = vec![1u8; fio.page_size()];
+        let mut test_buf = vec![1u8; fio.page_size() as usize];
         update_checksum(&mut test_buf);
         file.write_all(&test_buf)?;
         file.flush()?;
@@ -1204,10 +1205,10 @@ mod tests {
             .read(true)
             .append(true)
             .open(fio.file().path())?;
-        let mut buf = vec![0u8; fio.page_size()];
+        let mut buf = vec![0u8; fio.page_size() as usize];
         file.read_exact(&mut buf)?;
 
-        let mut res = vec![1u8; fio.page_size()];
+        let mut res = vec![1u8; fio.page_size() as usize];
         update_checksum(&mut res);
         assert_eq!(res, buf);
 
@@ -1236,10 +1237,10 @@ mod tests {
             .read(true)
             .append(true)
             .open(file.path())?;
-        let mut buf = vec![0u8; fio.page_size()];
+        let mut buf = vec![0u8; fio.page_size() as usize];
         file.read_exact(&mut buf)?;
 
-        let mut res = vec![1u8; fio.page_size()];
+        let mut res = vec![1u8; fio.page_size() as usize];
         update_checksum(&mut res);
         assert_eq!(res, buf);
 
@@ -1256,8 +1257,8 @@ mod tests {
         fio.alloc(NUM_HEADER_PAGES + 1).await?;
         assert!(NUM_HEADER_PAGES + 1 <= fs::metadata(fio.file().path())?.len());
         assert_eq!(
-            fio.page_size() * (NUM_HEADER_PAGES + 1) as usize,
-            fs::metadata(fio.file().path())?.len() as usize
+            fio.page_size() * (NUM_HEADER_PAGES + 1),
+            fs::metadata(fio.file().path())?.len()
         );
 
         let _read_test = fio.read_unchecked(0).await?;
@@ -1266,7 +1267,7 @@ mod tests {
         assert!(1000 <= fs::metadata(fio.file().path())?.len());
         assert_eq!(
             1000 * fio.page_size(),
-            fs::metadata(fio.file().path())?.len() as usize
+            fs::metadata(fio.file().path())?.len()
         );
 
         let _read_test = fio.read_unchecked(5).await?;

@@ -4,6 +4,8 @@ use xxhash_rust::xxh3::xxh3_64;
 
 use anyhow::Result;
 
+use crate::uint::InPgIdx;
+
 #[macro_export]
 macro_rules! const_assert {
     ($($arg:tt)*) => {
@@ -16,7 +18,7 @@ pub const MAX_KEY_SIZE: usize = u8::MAX as usize;
 pub const MIN_PAGE_SIZE: u64 = 4096; // 4kb
 pub const MAX_PAGE_SIZE: u64 = 65536; // 64kb
 
-pub fn get_fs_block_size<P: AsRef<Path>>(path: P) -> Result<u64> {
+pub fn get_fs_block_size<P: AsRef<Path>>(path: P) -> Result<InPgIdx> {
     let file = File::open(path)?;
     let fd = file.as_fd();
     let fstatvfs = fstatvfs(fd)?;
