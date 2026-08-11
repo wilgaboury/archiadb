@@ -11,29 +11,29 @@ use crate::{
     fio::{Fio, MIN_PAGE_SIZE, PageBuf},
     flux::FluxBuf,
     key::KeyPath,
-    uint::{InPgIdxDisk, PgIdx, PgIdxDisk, U32, U64},
+    uint::{InPgIdx, InPgIdxDisk, PgIdx, PgIdxDisk},
     util::{CHECKSUM_SIZE, from_bytes, from_bytes_mut, has_valid_checksum},
 };
 
-type Slot = u32;
-type SlotDisk = U32;
+type Slot = InPgIdx;
+type SlotDisk = InPgIdxDisk;
 
-type LinkedListLen = u64;
-type LinkedListLenDisk = U64;
+type LinkedListLen = PgIdx;
+type LinkedListLenDisk = PgIdxDisk;
 
 const MAX_KEY_SIZE: usize = 256;
 
 /// Inner node layout:
 /// - header
-/// - slots:[u32; max(0,len-1)], key_len is derivable, pointer to beginning of key
+/// - slots:[u24; max(0,len-1)], key_len is derivable, pointer to beginning of key
 /// - data: [u8], grows backward, interleaved child pointer and key
-/// - checksum: u32
+/// - checksum: u64
 ///
 /// Leaf node layout:
 /// - header
-/// - slots: [u32; len], key_len is derivable, pointer to beginning of (value,key)
+/// - slots: [u24; len], key_len is derivable, pointer to beginning of (value,key)
 /// - data: [u8], grows backward, interleaved value and key
-/// - checksum: u32
+/// - checksum: u64
 
 #[repr(u8)]
 #[derive(PartialEq, Eq, Debug, Clone, Copy)]
