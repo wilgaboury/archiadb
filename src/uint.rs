@@ -106,7 +106,16 @@ impl U16 {
 
 #[cfg(test)]
 mod test {
-    use crate::uint::{U16, U24, U32, U40};
+    use crate::uint::{U16, U24, U32, U40, U64};
+
+    #[test]
+    fn u64() {
+        let value = 0x2211FFEEDDCCBBAAu64;
+        let mut test = U64::new(0);
+        assert_eq!(0, test.get());
+        test.set(value);
+        assert_eq!(value, test.get());
+    }
 
     #[test]
     fn u40() {
