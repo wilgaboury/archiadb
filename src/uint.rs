@@ -4,6 +4,25 @@ pub(crate) type PgIdxDisk = U40;
 pub(crate) type InPgIdxDisk = U24;
 
 #[repr(C, packed)]
+pub(crate) struct U64(u64);
+
+impl U64 {
+    pub(crate) fn new(value: u64) -> Self {
+        let mut ret = Self(0);
+        ret.set(value);
+        ret
+    }
+
+    pub(crate) fn get(&self) -> u64 {
+        u64::from_le(self.0) as u64
+    }
+
+    pub(crate) fn set(&mut self, value: u64) {
+        self.0 = u64::from_le(value);
+    }
+}
+
+#[repr(C, packed)]
 pub(crate) struct U40([u8; 5]);
 
 impl U40 {

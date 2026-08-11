@@ -3,7 +3,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 
 use crate::{
     const_assert,
@@ -11,15 +11,17 @@ use crate::{
     fio::{Fio, MIN_PAGE_SIZE, PageBuf},
     flux::FluxBuf,
     key::KeyPath,
-    uint::{InPgIdx, InPgIdxDisk, PgIdx, PgIdxDisk, U32},
+    uint::{InPgIdxDisk, PgIdx, PgIdxDisk, U32, U64},
     util::{CHECKSUM_SIZE, from_bytes, from_bytes_mut, has_valid_checksum},
 };
 
 type Slot = u32;
+type SlotDisk = U32;
+
+type LinkedListLen = u64;
+type LinkedListLenDisk = U64;
 
 const MAX_KEY_SIZE: usize = 256;
-const SLOT_SIZE: usize = size_of::<Slot>();
-const LINKED_LIST_VALUE_LEN_SIZE: usize = size_of::<u64>();
 
 /// Inner node layout:
 /// - header
@@ -180,7 +182,7 @@ impl LeafValueEncoded<'_> {
             LeafValueEncoded::Btree { .. } => 2 * size_of::<PgIdxDisk>(),
             LeafValueEncoded::ValueEmbedded(v) => 1 + v.len(),
             LeafValueEncoded::ValueLinkedList { .. } => {
-                size_of::<PgIdxDisk>() + LINKED_LIST_VALUE_LEN_SIZE
+                size_of::<PgIdxDisk>() + size_of::<LinkedListLenDisk>()
             }
         }
     }
@@ -189,19 +191,17 @@ impl LeafValueEncoded<'_> {
         buf[0] = self.kind() as u8;
         match self {
             LeafValueEncoded::Btree { pg_idx_1, pg_idx_2 } => {
-                buf[1..1 + size_of::<PgIdxDisk>()].copy_from_slice(&pg_idx_1.to_le_bytes());
-                buf[1 + size_of::<PgIdxDisk>()..1 + 2 * size_of::<PgIdxDisk>()]
-                    .copy_from_slice(&pg_idx_2.to_le_bytes());
+                from_bytes_mut::<PgIdxDisk>(&mut buf[1..]).set(*pg_idx_1);
+                from_bytes_mut::<PgIdxDisk>(&mut buf[1 + size_of::<PgIdxDisk>()..]).set(*pg_idx_2);
             }
             LeafValueEncoded::ValueEmbedded(v) => {
                 buf[1] = v.len() as u8;
                 buf[2..2 + v.len()].copy_from_slice(v);
             }
             LeafValueEncoded::ValueLinkedList { pg_idx, len } => {
-                buf[1..1 + size_of::<PgIdxDisk>()].copy_from_slice(&pg_idx.to_le_bytes());
-                buf[1 + size_of::<PgIdxDisk>()
-                    ..1 + size_of::<PgIdxDisk>() + LINKED_LIST_VALUE_LEN_SIZE]
-                    .copy_from_slice(&len.to_le_bytes());
+                from_bytes_mut::<PgIdxDisk>(&mut buf[1..]).set(*pg_idx);
+                from_bytes_mut::<LinkedListLenDisk>(&mut buf[1 + size_of::<PgIdxDisk>()..])
+                    .set(*len);
             }
         }
     }
@@ -297,13 +297,6 @@ impl BTreeRootHeader {
 
 const_assert!(size_of::<BTreeRootHeader>() + CHECKSUM_SIZE < MIN_PAGE_SIZE as usize);
 
-#[repr(C, packed)]
-struct BTreeLeafSlot {
-    loc: u32,
-    key_len: u32,
-    data_len: u32,
-}
-
 trait BTreeNodeBuf {
     fn header(&self) -> &BTreeHeader;
     fn header_mut(&mut self) -> &mut BTreeHeader;
@@ -371,7 +364,8 @@ impl BTreeNodeBuf for [u8] {
             }
         };
 
-        self.len() - (self.header().kind.header_size() + slots_len * SLOT_SIZE + tail_size)
+        self.len()
+            - (self.header().kind.header_size() + slots_len * size_of::<SlotDisk>() + tail_size)
     }
 
     fn available(&self) -> usize {
@@ -396,7 +390,7 @@ impl BTreeNodeBuf for [u8] {
 
     fn root_to_inner(&mut self) {
         let slots_start = size_of::<BTreeRootHeader>();
-        let slots_end = slots_start + self.header().len() as usize * SLOT_SIZE;
+        let slots_end = slots_start + self.header().len() as usize * size_of::<SlotDisk>();
         let dest = size_of::<BTreeHeader>();
         self.copy_within(slots_start..slots_end, dest);
     }
@@ -416,8 +410,8 @@ fn insert_at_inner(buf: &mut [u8], idx: usize, left: PgIdx, key: &[u8], right: P
         let header = buf.header();
         let slots_idx = header.kind.header_size();
         let slots_len = buf.slots_len();
-        let slots_insert_idx = slots_idx + SLOT_SIZE * idx;
-        let slots_end_idx = slots_idx + SLOT_SIZE * slots_len;
+        let slots_insert_idx = slots_idx + size_of::<SlotDisk>() * idx;
+        let slots_end_idx = slots_idx + size_of::<SlotDisk>() * slots_len;
 
         let key_and_ptr_len = key.len() + size_of::<PgIdxDisk>();
         let key_and_ptr_end = if idx == 0 {
@@ -451,7 +445,7 @@ fn insert_at_inner(buf: &mut [u8], idx: usize, left: PgIdx, key: &[u8], right: P
 
         buf.copy_within(
             slots_insert_idx..slots_end_idx,
-            slots_insert_idx + SLOT_SIZE,
+            slots_insert_idx + size_of::<SlotDisk>(),
         );
         write_slot(buf, idx, key_start);
     }
@@ -466,8 +460,8 @@ fn insert_at_leaf(buf: &mut [u8], idx: usize, key: &[u8], value: &LeafValueEncod
     let header = buf.header();
     let slots_idx = header.kind.header_size();
     let slots_len = buf.slots_len();
-    let slots_insert_idx = slots_idx + SLOT_SIZE * idx;
-    let slots_end_idx = slots_idx + SLOT_SIZE * slots_len;
+    let slots_insert_idx = slots_idx + size_of::<SlotDisk>() * idx;
+    let slots_end_idx = slots_idx + size_of::<SlotDisk>() * slots_len;
 
     let value_key_len = value.len() + key.len();
     let value_key_end = if idx == 0 {
@@ -486,7 +480,7 @@ fn insert_at_leaf(buf: &mut [u8], idx: usize, key: &[u8], value: &LeafValueEncod
         all_value_key_start..value_key_end,
         all_value_key_start - value_key_len,
     );
-    value.write_to_buf(buf[value_key_start..value_key_start + value.len()].as_mut());
+    value.write_to_buf(&mut buf[value_key_start..]);
     buf[value_key_start + value.len()..value_key_end].copy_from_slice(key);
 
     for i in idx..slots_len {
@@ -496,7 +490,7 @@ fn insert_at_leaf(buf: &mut [u8], idx: usize, key: &[u8], value: &LeafValueEncod
 
     buf.copy_within(
         slots_insert_idx..slots_end_idx,
-        slots_insert_idx + SLOT_SIZE,
+        slots_insert_idx + size_of::<SlotDisk>(),
     );
     write_slot(buf, idx, value_key_start);
 
@@ -510,8 +504,8 @@ fn remove_at_leaf(buf: &mut [u8], idx: usize) {
     let header = buf.header();
     let slots_idx = header.kind.header_size();
     let slots_len = buf.slots_len();
-    let slots_remove_idx = slots_idx + SLOT_SIZE * idx;
-    let slots_end_idx = slots_idx + SLOT_SIZE * slots_len;
+    let slots_remove_idx = slots_idx + size_of::<SlotDisk>() * idx;
+    let slots_end_idx = slots_idx + size_of::<SlotDisk>() * slots_len;
 
     let value_key_end = if idx == 0 {
         buf.len() - CHECKSUM_SIZE
@@ -538,7 +532,7 @@ fn remove_at_leaf(buf: &mut [u8], idx: usize) {
     }
 
     buf.copy_within(
-        (slots_remove_idx + SLOT_SIZE)..slots_end_idx,
+        (slots_remove_idx + size_of::<SlotDisk>())..slots_end_idx,
         slots_remove_idx,
     );
 
@@ -551,19 +545,15 @@ fn remove_at_leaf(buf: &mut [u8], idx: usize) {
 fn read_slot(buf: &[u8], idx: usize) -> usize {
     let header = from_bytes::<BTreeHeader>(buf);
     let slots_idx = header.kind.header_size();
-    let start = slots_idx + SLOT_SIZE * idx;
-    let end = start + SLOT_SIZE;
-    let mut u32_buf = [0u8; 4];
-    u32_buf.copy_from_slice(&buf[start..end]);
-    u32::from_le_bytes(u32_buf) as usize
+    let start = slots_idx + size_of::<SlotDisk>() * idx;
+    from_bytes::<SlotDisk>(&buf[start..]).get() as usize
 }
 
 fn write_slot(buf: &mut [u8], idx: usize, value: usize) {
     let header = from_bytes::<BTreeHeader>(buf);
     let slots_idx = header.kind.header_size();
-    let start = slots_idx + SLOT_SIZE * idx;
-    let end = start + SLOT_SIZE;
-    buf[start..end].copy_from_slice(&(value as Slot).to_le_bytes());
+    let start = slots_idx + size_of::<SlotDisk>() * idx;
+    from_bytes_mut::<SlotDisk>(&mut buf[start..]).set(value as u64);
 }
 
 fn get_page_ptr(buf: &[u8], idx: usize) -> u64 {
@@ -581,7 +571,7 @@ fn write_page_ptr(buf: &mut [u8], idx: usize, value: u64) {
     } else {
         read_slot(buf, idx - 1) - size_of::<PgIdxDisk>()
     };
-    buf[loc..loc + size_of::<PgIdxDisk>()].copy_from_slice(&value.to_le_bytes());
+    from_bytes_mut::<PgIdxDisk>(&mut buf[loc..]).set(value);
 }
 
 fn get_key_inner(buf: &[u8], idx: usize) -> &[u8] {
@@ -599,7 +589,7 @@ fn get_key_leaf(buf: &[u8], idx: usize) -> &[u8] {
     let val_len = 1 + match LeafValueKind::from(buf[val_key_idx]) {
         LeafValueKind::Btree => 2 * size_of::<PgIdxDisk>(),
         LeafValueKind::ValueEmbedded => 1 + buf[val_key_idx + 1] as usize,
-        LeafValueKind::ValueLinkedList => size_of::<PgIdxDisk>() + LINKED_LIST_VALUE_LEN_SIZE,
+        LeafValueKind::ValueLinkedList => size_of::<PgIdxDisk>() + size_of::<LinkedListLenDisk>(),
     };
     let key_idx = val_key_idx + val_len;
     let key_len = if idx == 0 {
@@ -610,20 +600,14 @@ fn get_key_leaf(buf: &[u8], idx: usize) -> &[u8] {
     &buf[key_idx..(key_idx + key_len)]
 }
 
-fn read_u64_at(buf: &[u8], idx: usize) -> u64 {
-    let mut u64_buf = [0u8; 8];
-    u64_buf.copy_from_slice(&buf[idx..idx + 8]);
-    u64::from_le_bytes(u64_buf)
-}
-
 fn get_value_leaf(buf: &[u8], idx: usize) -> LeafValueGetResult {
     let val_key_idx = read_slot(buf, idx);
     match LeafValueKind::from(buf[val_key_idx]) {
         LeafValueKind::Btree => {
             let b_idx_1 = val_key_idx + 1;
             let b_idx_2 = b_idx_1 + size_of::<PgIdxDisk>();
-            let pg_idx_1 = read_u64_at(buf, b_idx_1);
-            let pg_idx_2 = read_u64_at(buf, b_idx_2);
+            let pg_idx_1 = from_bytes::<PgIdxDisk>(&buf[b_idx_1..]).get();
+            let pg_idx_2 = from_bytes::<PgIdxDisk>(&buf[b_idx_2..]).get();
             LeafValueGetResult::Btree { pg_idx_1, pg_idx_2 }
         }
         LeafValueKind::ValueEmbedded => {
@@ -638,8 +622,8 @@ fn get_value_leaf(buf: &[u8], idx: usize) -> LeafValueGetResult {
         LeafValueKind::ValueLinkedList => {
             let b_idx_1 = val_key_idx + 1;
             let b_idx_2 = b_idx_1 + size_of::<PgIdxDisk>();
-            let pg_idx = read_u64_at(buf, b_idx_1);
-            let len = read_u64_at(buf, b_idx_2);
+            let pg_idx = from_bytes::<PgIdxDisk>(&buf[b_idx_1..]).get();
+            let len = from_bytes::<LinkedListLenDisk>(&buf[b_idx_2..]).get();
             LeafValueGetResult::ValueLinkedList { pg_idx, len }
         }
     }
@@ -872,8 +856,8 @@ impl Txn {
                         pg.get_mut().root_to_inner();
                     }
 
-                    let can_insert =
-                        pg.get().remaining() > size_of::<PgIdxDisk>() + split.len() + SLOT_SIZE;
+                    let can_insert = pg.get().remaining()
+                        > size_of::<PgIdxDisk>() + split.len() + size_of::<SlotDisk>();
                     if can_insert {
                         insert_at_inner(pg.get_mut(), search, left, &split, right);
                         Ok(InsertResult::Single(pg))
@@ -938,7 +922,8 @@ impl Txn {
     ) -> Result<InsertResult> {
         let encoded_value = value.encode(self).await?;
 
-        let can_insert = pg.get().remaining() > key.len() + encoded_value.len() + SLOT_SIZE;
+        let can_insert =
+            pg.get().remaining() > key.len() + encoded_value.len() + size_of::<SlotDisk>();
         if can_insert {
             let search = search_leaf(pg.get(), key);
             if let SearchResult::Exact(idx) = search
@@ -989,14 +974,15 @@ impl Txn {
     async fn create_value_linked_list(&mut self, value: &[u8]) -> Result<u64> {
         let chunk_size =
             self.db.inner.meta.page_size() as usize - size_of::<PgIdxDisk>() - CHECKSUM_SIZE;
-        let mut prev_pg_idx = 0u64;
+        let mut prev_pg_idx: PgIdx = 0;
         for chunk in value.chunks(chunk_size).rev() {
             let pg_idx = self.alloc().await?;
             let mut buf = self.db.inner.fio.get_buf();
-            let b = buf.get_mut();
+            let mbuf = buf.get_mut();
             let len = chunk.len();
-            b[..len].copy_from_slice(chunk);
-            b[len..len + size_of::<PgIdxDisk>()].copy_from_slice(&prev_pg_idx.to_le_bytes());
+            mbuf[..len].copy_from_slice(chunk);
+            from_bytes_mut::<PgIdxDisk>(&mut mbuf[len..len + size_of::<PgIdxDisk>()])
+                .set(prev_pg_idx);
             prev_pg_idx = pg_idx;
             self.db.inner.fio.write(pg_idx, buf).await?;
         }
@@ -1006,17 +992,14 @@ impl Txn {
     async fn read_value_linked_list(&mut self, mut pg_idx: u64, buf: &mut [u8]) -> Result<()> {
         let mut empty = buf.len();
         while empty > 0 {
-            let page = self.db.inner.fio.read(pg_idx).await?;
-            let b = page.get();
-            let len = b.len() - size_of::<PgIdxDisk>() - CHECKSUM_SIZE;
+            let pg = self.db.inner.fio.read(pg_idx).await?;
+            let pg_buf = pg.get();
+            let len = pg_buf.len() - size_of::<PgIdxDisk>() - CHECKSUM_SIZE;
             let cp_len = std::cmp::min(len, empty);
             let cp_start = buf.len() - empty;
-            buf[cp_start..cp_start + cp_len].copy_from_slice(&b[0..cp_len]);
+            buf[cp_start..cp_start + cp_len].copy_from_slice(&pg_buf[0..cp_len]);
             empty -= cp_len;
-            pg_idx = b[len..len + size_of::<PgIdxDisk>()]
-                .try_into()
-                .map(u64::from_le_bytes)
-                .context("buffer cannot fit page pointer")?;
+            pg_idx = from_bytes::<PgIdxDisk>(&pg_buf[len..len + size_of::<PgIdxDisk>()]).get();
         }
         Ok(())
     }
@@ -1291,15 +1274,15 @@ mod tests {
             0,
             b"K_CCC",
             &LeafValueEncoded::Btree {
-                pg_idx_1: 0x6b2a2e7c2ea46f6e,
-                pg_idx_2: 0x68d67d9571ec6979,
+                pg_idx_1: 0x0000007c2ea46f6e,
+                pg_idx_2: 0x0000009571ec6979,
             },
         );
         assert_eq!(b"K_CCC", get_key_leaf(&page, 0));
         match get_value_leaf(&page, 0).encode(&page) {
             LeafValueEncoded::Btree { pg_idx_1, pg_idx_2 } => {
-                assert_eq!(pg_idx_1, 0x6b2a2e7c2ea46f6e);
-                assert_eq!(pg_idx_2, 0x68d67d9571ec6979);
+                assert_eq!(pg_idx_1, 0x0000007c2ea46f6e);
+                assert_eq!(pg_idx_2, 0x0000009571ec6979);
             }
             _ => panic!("expected embedded value"),
         };
@@ -1326,15 +1309,15 @@ mod tests {
             2,
             b"K_DDD",
             &LeafValueEncoded::ValueLinkedList {
-                pg_idx: 0x623c99542265332b,
-                len: 0x15c12bbd13ba0a79,
+                pg_idx: 0x000000542265332b,
+                len: 0x000000bd13ba0a79,
             },
         );
         assert_eq!(b"K_CCC", get_key_leaf(&page, 0));
         match get_value_leaf(&page, 0).encode(&page) {
             LeafValueEncoded::Btree { pg_idx_1, pg_idx_2 } => {
-                assert_eq!(pg_idx_1, 0x6b2a2e7c2ea46f6e);
-                assert_eq!(pg_idx_2, 0x68d67d9571ec6979);
+                assert_eq!(pg_idx_1, 0x0000007c2ea46f6e);
+                assert_eq!(pg_idx_2, 0x0000009571ec6979);
             }
             _ => panic!("expected embedded value"),
         };
@@ -1349,8 +1332,8 @@ mod tests {
         assert_eq!(b"K_DDD", get_key_leaf(&page, 2));
         match get_value_leaf(&page, 2).encode(&page) {
             LeafValueEncoded::ValueLinkedList { pg_idx, len } => {
-                assert_eq!(pg_idx, 0x623c99542265332b);
-                assert_eq!(len, 0x15c12bbd13ba0a79);
+                assert_eq!(pg_idx, 0x000000542265332b);
+                assert_eq!(len, 0x000000bd13ba0a79);
             }
             _ => panic!("expected embedded value"),
         };
@@ -1369,8 +1352,8 @@ mod tests {
         assert_eq!(b"K_CCC", get_key_leaf(&page, 0));
         match get_value_leaf(&page, 0).encode(&page) {
             LeafValueEncoded::Btree { pg_idx_1, pg_idx_2 } => {
-                assert_eq!(pg_idx_1, 0x6b2a2e7c2ea46f6e);
-                assert_eq!(pg_idx_2, 0x68d67d9571ec6979);
+                assert_eq!(pg_idx_1, 0x0000007c2ea46f6e);
+                assert_eq!(pg_idx_2, 0x0000009571ec6979);
             }
             _ => panic!("expected embedded value"),
         };
