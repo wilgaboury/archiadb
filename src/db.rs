@@ -9,7 +9,7 @@ use crate::{
     file::DbFile,
     fio::{DEFAULT_CQ_SIZE, DEFAULT_SQ_SIZE, Fio},
     flux::Flux,
-    galloc::Galloc,
+    galloc::{Galloc, galloc_recover},
     key::{KeyPath, KeyPathBuf},
     lock::{Lock, LockGuard, LockType},
     meta::MetaHandler,
@@ -55,7 +55,7 @@ impl Db {
         )?;
 
         if meta.open_async().await {
-            // TODO: run recovery
+            galloc_recover(&meta, &fio).await?;
         }
 
         meta.mutate_async(&fio, |meta| {

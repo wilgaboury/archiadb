@@ -4,6 +4,25 @@ pub(crate) type PgIdxDisk = U40;
 pub(crate) type InPgIdxDisk = U24;
 
 #[repr(C, packed)]
+pub(crate) struct U128(u128);
+
+impl U128 {
+    pub(crate) fn new(value: u128) -> Self {
+        let mut ret = Self(0);
+        ret.set(value);
+        ret
+    }
+
+    pub(crate) fn get(&self) -> u128 {
+        u128::from_le(self.0)
+    }
+
+    pub(crate) fn set(&mut self, value: u128) {
+        self.0 = u128::from_le(value);
+    }
+}
+
+#[repr(C, packed)]
 pub(crate) struct U64(u64);
 
 impl U64 {
@@ -106,7 +125,16 @@ impl U16 {
 
 #[cfg(test)]
 mod test {
-    use crate::uint::{U16, U24, U32, U40, U64};
+    use crate::uint::{U16, U24, U32, U40, U64, U128};
+
+    #[test]
+    fn u128() {
+        let value = 0x11FFEEDDCCBBAA998877665544332211u128;
+        let mut test = U128::new(0);
+        assert_eq!(0, test.get());
+        test.set(value);
+        assert_eq!(value, test.get());
+    }
 
     #[test]
     fn u64() {

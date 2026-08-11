@@ -10,14 +10,16 @@ use tokio::sync::Mutex;
 use crate::{
     const_assert,
     fio::{Fio, MAX_PAGE_SIZE, MIN_PAGE_SIZE, choose_page_size},
+    uint::{InPgIdxDisk, PgIdxDisk, U16, U64, U128},
     util::{CHECKSUM_SIZE, from_bytes, from_bytes_mut, has_valid_checksum, update_checksum},
 };
 
 pub(crate) type MagicType = u128;
+pub(crate) type MagicTypeDisk = U128;
 pub(crate) const MAGIC: MagicType = 0xa90e3b4b1b0833499933888e3933af0d; // Random GUID
 pub(crate) const NUM_HEADER_PAGES: u64 = 2;
 
-#[repr(u64)]
+#[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FmtVer {
     V1 = 0,
@@ -38,27 +40,31 @@ impl TryFrom<u64> for FmtVer {
 
 #[repr(C, packed)]
 pub(crate) struct Meta {
-    magic: MagicType,
+    magic: MagicTypeDisk,
 
-    fmt_ver: u64,
-    pg_size: u64,
-    root1: u64,
-    root2: u64,
+    fmt_ver: U16,
+    pg_size: InPgIdxDisk,
+    root1: PgIdxDisk,
+    root2: PgIdxDisk,
 
-    version: u64,
+    version: U64,
     open: u8,
-    len: u64,
+    len: PgIdxDisk,
+
+    // global alloc data
+    galloc_fidx: PgIdxDisk,
+    galloc_bidx: PgIdxDisk,
 }
 
 const_assert!(size_of::<Meta>() + CHECKSUM_SIZE < MIN_PAGE_SIZE as usize);
 
 impl Meta {
     pub(crate) fn init(&mut self, page_size: u64) {
-        self.magic = MagicType::to_le(MAGIC);
-        self.fmt_ver = u64::to_le(CUR_FMT_VER as u64);
-        self.pg_size = u64::to_le(page_size);
-        self.root1 = u64::to_le(NUM_HEADER_PAGES + 1);
-        self.root2 = u64::to_le(NUM_HEADER_PAGES + 2);
+        self.magic.set(MAGIC);
+        self.fmt_ver.set(CUR_FMT_VER as u64);
+        self.pg_size.set(page_size as u64);
+        self.root1.set(NUM_HEADER_PAGES + 1 as u64);
+        self.root2.set(NUM_HEADER_PAGES + 2 as u64);
 
         self.set_version(0);
         self.set_open(false);
@@ -66,31 +72,31 @@ impl Meta {
     }
 
     pub(crate) fn magic(&self) -> MagicType {
-        MagicType::from_le(self.magic)
+        self.magic.get()
     }
 
     pub(crate) fn fmt_ver(&self) -> FmtVer {
-        u64::from_le(self.fmt_ver).try_into().unwrap()
+        self.fmt_ver.get().try_into().unwrap()
     }
 
     pub(crate) fn pg_size(&self) -> u64 {
-        u64::from_le(self.pg_size)
+        self.pg_size.get()
     }
 
     pub(crate) fn root1(&self) -> u64 {
-        u64::from_le(self.root1)
+        self.root1.get()
     }
 
     pub(crate) fn root2(&self) -> u64 {
-        u64::from_le(self.root2)
+        self.root2.get()
     }
 
     pub(crate) fn version(&self) -> u64 {
-        u64::from_le(self.version)
+        self.version.get()
     }
 
     fn set_version(&mut self, ver: u64) {
-        self.version = u64::to_le(ver);
+        self.version.set(ver);
     }
 
     pub(crate) fn open(&self) -> bool {
@@ -102,11 +108,27 @@ impl Meta {
     }
 
     pub(crate) fn len(&self) -> u64 {
-        u64::from_le(self.len)
+        self.len.get()
     }
 
     pub(crate) fn set_len(&mut self, len: u64) {
-        self.len = u64::to_le(len);
+        self.len.set(len);
+    }
+
+    pub(crate) fn galloc_fidx(&self) -> u64 {
+        self.galloc_fidx.get()
+    }
+
+    pub(crate) fn set_galloc_fidx(&mut self, idx: u64) {
+        self.galloc_fidx.set(idx);
+    }
+
+    pub(crate) fn galloc_bidx(&self) -> u64 {
+        self.galloc_bidx.get()
+    }
+
+    pub(crate) fn set_galloc_bidx(&mut self, idx: u64) {
+        self.galloc_bidx.set(idx);
     }
 }
 
@@ -191,8 +213,7 @@ impl MetaHandler {
     }
 
     pub(crate) async fn open_async(&self) -> bool {
-        let lock = self.inner.lock().await;
-        from_bytes::<Meta>(&lock.front).open()
+        self.access_async(|meta| meta.open()).await
     }
 
     pub(crate) fn try_mutate(&self, file: &File, f: impl FnOnce(&mut Meta)) -> Result<()> {
@@ -261,6 +282,13 @@ impl MetaHandler {
         self.len.store(len, Ordering::Release);
 
         Ok(())
+    }
+
+    pub(crate) async fn access_async<T>(&self, f: impl FnOnce(&Meta) -> T) -> T {
+        let mut inner_guard = self.inner.lock().await;
+        let inner = &mut *inner_guard;
+        let meta = from_bytes::<Meta>(&inner.front);
+        f(meta)
     }
 
     fn read_page_size(file: &File) -> Result<u64> {

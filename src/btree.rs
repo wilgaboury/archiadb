@@ -37,7 +37,7 @@ const MAX_KEY_SIZE: usize = 256;
 
 #[repr(u8)]
 #[derive(PartialEq, Eq, Debug, Clone, Copy)]
-enum BTreeNodeKind {
+pub(crate) enum BTreeNodeKind {
     Root = 0,
     Inner,
     Leaf,
@@ -219,30 +219,30 @@ impl From<u8> for LeafValueKind {
 }
 
 #[repr(C, packed)]
-struct BTreeHeader {
+pub(crate) struct BTreeHeader {
     kind: BTreeNodeKind,
     len: InPgIdxDisk,
 }
 
 impl BTreeHeader {
-    pub fn init(&mut self, kind: BTreeNodeKind) {
+    pub(crate) fn init(&mut self, kind: BTreeNodeKind) {
         self.set_kind(kind);
         self.set_len(0);
     }
 
-    pub fn kind(&self) -> BTreeNodeKind {
+    pub(crate) fn kind(&self) -> BTreeNodeKind {
         self.kind
     }
 
-    pub fn set_kind(&mut self, kind: BTreeNodeKind) {
+    pub(crate) fn set_kind(&mut self, kind: BTreeNodeKind) {
         self.kind = kind;
     }
 
-    pub fn len(&self) -> u64 {
+    pub(crate) fn len(&self) -> u64 {
         self.len.get()
     }
 
-    pub fn set_len(&mut self, len: u64) {
+    pub(crate) fn set_len(&mut self, len: u64) {
         self.len.set(len);
     }
 }
@@ -263,7 +263,7 @@ impl Arena {
 }
 
 #[repr(C, packed)]
-struct BTreeRootHeader {
+pub(crate) struct BTreeRootHeader {
     pub(crate) header: BTreeHeader,
     version: u64,
     free: u64,
@@ -271,7 +271,7 @@ struct BTreeRootHeader {
 }
 
 impl BTreeRootHeader {
-    pub fn init(&mut self) {
+    pub(crate) fn init(&mut self) {
         self.header.init(BTreeNodeKind::Root);
         self.version = 0;
         self.free = 0;
