@@ -10,8 +10,8 @@ use tokio::sync::Mutex;
 use crate::{
     const_assert,
     fio::{Fio, MAX_PAGE_SIZE, MIN_PAGE_SIZE, choose_page_size},
-    uint::{InPgIdxDisk, PgIdxDisk, U16, U64, U128},
-    util::{CHECKSUM_SIZE, from_bytes, from_bytes_mut, has_valid_checksum, update_checksum},
+    uint::{InPgIdxDisk, PgIdx, PgIdxDisk, U16, U64, U128},
+    util::{Checksum, from_bytes, from_bytes_mut, has_valid_checksum, update_checksum},
 };
 
 pub(crate) type MagicType = u128;
@@ -57,19 +57,22 @@ pub(crate) struct Meta {
     galloc_bidx: PgIdxDisk,
 }
 
-const_assert!(size_of::<Meta>() + CHECKSUM_SIZE < MIN_PAGE_SIZE as usize);
+const_assert!(size_of::<Meta>() + size_of::<Checksum>() < MIN_PAGE_SIZE as usize);
 
 impl Meta {
     pub(crate) fn init(&mut self, page_size: u64) {
         self.magic.set(MAGIC);
         self.fmt_ver.set(CUR_FMT_VER as u64);
-        self.pg_size.set(page_size as u64);
-        self.root1.set(NUM_HEADER_PAGES + 1 as u64);
-        self.root2.set(NUM_HEADER_PAGES + 2 as u64);
+        self.pg_size.set(page_size);
+        self.root1.set(NUM_HEADER_PAGES);
+        self.root2.set(NUM_HEADER_PAGES + 1);
 
         self.set_version(0);
         self.set_open(false);
         self.set_len(NUM_HEADER_PAGES);
+
+        self.set_galloc_fidx(0);
+        self.set_galloc_bidx(0);
     }
 
     pub(crate) fn magic(&self) -> MagicType {
@@ -157,24 +160,27 @@ impl MetaHandler {
     pub fn new(file: &File) -> Result<Self> {
         let (is_first, front, back) = if file.metadata()?.len() == 0 {
             let page_size = choose_page_size(file)?;
-            let front = Self::create_buf(page_size);
-            let back = Self::create_buf(page_size);
+            let mut front = Self::create_buf(page_size);
+            let mut back = Self::create_buf(page_size);
+            update_checksum(&mut front);
             file.write_at(&front, 0)?;
+            update_checksum(&mut back);
             file.write_at(&back, page_size as u64)?;
             (true, front, back)
         } else {
             let page_size = Self::read_page_size(&file)?;
             let buf1 = Self::read_buf(&file, page_size, 0)?;
             let buf2 = Self::read_buf(&file, page_size, page_size)?;
-            let front_back = Self::choose_front_back(buf1, buf2)?;
+            let (is_first, front, mut back) = Self::choose_front_back(buf1, buf2)?;
+            back.copy_from_slice(&front);
 
-            if from_bytes::<Meta>(&front_back.1).magic() != MAGIC {
+            if from_bytes::<Meta>(&front).magic() != MAGIC {
                 return Err(anyhow!(
                     "file is not an archia db file or magic number is corrupted",
                 ));
             }
 
-            front_back
+            (is_first, front, back)
         };
 
         let meta = from_bytes::<Meta>(&front);
@@ -341,11 +347,9 @@ impl MetaHandler {
         }
     }
 
-    fn create_buf(page_size: usize) -> Box<[u8]> {
-        let mut buf = vec![0u8; page_size].into_boxed_slice();
-        let meta = from_bytes_mut::<Meta>(&mut buf);
-        meta.init(page_size as u64);
-        update_checksum(&mut buf);
+    fn create_buf(page_size: PgIdx) -> Box<[u8]> {
+        let mut buf = vec![0u8; page_size as usize].into_boxed_slice();
+        from_bytes_mut::<Meta>(&mut buf).init(page_size);
         buf
     }
 }
@@ -433,8 +437,8 @@ mod tests {
         let meta_hand = temp_dir.meta("sync.db")?;
 
         assert_eq!(meta_hand.fmt_ver(), CUR_FMT_VER);
-        assert_eq!(meta_hand.root1(), 3);
-        assert_eq!(meta_hand.root2(), 4);
+        assert_eq!(meta_hand.root1(), 2);
+        assert_eq!(meta_hand.root2(), 3);
 
         Ok(())
     }

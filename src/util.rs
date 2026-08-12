@@ -36,8 +36,8 @@ pub fn pick_page_size<P: AsRef<Path>>(path: P) -> Result<u64> {
     }
 }
 
-pub type Checksum = u64;
-pub const CHECKSUM_SIZE: usize = size_of::<Checksum>();
+pub(crate) type Checksum = u64;
+pub(crate) const CHECKSUM_SIZE: usize = size_of::<Checksum>();
 
 pub fn update_checksum(buf: &mut [u8]) {
     let len = buf.len();

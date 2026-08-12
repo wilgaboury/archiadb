@@ -1049,12 +1049,12 @@ impl IoLoop {
     }
 }
 
-pub fn choose_page_size(file: &File) -> Result<usize> {
+pub fn choose_page_size(file: &File) -> Result<PgIdx> {
     let fd = file.as_fd();
     let fstatvfs = fstatvfs(fd)?;
     let block_size = fstatvfs.f_bsize as u64;
     if MIN_PAGE_SIZE % block_size == 0 || block_size % MIN_PAGE_SIZE == 0 {
-        Ok(cmp::max(block_size, MIN_PAGE_SIZE) as usize)
+        Ok(cmp::max(block_size, MIN_PAGE_SIZE))
     } else {
         // realistically, there should be no linux filesytems that fail this check
         Err(anyhow!("Unsupported filesystem block size: {}", block_size))

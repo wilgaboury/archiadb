@@ -9,10 +9,10 @@ use crate::{
     file::DbFile,
     fio::{DEFAULT_CQ_SIZE, DEFAULT_SQ_SIZE, Fio},
     flux::Flux,
-    galloc::{Galloc, galloc_recover},
+    galloc::{Galloc, galloc_recover, init_root},
     key::{KeyPath, KeyPathBuf},
     lock::{Lock, LockGuard, LockType},
-    meta::MetaHandler,
+    meta::{MetaHandler, NUM_HEADER_PAGES},
     trie::TxnKeyTrie,
     txnmap::TxnFreeDeferMap,
 };
@@ -54,6 +54,7 @@ impl Db {
             generic_op_state_pool,
         )?;
 
+        // check if database file suffered dirty shutdown
         if meta.open_async().await {
             galloc_recover(&meta, &fio).await?;
         }
@@ -63,8 +64,8 @@ impl Db {
         })
         .await?;
 
-        if meta.len() == 2 {
-            // TODO: init root nodes
+        if meta.len() == NUM_HEADER_PAGES {
+            init_root(&meta, &fio).await?;
         }
 
         Ok(Self {

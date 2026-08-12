@@ -10,8 +10,8 @@ use crate::{
     util::from_bytes_mut,
 };
 
-pub(crate) const MIN_ARENA_LEN: u64 = 2 ^ 2;
-pub(crate) const MAX_ARENA_LEN: u64 = 2 ^ 18; // 1GB with 4kb page
+pub(crate) const MIN_ARENA_LEN: u64 = 1 << 2;
+pub(crate) const MAX_ARENA_LEN: u64 = 1 << 18; // 1GB with 4kb page
 
 #[derive(Debug)]
 pub(crate) struct Galloc {
@@ -84,11 +84,38 @@ pub(crate) async fn galloc_recover(meta: &MetaHandler, fio: &Fio) -> Result<()> 
     Ok(())
 }
 
+pub(crate) async fn init_root(meta: &MetaHandler, fio: &Fio) -> Result<()> {
+    let len = meta.len();
+    let front_idx = len;
+    let back_idx = len + 1;
+    fio.alloc(len + 2).await?;
+
+    let mut front = fio.get_buf();
+    let mut back = fio.get_buf();
+    let mut root = fio.get_buf();
+    from_bytes_mut::<BTreeRootHeader>(front.get_mut()).init();
+    from_bytes_mut::<BTreeRootHeader>(back.get_mut()).init();
+    from_bytes_mut::<BTreeRootHeader>(root.get_mut()).init();
+    fio.write(front_idx, front).await?;
+    fio.write(back_idx, back).await?;
+
+    fio.commit().await?;
+
+    meta.mutate_async(&fio, |meta| {
+        meta.set_len(len + 2);
+    })
+    .await?;
+
+    galloc_helper(meta, fio, root, front_idx, back_idx).await?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use function_name::named;
 
-    use crate::test_util::TempDir;
+    use crate::{meta::NUM_HEADER_PAGES, test_util::TempDir};
 
     use super::*;
 
@@ -99,7 +126,7 @@ mod tests {
         let tmp = TempDir::new(function_name!()).unwrap();
         let db = tmp.db(LOC).await?;
 
-        assert_eq!(2, db.inner.meta.len());
+        assert_eq!(NUM_HEADER_PAGES + 2 + MIN_ARENA_LEN, db.inner.meta.len());
 
         db.try_close()?;
 
