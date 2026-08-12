@@ -63,6 +63,10 @@ impl Db {
         })
         .await?;
 
+        if meta.len() == 2 {
+            // TODO: init root nodes
+        }
+
         Ok(Self {
             inner: Arc::new(DbInner {
                 file,

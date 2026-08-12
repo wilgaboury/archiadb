@@ -92,15 +92,13 @@ When new B+tree roots are first created or when one runs out of pages in their l
 
 1. acquire global alloc lock
 2. falloc, extend file to create new arena
-3. write tuple (previous file len, root page index) and checksum to the last page of file, one past arena end.
+3. write new file length and B+tree root indexes to meta page
 4. fsync
-5. write new file length to meta page
+5. write arena information to B+tree root page
 6. fsync
-7. prepend arena information to B+tree root page
-9. fsync
-10. wipe last page
-11. fsync
-12. release lock
+7. wipe btree root indexes from meta page
+8. fsync
+9. release lock
 
 This dance with the last page data is important for crash recovery, since this process is not committed atomically. A crash that occurs after extending the file but before the new arena has been committed to the B+tree is at risk of leaking a chunk of the file. On startup, if a crash is detected, the recovery process reads the last page. If the checksum is valid and a partial global alloc indicated, it checks the root that it points to and checks that it knows about the arena. If not, the root is updated to complete the allocation.
 
