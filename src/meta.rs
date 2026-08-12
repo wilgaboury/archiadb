@@ -19,11 +19,12 @@ pub(crate) type MagicTypeDisk = U128;
 pub(crate) const MAGIC: MagicType = 0xa90e3b4b1b0833499933888e3933af0d; // Random GUID
 pub(crate) const NUM_HEADER_PAGES: u64 = 2;
 
-#[repr(u32)]
+#[repr(u16)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FmtVer {
     V1 = 0,
 }
+type FmtVerDisk = U16;
 
 const CUR_FMT_VER: FmtVer = FmtVer::V1;
 
@@ -42,7 +43,7 @@ impl TryFrom<u64> for FmtVer {
 pub(crate) struct Meta {
     magic: MagicTypeDisk,
 
-    fmt_ver: U16,
+    fmt_ver: FmtVerDisk,
     pg_size: InPgIdxDisk,
     root1: PgIdxDisk,
     root2: PgIdxDisk,
@@ -292,13 +293,13 @@ impl MetaHandler {
     }
 
     fn read_page_size(file: &File) -> Result<u64> {
-        let offset: u64 = (size_of::<MagicType>() + size_of::<FmtVer>()) as u64;
-        let mut buf = [0u8; size_of::<u64>()];
+        let offset: u64 = (size_of::<MagicTypeDisk>() + size_of::<FmtVerDisk>()) as u64;
+        let mut buf = [0u8; size_of::<InPgIdxDisk>()];
         let read = file.read_at(&mut buf, offset)?;
-        if read < size_of::<u64>() {
+        if read < size_of::<InPgIdxDisk>() {
             bail!("File too small to contain metadata");
         }
-        let page_size = u64::from_le_bytes(buf);
+        let page_size = from_bytes::<InPgIdxDisk>(&buf).get();
         if page_size < MIN_PAGE_SIZE || page_size % MIN_PAGE_SIZE != 0 || page_size > MAX_PAGE_SIZE
         {
             bail!("Invalid page size in metadata");
@@ -381,10 +382,10 @@ mod tests {
         let meta = from_bytes::<Meta>(&buf);
         assert_eq!(meta.len(), 101);
 
-        meta_hand.mutate(&file, |m| m.set_len(0x1FFFFFFFFFFFFFFF))?;
+        meta_hand.mutate(&file, |m| m.set_len(0x0000005544332211))?;
         file.read_at(&mut buf, meta_hand.pg_size)?;
         let meta = from_bytes::<Meta>(&buf);
-        assert_eq!(meta.len(), 0x1FFFFFFFFFFFFFFF);
+        assert_eq!(meta.len(), 0x0000005544332211);
 
         Ok(())
     }
@@ -412,11 +413,11 @@ mod tests {
             assert_eq!(meta.len(), 101);
 
             meta_hand
-                .mutate_async(&fio, |m| m.set_len(0x1FFFFFFFFFFFFFFF))
+                .mutate_async(&fio, |m| m.set_len(0x0000005544332211))
                 .await?;
             let buf = fio.read(1).await?;
             let meta = from_bytes::<Meta>(&buf.get());
-            assert_eq!(meta.len(), 0x1FFFFFFFFFFFFFFF);
+            assert_eq!(meta.len(), 0x0000005544332211);
 
             Ok(())
         });
