@@ -11,7 +11,7 @@ use crate::{
     fio::{Fio, MIN_PAGE_SIZE, PageBuf},
     flux::FluxBuf,
     key::KeyPath,
-    uint::{InPgIdx, InPgIdxDisk, PgIdx, PgIdxDisk},
+    uint::{InPgIdx, InPgIdxDisk, PgIdx, PgIdxDisk, U64},
     util::{CHECKSUM_SIZE, from_bytes, from_bytes_mut, has_valid_checksum},
 };
 
@@ -265,33 +265,17 @@ impl Arena {
 #[repr(C, packed)]
 pub(crate) struct BTreeRootHeader {
     pub(crate) header: BTreeHeader,
-    version: u64,
-    free: u64,
+    pub(crate) version: U64,
+    pub(crate) free: PgIdxDisk,
     pub(crate) arena: Arena,
 }
 
 impl BTreeRootHeader {
     pub(crate) fn init(&mut self) {
         self.header.init(BTreeNodeKind::Root);
-        self.version = 0;
-        self.free = 0;
+        self.version.set(0);
+        self.free.set(0);
         self.arena.init();
-    }
-
-    pub(crate) fn version(&self) -> u64 {
-        u64::from_le(self.version)
-    }
-
-    pub(crate) fn set_version(&mut self, version: u64) {
-        self.version = u64::to_le(version);
-    }
-
-    pub(crate) fn free(&self) -> u64 {
-        u64::from_le(self.free)
-    }
-
-    pub(crate) fn set_free(&mut self, free: u64) {
-        self.free = u64::to_le(free);
     }
 }
 
@@ -754,7 +738,7 @@ impl RootDoublePageBuf {
             let keep_order = {
                 let root1 = from_bytes::<BTreeRootHeader>(&pg1.get());
                 let root2 = from_bytes::<BTreeRootHeader>(&pg2.get());
-                root1.version >= root2.version
+                root1.version.get() >= root2.version.get()
             };
             if keep_order {
                 Ok(((pg_idx1, pg1), (pg_idx2, pg2)))
@@ -795,26 +779,21 @@ impl Txn {
         }
     }
 
-    async fn btree_upsert(
-        &mut self,
-        key: &[u8],
-        value: &[u8],
-        mut root: FluxBuf,
-    ) -> Result<FluxBuf> {
-        let version = root.get_mut().root_header().version;
+    async fn btree_upsert(&mut self, key: &[u8], value: &[u8], root: FluxBuf) -> Result<FluxBuf> {
         match self
             .btree_upsert_inner(key, LeafValue::Value(value), root)
             .await?
         {
             InsertResult::Single(mut page_buf) => {
-                page_buf.get_mut().root_header_mut().version += 1;
+                let header = page_buf.get_mut().root_header_mut();
+                header.version.set(header.version.get() + 1);
                 Ok(page_buf)
             }
             InsertResult::Split(left, split, right) => {
                 let mut pg_buf = self.flux_buf();
-
-                pg_buf.get_mut().root_header_mut().init();
-                pg_buf.get_mut().root_header_mut().version = version + 1;
+                let header = pg_buf.get_mut().root_header_mut();
+                header.init();
+                header.version.set(header.version.get() + 1);
                 insert_at_inner(pg_buf.get_mut(), 0, left, &split, right);
 
                 Ok(pg_buf)
@@ -1016,7 +995,7 @@ fn test_access() {
     let slice = &buffer[1..];
     let header = from_bytes::<BTreeRootHeader>(slice);
     assert_eq!({ header.header.kind.clone() }, BTreeNodeKind::Root);
-    assert_eq!({ header.version }, 0);
+    assert_eq!(header.version.get(), 0);
     assert_eq!(header.header.len(), 0);
 }
 

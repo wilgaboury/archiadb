@@ -41,20 +41,20 @@ impl TryFrom<u64> for FmtVer {
 
 #[repr(C, packed)]
 pub(crate) struct Meta {
-    magic: MagicTypeDisk,
+    pub(crate) magic: MagicTypeDisk,
 
-    fmt_ver: FmtVerDisk,
-    pg_size: InPgIdxDisk,
-    root1: PgIdxDisk,
-    root2: PgIdxDisk,
+    pub(crate) fmt_ver: FmtVerDisk,
+    pub(crate) pg_size: InPgIdxDisk,
+    pub(crate) root1: PgIdxDisk,
+    pub(crate) root2: PgIdxDisk,
 
-    version: U64,
-    open: u8,
-    len: PgIdxDisk,
+    pub(crate) version: U64,
+    pub(crate) open: u8,
+    pub(crate) len: PgIdxDisk,
 
     // global alloc data
-    galloc_fidx: PgIdxDisk,
-    galloc_bidx: PgIdxDisk,
+    pub(crate) galloc_fidx: PgIdxDisk,
+    pub(crate) galloc_bidx: PgIdxDisk,
 }
 
 const_assert!(size_of::<Meta>() + size_of::<Checksum>() < MIN_PAGE_SIZE as usize);
