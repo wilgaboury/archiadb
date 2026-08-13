@@ -1,3 +1,5 @@
+<img align="left" height="60px" hspace="10" src="files/logo.svg"/>
+
 # ArchiaDB
 
 [![Build Status](https://github.com/wilgaboury/sbdb/workflows/build/badge.svg)](https://github.com/wilgaboury/sbdb/actions)
