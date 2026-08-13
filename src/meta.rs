@@ -55,6 +55,7 @@ pub(crate) struct Meta {
     // global alloc data
     pub(crate) galloc_fidx: PgIdxDisk,
     pub(crate) galloc_bidx: PgIdxDisk,
+    pub(crate) galloc_len: PgIdxDisk,
 }
 
 const_assert!(size_of::<Meta>() + size_of::<Checksum>() < MIN_PAGE_SIZE as usize);
