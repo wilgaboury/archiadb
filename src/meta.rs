@@ -8,10 +8,13 @@ use anyhow::{Result, anyhow, bail};
 use tokio::sync::Mutex;
 
 use crate::{
+    btree::BTreeRootHeader,
     const_assert,
     fio::{Fio, MAX_PAGE_SIZE, MIN_PAGE_SIZE, choose_page_size},
     uint::{InPgIdxDisk, PgIdx, PgIdxDisk, U16, U64, U128},
-    util::{Checksum, from_bytes, from_bytes_mut, has_valid_checksum, update_checksum},
+    util::{
+        Checksum, from_bytes, from_bytes_mut, has_valid_checksum, order_front_back, update_checksum,
+    },
 };
 
 pub(crate) type MagicType = u128;
@@ -172,7 +175,10 @@ impl MetaHandler {
             let page_size = Self::read_page_size(&file)?;
             let buf1 = Self::read_buf(&file, page_size, 0)?;
             let buf2 = Self::read_buf(&file, page_size, page_size)?;
-            let (is_first, front, mut back) = Self::choose_front_back(buf1, buf2)?;
+            let (is_first, front, _, mut back) = order_front_back(true, buf1, false, buf2, |pg| {
+                let root = from_bytes::<Meta>(&pg.as_ref());
+                root.version.get()
+            })?;
             back.copy_from_slice(&front);
 
             if from_bytes::<Meta>(&front).magic() != MAGIC {
@@ -321,31 +327,6 @@ impl MetaHandler {
             bail!("File too small to contain metadata");
         }
         Ok(buf.into())
-    }
-
-    fn choose_front_back(buf1: Box<[u8]>, buf2: Box<[u8]>) -> Result<(bool, Box<[u8]>, Box<[u8]>)> {
-        let buf1_checksum_valid = has_valid_checksum(&buf1);
-        let buf2_checksum_valid = has_valid_checksum(&buf2);
-
-        if !buf1_checksum_valid && !buf2_checksum_valid {
-            bail!("File corrupted, both metadata pages have invalid checksums");
-        } else if buf1_checksum_valid && !buf2_checksum_valid {
-            Ok((true, buf1, buf2))
-        } else if !buf1_checksum_valid && buf2_checksum_valid {
-            Ok((false, buf2, buf1))
-        } else {
-            // Both checksums are valid, choose the one with higher version
-            let keep_order = {
-                let meta1 = from_bytes::<Meta>(&buf1);
-                let meta2 = from_bytes::<Meta>(&buf2);
-                meta1.version() >= meta2.version()
-            };
-            if keep_order {
-                Ok((true, buf1, buf2))
-            } else {
-                Ok((false, buf2, buf1))
-            }
-        }
     }
 
     fn create_buf(page_size: PgIdx) -> Box<[u8]> {

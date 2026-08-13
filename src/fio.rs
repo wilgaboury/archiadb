@@ -187,6 +187,18 @@ pub enum PageBuf {
     Dynamic(Box<[u8]>),
 }
 
+impl AsRef<[u8]> for PageBuf {
+    fn as_ref(&self) -> &[u8] {
+        self.get()
+    }
+}
+
+impl AsMut<[u8]> for PageBuf {
+    fn as_mut(&mut self) -> &mut [u8] {
+        self.get_mut()
+    }
+}
+
 impl PageBuf {
     pub fn get(&self) -> &[u8] {
         match self {
