@@ -13,7 +13,7 @@ use crate::{
     key::{KeyPath, KeyPathBuf},
     lock::{Lock, LockGuard, LockType},
     meta::{MetaHandler, NUM_HEADER_PAGES},
-    trie::TxnKeyTrie,
+    trie::KeyTrie,
     txnmap::TxnFreeDeferMap,
 };
 
@@ -88,7 +88,7 @@ impl Db {
     pub fn txn(&self) -> TxnBuilder {
         TxnBuilder {
             db: self.clone(),
-            ops: TxnKeyTrie::new(),
+            ops: KeyTrie::new(),
         }
     }
 
@@ -111,7 +111,7 @@ impl Drop for DbInner {
 
 pub struct TxnBuilder {
     db: Db,
-    ops: TxnKeyTrie<LockType>,
+    ops: KeyTrie<LockType>,
 }
 
 impl TxnBuilder {
@@ -146,7 +146,7 @@ impl TxnBuilder {
             free: Vec::new(),
             ops: self.ops,
             flux: Flux::new(),
-            writes: TxnKeyTrie::new(),
+            writes: KeyTrie::new(),
         }
     }
 }
@@ -156,9 +156,9 @@ pub struct Txn {
     pub(crate) db: Db,
     pub(crate) guards: Vec<LockGuard>,
     pub(crate) free: Vec<u64>,
-    pub(crate) ops: TxnKeyTrie<LockType>,
+    pub(crate) ops: KeyTrie<LockType>,
     pub(crate) flux: Flux,
-    pub(crate) writes: TxnKeyTrie<Option<u64>>,
+    pub(crate) writes: KeyTrie<Option<u64>>,
 }
 
 impl Txn {

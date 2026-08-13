@@ -11,16 +11,16 @@ use crate::{
 };
 
 /// Benefit of tries is that it automatically merges common prefixes, detects conflicts, and is sorted for locking.
-pub(crate) struct TxnKeyTrie<T> {
-    root: Option<TxnKeyTrieNode<T>>,
+pub(crate) struct KeyTrie<T> {
+    root: Option<KeyTrieNode<T>>,
 }
 
-pub(crate) struct TxnKeyTrieNode<T> {
+pub(crate) struct KeyTrieNode<T> {
     value: T,
-    children: BTreeMap<Vec<u8>, TxnKeyTrieNode<T>>,
+    children: BTreeMap<Vec<u8>, KeyTrieNode<T>>,
 }
 
-impl<T> TxnKeyTrie<T> {
+impl<T> KeyTrie<T> {
     pub fn new() -> Self {
         Self { root: None }
     }
@@ -30,10 +30,10 @@ impl<T> TxnKeyTrie<T> {
             Some(node) => node,
             None => {
                 if path.len() > 0 {
-                    self.root = Some(TxnKeyTrieNode::new(value_inter()));
+                    self.root = Some(KeyTrieNode::new(value_inter()));
                     self.root.as_mut().unwrap()
                 } else {
-                    self.root = Some(TxnKeyTrieNode::new(value));
+                    self.root = Some(KeyTrieNode::new(value));
                     return Ok(());
                 }
             }
@@ -44,14 +44,13 @@ impl<T> TxnKeyTrie<T> {
             if iter.peek().is_some() {
                 if !node.children.contains_key(key) {
                     node.children
-                        .insert(key.to_vec(), TxnKeyTrieNode::new(value_inter()));
+                        .insert(key.to_vec(), KeyTrieNode::new(value_inter()));
                 }
             } else {
                 if node.children.contains_key(key) {
                     node.children.get_mut(key).unwrap().value = value;
                 } else {
-                    node.children
-                        .insert(key.to_vec(), TxnKeyTrieNode::new(value));
+                    node.children.insert(key.to_vec(), KeyTrieNode::new(value));
                 }
                 break;
             }
@@ -121,24 +120,24 @@ impl<T> TxnKeyTrie<T> {
         }
     }
 
-    pub fn bfs_iter(&self) -> TxnKeyTrieBfsIter<'_, T> {
-        TxnKeyTrieBfsIter::new(self)
+    pub fn bfs_iter(&self) -> KeyTrieBfsIter<'_, T> {
+        KeyTrieBfsIter::new(self)
     }
 
-    pub fn bfs_iter_mut(&mut self) -> TxnKeyTrieBfsIterMut<'_, T> {
-        TxnKeyTrieBfsIterMut::new(self)
+    pub fn bfs_iter_mut(&mut self) -> KeyTrieBfsIterMut<'_, T> {
+        KeyTrieBfsIterMut::new(self)
     }
 
-    pub fn dfs_iter(&self) -> TxnKeyTrieDfsIter<'_, T> {
-        TxnKeyTrieDfsIter::new(self)
+    pub fn dfs_iter(&self) -> KeyTrieDfsIter<'_, T> {
+        KeyTrieDfsIter::new(self)
     }
 
-    pub fn dfs_iter_mut(&mut self) -> TxnKeyTrieDfsIterMut<'_, T> {
-        TxnKeyTrieDfsIterMut::new(self)
+    pub fn dfs_iter_mut(&mut self) -> KeyTrieDfsIterMut<'_, T> {
+        KeyTrieDfsIterMut::new(self)
     }
 }
 
-impl TxnKeyTrie<LockType> {
+impl KeyTrie<LockType> {
     pub fn insert_lock(&mut self, path: &KeyPath, lock_type: LockType) -> Result<()> {
         let next_lock_type = if path.len() == 0 {
             lock_type
@@ -153,7 +152,7 @@ impl TxnKeyTrie<LockType> {
                 .is_compatible(&next_lock_type)
                 .context("incompatible lock types")?;
         } else {
-            self.root = Some(TxnKeyTrieNode::new(next_lock_type))
+            self.root = Some(KeyTrieNode::new(next_lock_type))
         }
         let mut node = self.root.as_mut().unwrap();
 
@@ -174,7 +173,7 @@ impl TxnKeyTrie<LockType> {
                 next
             } else {
                 node.children
-                    .insert(key.to_vec(), TxnKeyTrieNode::new(next_lock_type));
+                    .insert(key.to_vec(), KeyTrieNode::new(next_lock_type));
                 node.children.get_mut(key).unwrap()
             }
         }
@@ -227,7 +226,7 @@ impl TxnKeyTrie<LockType> {
     }
 }
 
-impl<T> TxnKeyTrieNode<T> {
+impl<T> KeyTrieNode<T> {
     pub fn new(value: T) -> Self {
         Self {
             value,
@@ -257,14 +256,14 @@ impl<T> TxnKeyTrieNode<T> {
     }
 }
 
-pub(crate) struct TxnKeyTrieDfsIter<'a, T> {
-    stack: Vec<(KeyPathBuf, *const TxnKeyTrieNode<T>)>,
-    visited: HashSet<*const TxnKeyTrieNode<T>>,
-    _phantom: PhantomData<&'a TxnKeyTrie<T>>,
+pub(crate) struct KeyTrieDfsIter<'a, T> {
+    stack: Vec<(KeyPathBuf, *const KeyTrieNode<T>)>,
+    visited: HashSet<*const KeyTrieNode<T>>,
+    _phantom: PhantomData<&'a KeyTrie<T>>,
 }
 
-impl<'a, T> TxnKeyTrieDfsIter<'a, T> {
-    pub fn new(trie: &TxnKeyTrie<T>) -> Self {
+impl<'a, T> KeyTrieDfsIter<'a, T> {
+    pub fn new(trie: &KeyTrie<T>) -> Self {
         let mut ret = Self {
             stack: Vec::new(),
             visited: HashSet::new(),
@@ -277,7 +276,7 @@ impl<'a, T> TxnKeyTrieDfsIter<'a, T> {
     }
 }
 
-impl<'a, T> Iterator for TxnKeyTrieDfsIter<'a, T> {
+impl<'a, T> Iterator for KeyTrieDfsIter<'a, T> {
     type Item = (KeyPathBuf, &'a T);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -286,14 +285,14 @@ impl<'a, T> Iterator for TxnKeyTrieDfsIter<'a, T> {
     }
 }
 
-pub(crate) struct TxnKeyTrieDfsIterMut<'a, T> {
-    stack: Vec<(KeyPathBuf, *const TxnKeyTrieNode<T>)>,
-    visited: HashSet<*const TxnKeyTrieNode<T>>,
-    _phantom: PhantomData<&'a TxnKeyTrie<T>>,
+pub(crate) struct KeyTrieDfsIterMut<'a, T> {
+    stack: Vec<(KeyPathBuf, *const KeyTrieNode<T>)>,
+    visited: HashSet<*const KeyTrieNode<T>>,
+    _phantom: PhantomData<&'a KeyTrie<T>>,
 }
 
-impl<'a, T> TxnKeyTrieDfsIterMut<'a, T> {
-    pub fn new(trie: &mut TxnKeyTrie<T>) -> Self {
+impl<'a, T> KeyTrieDfsIterMut<'a, T> {
+    pub fn new(trie: &mut KeyTrie<T>) -> Self {
         let mut ret = Self {
             stack: Vec::new(),
             visited: HashSet::new(),
@@ -306,21 +305,19 @@ impl<'a, T> TxnKeyTrieDfsIterMut<'a, T> {
     }
 }
 
-impl<'a, T> Iterator for TxnKeyTrieDfsIterMut<'a, T> {
+impl<'a, T> Iterator for KeyTrieDfsIterMut<'a, T> {
     type Item = (KeyPathBuf, &'a mut T);
 
     fn next(&mut self) -> Option<Self::Item> {
         let (path, cur) = dfs_step(&mut self.stack, &mut self.visited)?;
-        Some((path, unsafe {
-            &mut (*(cur as *mut TxnKeyTrieNode<T>)).value
-        }))
+        Some((path, unsafe { &mut (*(cur as *mut KeyTrieNode<T>)).value }))
     }
 }
 
 fn dfs_iter_init<T>(
-    trie: &TxnKeyTrie<T>,
-    stack: &mut Vec<(KeyPathBuf, *const TxnKeyTrieNode<T>)>,
-    visited: &mut HashSet<*const TxnKeyTrieNode<T>>,
+    trie: &KeyTrie<T>,
+    stack: &mut Vec<(KeyPathBuf, *const KeyTrieNode<T>)>,
+    visited: &mut HashSet<*const KeyTrieNode<T>>,
 ) {
     if let Some(root) = trie.root.as_ref() {
         let root = root as *const _;
@@ -330,11 +327,11 @@ fn dfs_iter_init<T>(
 }
 
 fn dfs_step<T>(
-    stack: &mut Vec<(KeyPathBuf, *const TxnKeyTrieNode<T>)>,
-    visited: &mut HashSet<*const TxnKeyTrieNode<T>>,
-) -> Option<(KeyPathBuf, *const TxnKeyTrieNode<T>)> {
+    stack: &mut Vec<(KeyPathBuf, *const KeyTrieNode<T>)>,
+    visited: &mut HashSet<*const KeyTrieNode<T>>,
+) -> Option<(KeyPathBuf, *const KeyTrieNode<T>)> {
     let (path, cur) = stack.pop()?;
-    let cur = unsafe { &mut *(cur as *mut TxnKeyTrieNode<T>) };
+    let cur = unsafe { &mut *(cur as *mut KeyTrieNode<T>) };
 
     for (key, child) in cur.children.iter().rev() {
         let child = child as *const _;
@@ -349,13 +346,13 @@ fn dfs_step<T>(
     Some((path, cur))
 }
 
-pub(crate) struct TxnKeyTrieBfsIter<'a, T> {
-    queue: VecDeque<(KeyPathBuf, *const TxnKeyTrieNode<T>)>,
-    _phantom: PhantomData<&'a TxnKeyTrie<T>>,
+pub(crate) struct KeyTrieBfsIter<'a, T> {
+    queue: VecDeque<(KeyPathBuf, *const KeyTrieNode<T>)>,
+    _phantom: PhantomData<&'a KeyTrie<T>>,
 }
 
-impl<'a, T> TxnKeyTrieBfsIter<'a, T> {
-    pub fn new(trie: &'a TxnKeyTrie<T>) -> Self {
+impl<'a, T> KeyTrieBfsIter<'a, T> {
+    pub fn new(trie: &'a KeyTrie<T>) -> Self {
         let mut ret = Self {
             queue: VecDeque::new(),
             _phantom: PhantomData::default(),
@@ -367,7 +364,7 @@ impl<'a, T> TxnKeyTrieBfsIter<'a, T> {
     }
 }
 
-impl<'a, T> Iterator for TxnKeyTrieBfsIter<'a, T> {
+impl<'a, T> Iterator for KeyTrieBfsIter<'a, T> {
     type Item = (KeyPathBuf, &'a T);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -376,13 +373,13 @@ impl<'a, T> Iterator for TxnKeyTrieBfsIter<'a, T> {
     }
 }
 
-pub(crate) struct TxnKeyTrieBfsIterMut<'a, T> {
-    queue: VecDeque<(KeyPathBuf, *const TxnKeyTrieNode<T>)>,
-    _phantom: PhantomData<&'a TxnKeyTrie<T>>,
+pub(crate) struct KeyTrieBfsIterMut<'a, T> {
+    queue: VecDeque<(KeyPathBuf, *const KeyTrieNode<T>)>,
+    _phantom: PhantomData<&'a KeyTrie<T>>,
 }
 
-impl<'a, T> TxnKeyTrieBfsIterMut<'a, T> {
-    pub fn new(trie: &'a mut TxnKeyTrie<T>) -> Self {
+impl<'a, T> KeyTrieBfsIterMut<'a, T> {
+    pub fn new(trie: &'a mut KeyTrie<T>) -> Self {
         let mut ret = Self {
             queue: VecDeque::new(),
             _phantom: PhantomData::default(),
@@ -394,29 +391,24 @@ impl<'a, T> TxnKeyTrieBfsIterMut<'a, T> {
     }
 }
 
-impl<'a, T> Iterator for TxnKeyTrieBfsIterMut<'a, T> {
+impl<'a, T> Iterator for KeyTrieBfsIterMut<'a, T> {
     type Item = (KeyPathBuf, &'a T);
 
     fn next(&mut self) -> Option<Self::Item> {
         let (path, node) = bfs_step(&mut self.queue)?;
-        Some((path, unsafe {
-            &mut (*(node as *mut TxnKeyTrieNode<T>)).value
-        }))
+        Some((path, unsafe { &mut (*(node as *mut KeyTrieNode<T>)).value }))
     }
 }
 
-fn bfs_iter_init<T>(
-    trie: &TxnKeyTrie<T>,
-    queue: &mut VecDeque<(KeyPathBuf, *const TxnKeyTrieNode<T>)>,
-) {
+fn bfs_iter_init<T>(trie: &KeyTrie<T>, queue: &mut VecDeque<(KeyPathBuf, *const KeyTrieNode<T>)>) {
     if let Some(root) = trie.root.as_ref() {
         queue.push_back((KeyPathBuf::new(), root as *const _));
     }
 }
 
 fn bfs_step<T>(
-    queue: &mut VecDeque<(KeyPathBuf, *const TxnKeyTrieNode<T>)>,
-) -> Option<(KeyPathBuf, *const TxnKeyTrieNode<T>)> {
+    queue: &mut VecDeque<(KeyPathBuf, *const KeyTrieNode<T>)>,
+) -> Option<(KeyPathBuf, *const KeyTrieNode<T>)> {
     while let Some((path, node)) = queue.pop_front() {
         let result = Some((path.clone(), node));
 
@@ -439,7 +431,7 @@ mod tests {
 
     #[test]
     fn test_level_order_iterator_with_empty_path() {
-        let mut trie = TxnKeyTrie::new();
+        let mut trie = KeyTrie::new();
 
         trie.insert_lock(key_path![], LockType::Read).unwrap();
         trie.insert_lock(key_path![b"a", b"b"], LockType::Write)
@@ -481,7 +473,7 @@ mod tests {
 
     #[test]
     fn test_read_write_validation() {
-        let mut trie = TxnKeyTrie::new();
+        let mut trie = KeyTrie::new();
 
         trie.insert_lock(key_path![b"read", b"read_recur"], LockType::ReadRecursive)
             .unwrap();
@@ -541,7 +533,7 @@ mod tests {
 
     #[test]
     fn test_lca() -> Result<()> {
-        let mut trie = TxnKeyTrie::new();
+        let mut trie = KeyTrie::new();
 
         trie.upsert(key_path![b"1", b"2", b"4"], || false, false)?;
         trie.upsert(key_path![b"1", b"2", b"5"], || false, false)?;
@@ -583,7 +575,7 @@ mod tests {
 
     #[test]
     fn test_iter() -> Result<()> {
-        let mut trie = TxnKeyTrie::new();
+        let mut trie = KeyTrie::new();
 
         trie.insert_lock(key_path![b"1", b"2"], LockType::Write)?;
         trie.insert_lock(key_path![b"3", b"4"], LockType::Read)?;
@@ -689,16 +681,16 @@ mod tests {
 
     #[test]
     fn try_all_lock_compatability() {
-        let mut trie = TxnKeyTrie::new();
+        let mut trie = KeyTrie::new();
         trie.insert_lock(key_path![], LockType::Read).unwrap();
         trie.insert_lock(key_path![], LockType::Read).unwrap();
         trie.insert_lock(key_path![], LockType::ReadRecursive)
             .unwrap();
-        let mut trie = TxnKeyTrie::new();
+        let mut trie = KeyTrie::new();
         trie.insert_lock(key_path![], LockType::Read).unwrap();
         assert!(trie.insert_lock(key_path![], LockType::Write).is_err());
 
-        let mut trie = TxnKeyTrie::new();
+        let mut trie = KeyTrie::new();
         trie.insert_lock(key_path![b"write1"], LockType::Write)
             .unwrap();
         trie.insert_lock(key_path![], LockType::Read).unwrap();
@@ -710,7 +702,7 @@ mod tests {
         );
         assert!(trie.insert_lock(key_path![], LockType::Write).is_err());
 
-        let mut trie = TxnKeyTrie::new();
+        let mut trie = KeyTrie::new();
         trie.insert_lock(key_path![], LockType::ReadRecursive)
             .unwrap();
         trie.insert_lock(key_path![], LockType::Read).unwrap();
@@ -722,7 +714,7 @@ mod tests {
             .unwrap();
         assert!(trie.insert_lock(key_path![], LockType::Write).is_err());
 
-        let mut trie = TxnKeyTrie::new();
+        let mut trie = KeyTrie::new();
         trie.insert_lock(key_path![], LockType::Write).unwrap();
         assert!(trie.insert_lock(key_path![], LockType::Read).is_err());
         assert!(
