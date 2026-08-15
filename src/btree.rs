@@ -7,7 +7,7 @@ use crate::{
     db::Txn,
     fio::MIN_PAGE_SIZE,
     flux::FluxBuf,
-    uint::{InPgIdx, InPgIdxDisk, PgIdx, PgIdxDisk, U64},
+    uint::{InPgIdx, InPgIdxDisk, PgIdx, PgIdxDisk, U24, U64},
     util::{ChecksumDisk, from_bytes, from_bytes_mut},
 };
 
@@ -244,13 +244,13 @@ impl BTreeHeader {
 }
 
 #[repr(C, packed)]
-pub(crate) struct Arena {
+pub(crate) struct ArenaDisk {
     pub(crate) start: PgIdxDisk,
-    pub(crate) len: PgIdxDisk,
-    pub(crate) next: PgIdxDisk,
+    pub(crate) len: U24,
+    pub(crate) next: U24,
 }
 
-impl Arena {
+impl ArenaDisk {
     pub(crate) fn init(&mut self) {
         self.start.set(0);
         self.len.set(0);
@@ -263,7 +263,7 @@ pub(crate) struct BTreeRootHeader {
     pub(crate) header: BTreeHeader,
     pub(crate) version: U64,
     pub(crate) free: PgIdxDisk,
-    pub(crate) arena: Arena,
+    pub(crate) arena: ArenaDisk,
 }
 
 impl BTreeRootHeader {

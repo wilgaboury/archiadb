@@ -138,6 +138,10 @@ pub(crate) async fn read_root_w_retry(
     order_front_back(pg_idx1, pg1, pg_idx2, pg2, version)
 }
 
+pub(crate) fn ceil_div(num: u64, den: u64) -> u64 {
+    (num + den - 1) / den
+}
+
 #[cfg(test)]
 mod tests {
     use function_name::named;
