@@ -14,7 +14,7 @@ use crate::{
     db::Db,
     fio::PageBuf,
     key::KeyPath,
-    uint::{InPgIdx, PgIdx},
+    uint::{InPgIdx, PgIdx, U64},
 };
 
 #[macro_export]
@@ -48,22 +48,19 @@ pub fn pick_page_size<P: AsRef<Path>>(path: P) -> Result<u64> {
 }
 
 pub(crate) type Checksum = u64;
-pub(crate) const CHECKSUM_SIZE: usize = size_of::<Checksum>();
+pub(crate) type ChecksumDisk = U64;
 
 pub(crate) fn update_checksum(buf: &mut [u8]) {
     let len = buf.len();
-    let checksum = xxh3_64(&buf[..len - CHECKSUM_SIZE]);
-    buf[len - CHECKSUM_SIZE..].clone_from_slice(&checksum.to_le_bytes());
+    let checksum = xxh3_64(&buf[..len - size_of::<ChecksumDisk>()]);
+    from_bytes_mut::<ChecksumDisk>(&mut buf[len - size_of::<ChecksumDisk>()..]).set(checksum);
 }
 
 pub(crate) fn has_valid_checksum(buf: &[u8]) -> bool {
     let len = buf.len();
-    let checksum_bytes: [u8; CHECKSUM_SIZE] = buf[len - CHECKSUM_SIZE..]
-        .try_into()
-        .expect("buffer cannot fit checksum");
-    let checksum = Checksum::from_le_bytes(checksum_bytes);
-    let content_checksum = xxh3_64(&buf[..len - CHECKSUM_SIZE]);
-    content_checksum == checksum
+    let disk_checksum = from_bytes::<ChecksumDisk>(&buf[len - size_of::<ChecksumDisk>()..]).get();
+    let content_checksum = xxh3_64(&buf[..len - size_of::<ChecksumDisk>()]);
+    disk_checksum == content_checksum
 }
 
 pub(crate) fn from_bytes<T>(buf: &[u8]) -> &T {
@@ -127,8 +124,8 @@ pub(crate) async fn read_root_w_retry(
 
     let start = Instant::now();
     while Instant::now().duration_since(start) < timeout {
-        let pg1 = db.inner.fio.read(pg_idx1).await?;
-        let pg2 = db.inner.fio.read(pg_idx2).await?;
+        let pg1 = db.inner.fio.read_unchecked(pg_idx1).await?;
+        let pg2 = db.inner.fio.read_unchecked(pg_idx2).await?;
         if let Ok(ret) = order_front_back(pg_idx1, pg1, pg_idx2, pg2, version) {
             return Ok(ret);
         }
@@ -136,17 +133,29 @@ pub(crate) async fn read_root_w_retry(
 
     let carc = db.inner.write_locks.get(key.to_owned());
     let _gaurd = carc.lock().await;
-    let pg1 = db.inner.fio.read(pg_idx1).await?;
-    let pg2 = db.inner.fio.read(pg_idx2).await?;
+    let pg1 = db.inner.fio.read_unchecked(pg_idx1).await?;
+    let pg2 = db.inner.fio.read_unchecked(pg_idx2).await?;
     order_front_back(pg_idx1, pg1, pg_idx2, pg2, version)
 }
 
 #[cfg(test)]
 mod tests {
+    use function_name::named;
+    use tokio::{
+        spawn,
+        task::JoinHandle,
+        time::{error::Elapsed, sleep, timeout},
+    };
+
+    use crate::{
+        key_path,
+        test_util::{TempDir, corrupt_checksum, uncorrput_checksum},
+    };
+
     use super::*;
 
     #[test]
-    fn test_pick_block_size() {
+    fn pick_block_size() {
         let block_size = get_fs_block_size(Path::new("/")).unwrap();
         println!("Filesystem block size: {}", block_size);
         let page_size = pick_page_size(Path::new("/")).unwrap();
@@ -154,12 +163,104 @@ mod tests {
     }
 
     #[test]
-    fn test_checksum() {
+    fn checksum() {
         let mut content: [u8; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0, 0, 0, 0, 0];
         assert!(!has_valid_checksum(&content));
         update_checksum(&mut content);
         assert!(has_valid_checksum(&content));
-        content.fill(1);
+        corrupt_checksum(&mut content);
         assert!(!has_valid_checksum(&content));
+        uncorrput_checksum(&mut content);
+        assert!(has_valid_checksum(&content));
+    }
+
+    #[test]
+    #[should_panic(expected = "buffer misaligned for type")]
+    fn test_from_bytes_misaligned() {
+        let buf = [0u8; 16];
+        let misaligned = &buf[1..];
+        let _: &u64 = from_bytes(misaligned);
+    }
+
+    #[test]
+    #[should_panic(expected = "buffer misaligned for type")]
+    fn test_from_bytes_mut_misaligned() {
+        let mut buf = [0u8; 16];
+        let misaligned = &mut buf[1..];
+        let _: &mut u64 = from_bytes_mut(misaligned);
+    }
+
+    #[named]
+    #[tokio::test]
+    async fn root_rety_no_lock() -> Result<()> {
+        let tmp = TempDir::new(function_name!())?;
+        let db = tmp.db("db").await?;
+
+        let mut buf: PageBuf = db.inner.fio.read(2).await?;
+        corrupt_checksum(buf.get_mut());
+        db.inner.fio.write_unchecked(2, buf).await?;
+        let mut buf: PageBuf = db.inner.fio.read(3).await?;
+        corrupt_checksum(buf.get_mut());
+        db.inner.fio.write_unchecked(3, buf).await?;
+        db.inner.fio.commit().await?;
+
+        let db2 = db.clone();
+        let task: JoinHandle<Result<()>> = tokio::spawn(async move {
+            let (pg1, _, pg2, _) =
+                read_root_w_retry(&db2, key_path![], 2, 3, Duration::from_secs(10)).await?;
+
+            assert_eq!(pg1, 3);
+            assert_eq!(pg2, 2);
+
+            anyhow::Result::Ok(())
+        });
+
+        sleep(Duration::from_millis(500)).await;
+
+        assert!(!task.is_finished());
+
+        let buf: PageBuf = db.inner.fio.read_unchecked(3).await?;
+        db.inner.fio.write(3, buf).await?;
+
+        task.await??;
+
+        Ok(())
+    }
+
+    #[named]
+    #[tokio::test]
+    async fn root_rety_lock() -> Result<()> {
+        let tmp = TempDir::new(function_name!())?;
+        let db = tmp.db("db").await?;
+
+        let mut buf: PageBuf = db.inner.fio.read(3).await?;
+        corrupt_checksum(buf.get_mut());
+        db.inner.fio.write_unchecked(3, buf).await?;
+        db.inner.fio.commit().await?;
+
+        let carc = db.inner.write_locks.get(key_path![].to_owned());
+        let gaurd = carc.lock().await;
+
+        let db2 = db.clone();
+        let task: JoinHandle<Result<anyhow::Result<()>, Elapsed>> =
+            spawn(timeout(Duration::from_secs(5), async move {
+                let (pg1, _, pg2, _) =
+                    read_root_w_retry(&db2, key_path![], 2, 3, Duration::from_secs(0)).await?;
+
+                assert_eq!(pg1, 2);
+                assert_eq!(pg2, 3);
+
+                anyhow::Result::Ok(())
+            }));
+
+        sleep(Duration::from_millis(500)).await;
+
+        assert!(!task.is_finished());
+
+        drop(gaurd);
+
+        task.await???;
+
+        Ok(())
     }
 }

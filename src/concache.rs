@@ -14,7 +14,7 @@ where
     K: Hash + Eq + Clone,
 {
     #[debug(skip)]
-    create: Box<dyn Fn() -> V>,
+    create: Box<dyn Fn() -> V + Send + Sync>,
     maps: Arc<Maps<K, V>>,
 }
 
@@ -31,7 +31,7 @@ impl<K, V> ConCache<K, V>
 where
     K: Hash + Eq + Clone,
 {
-    pub fn new(create: Box<dyn Fn() -> V>) -> Self {
+    pub fn new(create: Box<dyn Fn() -> V + Send + Sync>) -> Self {
         Self {
             create,
             maps: Arc::new(Maps {
@@ -66,6 +66,20 @@ where
             })
             .raw_clone()
     }
+}
+
+unsafe impl<K, V> Send for Carc<K, V>
+where
+    K: Hash + Eq + Clone + Send,
+    V: Send,
+{
+}
+
+unsafe impl<K, V> Sync for Carc<K, V>
+where
+    K: Hash + Eq + Clone + Sync,
+    V: Sync,
+{
 }
 
 #[derive(Debug)]

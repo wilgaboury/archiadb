@@ -1,4 +1,4 @@
 #!/bin/bash
 
-cargo fix
+cargo fix --allow-dirty
 cargo fmt

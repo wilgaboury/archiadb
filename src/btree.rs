@@ -8,7 +8,7 @@ use crate::{
     fio::MIN_PAGE_SIZE,
     flux::FluxBuf,
     uint::{InPgIdx, InPgIdxDisk, PgIdx, PgIdxDisk, U64},
-    util::{CHECKSUM_SIZE, from_bytes, from_bytes_mut},
+    util::{ChecksumDisk, from_bytes, from_bytes_mut},
 };
 
 type Slot = InPgIdx;
@@ -275,7 +275,7 @@ impl BTreeRootHeader {
     }
 }
 
-const_assert!(size_of::<BTreeRootHeader>() + CHECKSUM_SIZE < MIN_PAGE_SIZE as usize);
+const_assert!(size_of::<BTreeRootHeader>() + size_of::<ChecksumDisk>() < MIN_PAGE_SIZE as usize);
 
 trait BTreeNodeBuf {
     fn header(&self) -> &BTreeHeader;
@@ -328,16 +328,16 @@ impl BTreeNodeBuf for [u8] {
         let tail_size = match self.header().kind {
             BTreeNodeKind::Root | BTreeNodeKind::Inner => {
                 if slots_len == 0 {
-                    CHECKSUM_SIZE
+                    size_of::<ChecksumDisk>()
                 } else if slots_len == 1 {
-                    CHECKSUM_SIZE + size_of::<PgIdxDisk>()
+                    size_of::<ChecksumDisk>() + size_of::<PgIdxDisk>()
                 } else {
                     self.len() - (size_of::<PgIdxDisk>() + read_slot(self, slots_len - 1))
                 }
             }
             BTreeNodeKind::Leaf => {
                 if slots_len == 0 {
-                    CHECKSUM_SIZE
+                    size_of::<ChecksumDisk>()
                 } else {
                     self.len() - read_slot(self, slots_len - 1)
                 }
@@ -379,7 +379,7 @@ impl BTreeNodeBuf for [u8] {
 fn insert_init_inner(buf: &mut [u8], ptr: u64) {
     let header = buf.header_mut();
     header.set_len(header.len() + 1);
-    let end = buf.len() - CHECKSUM_SIZE;
+    let end = buf.len() - size_of::<ChecksumDisk>();
     let start = end - size_of::<PgIdxDisk>();
     from_bytes_mut::<PgIdxDisk>(&mut buf[start..end]).set(ptr);
 }
@@ -395,14 +395,14 @@ fn insert_at_inner(buf: &mut [u8], idx: usize, left: PgIdx, key: &[u8], right: P
 
         let key_and_ptr_len = key.len() + size_of::<PgIdxDisk>();
         let key_and_ptr_end = if idx == 0 {
-            buf.len() - CHECKSUM_SIZE - size_of::<PgIdxDisk>()
+            buf.len() - size_of::<ChecksumDisk>() - size_of::<PgIdxDisk>()
         } else {
             read_slot(buf, idx - 1) - size_of::<PgIdxDisk>()
         };
         let key_and_ptr_start = key_and_ptr_end - key_and_ptr_len;
         let key_start = key_and_ptr_start + size_of::<PgIdxDisk>();
         let all_key_and_ptr_start = if slots_len == 0 {
-            buf.len() - CHECKSUM_SIZE - size_of::<PgIdxDisk>()
+            buf.len() - size_of::<ChecksumDisk>() - size_of::<PgIdxDisk>()
         } else {
             read_slot(buf, slots_len - 1) - size_of::<PgIdxDisk>()
         };
@@ -445,13 +445,13 @@ fn insert_at_leaf(buf: &mut [u8], idx: usize, key: &[u8], value: &LeafValueEncod
 
     let value_key_len = value.len() + key.len();
     let value_key_end = if idx == 0 {
-        buf.len() - CHECKSUM_SIZE
+        buf.len() - size_of::<ChecksumDisk>()
     } else {
         read_slot(buf, idx - 1)
     };
     let value_key_start = value_key_end - value_key_len;
     let all_value_key_start = if slots_len == 0 {
-        buf.len() - CHECKSUM_SIZE
+        buf.len() - size_of::<ChecksumDisk>()
     } else {
         read_slot(buf, slots_len - 1)
     };
@@ -488,7 +488,7 @@ fn remove_at_leaf(buf: &mut [u8], idx: usize) {
     let slots_end_idx = slots_idx + size_of::<SlotDisk>() * slots_len;
 
     let value_key_end = if idx == 0 {
-        buf.len() - CHECKSUM_SIZE
+        buf.len() - size_of::<ChecksumDisk>()
     } else {
         read_slot(buf, idx - 1)
     };
@@ -496,7 +496,7 @@ fn remove_at_leaf(buf: &mut [u8], idx: usize) {
     let value_key_len = value_key_end - value_key_start;
 
     let all_value_key_start = if slots_len == 0 {
-        buf.len() - CHECKSUM_SIZE
+        buf.len() - size_of::<ChecksumDisk>()
     } else {
         read_slot(buf, slots_len - 1)
     };
@@ -538,7 +538,7 @@ fn write_slot(buf: &mut [u8], idx: usize, value: usize) {
 
 fn get_page_ptr(buf: &[u8], idx: usize) -> u64 {
     let loc = if idx == 0 {
-        buf.len() - CHECKSUM_SIZE - size_of::<PgIdxDisk>()
+        buf.len() - size_of::<ChecksumDisk>() - size_of::<PgIdxDisk>()
     } else {
         read_slot(buf, idx - 1) - size_of::<PgIdxDisk>()
     };
@@ -547,7 +547,7 @@ fn get_page_ptr(buf: &[u8], idx: usize) -> u64 {
 
 fn write_page_ptr(buf: &mut [u8], idx: usize, value: u64) {
     let loc = if idx == 0 {
-        buf.len() - CHECKSUM_SIZE - size_of::<PgIdxDisk>()
+        buf.len() - size_of::<ChecksumDisk>() - size_of::<PgIdxDisk>()
     } else {
         read_slot(buf, idx - 1) - size_of::<PgIdxDisk>()
     };
@@ -557,7 +557,7 @@ fn write_page_ptr(buf: &mut [u8], idx: usize, value: u64) {
 fn get_key_inner(buf: &[u8], idx: usize) -> &[u8] {
     let key_idx = read_slot(buf, idx);
     let key_len = if idx == 0 {
-        (buf.len() - size_of::<PgIdxDisk>() - CHECKSUM_SIZE) - key_idx
+        (buf.len() - size_of::<PgIdxDisk>() - size_of::<ChecksumDisk>()) - key_idx
     } else {
         (read_slot(buf, idx - 1) - size_of::<PgIdxDisk>()) - key_idx
     } as usize;
@@ -573,7 +573,7 @@ fn get_key_leaf(buf: &[u8], idx: usize) -> &[u8] {
     };
     let key_idx = val_key_idx + val_len;
     let key_len = if idx == 0 {
-        buf.len() - CHECKSUM_SIZE - key_idx
+        buf.len() - size_of::<ChecksumDisk>() - key_idx
     } else {
         read_slot(buf, idx - 1) - key_idx
     } as usize;
@@ -865,7 +865,8 @@ impl<'a> Txn<'a> {
     }
 
     async fn create_value_linked_list(&mut self, value: &[u8]) -> Result<u64> {
-        let chunk_size = self.db.meta.page_size() as usize - size_of::<PgIdxDisk>() - CHECKSUM_SIZE;
+        let chunk_size =
+            self.db.meta.page_size() as usize - size_of::<PgIdxDisk>() - size_of::<ChecksumDisk>();
         let mut prev_pg_idx: PgIdx = 0;
         for chunk in value.chunks(chunk_size).rev() {
             let pg_idx = self.alloc().await?;
@@ -886,7 +887,7 @@ impl<'a> Txn<'a> {
         while empty > 0 {
             let pg = self.db.fio.read(pg_idx).await?;
             let pg_buf = pg.get();
-            let len = pg_buf.len() - size_of::<PgIdxDisk>() - CHECKSUM_SIZE;
+            let len = pg_buf.len() - size_of::<PgIdxDisk>() - size_of::<ChecksumDisk>();
             let cp_len = std::cmp::min(len, empty);
             let cp_start = buf.len() - empty;
             buf[cp_start..cp_start + cp_len].copy_from_slice(&pg_buf[0..cp_len]);

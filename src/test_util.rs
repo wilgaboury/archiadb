@@ -6,9 +6,27 @@ use std::{
 
 use anyhow::Result;
 
-use crate::{db::Db, file::DbFile, fio::Fio, meta::MetaHandler};
+use crate::{
+    db::Db,
+    file::DbFile,
+    fio::Fio,
+    meta::MetaHandler,
+    util::{ChecksumDisk, from_bytes_mut},
+};
 
-pub struct TempDir {
+pub(crate) fn corrupt_checksum(buf: &mut [u8]) {
+    let len = buf.len();
+    let checksum = from_bytes_mut::<ChecksumDisk>(&mut buf[len - size_of::<ChecksumDisk>()..]);
+    checksum.set(checksum.get() + 1);
+}
+
+pub(crate) fn uncorrput_checksum(buf: &mut [u8]) {
+    let len = buf.len();
+    let checksum = from_bytes_mut::<ChecksumDisk>(&mut buf[len - size_of::<ChecksumDisk>()..]);
+    checksum.set(checksum.get() - 1);
+}
+
+pub(crate) struct TempDir {
     path: PathBuf,
 }
 

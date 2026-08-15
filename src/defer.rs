@@ -53,20 +53,33 @@ impl Defer {
 }
 
 impl<'a> DeferGaurd<'a> {
+    pub(crate) fn free(&mut self, pg_idx: PgIdx) {
+        self.freed.push(pg_idx);
+    }
+
     pub(crate) fn flush(&mut self) {
+        for pg in self.freed.iter() {
+            self.defer.global.insert(*pg);
+        }
+
+        let mut inner = self.defer.inner.lock();
+        // Add pages to last transaction, since we can garuntee there will be no references to freed pages after it finishes
+        let last = inner.to_free.iter_mut().next_back();
+        match last {
+            Some((_, to_free)) => to_free.append(&mut self.freed),
+            None => {
+                eprintln!(
+                    "There should always be at least one entry since this transaction is still active"
+                );
+            }
+        }
+    }
+}
+
+impl<'a> Drop for DeferGaurd<'a> {
+    fn drop(&mut self) {
         let free = {
             let mut inner = self.defer.inner.lock();
-            // Add pages to last transaction, since we can garuntee there will be no references to freed pages after it finishes
-            let last = inner.to_free.iter_mut().next_back();
-            match last {
-                Some((_, to_free)) => to_free.append(&mut self.freed),
-                None => {
-                    eprintln!(
-                        "There should always be at least one entry since this transaction is still active"
-                    );
-                }
-            }
-
             let maybe_to_free = inner.to_free.remove(&self.id);
             if let Some(mut to_free) = maybe_to_free {
                 let next_back = inner.to_free.range_mut(..self.id).next_back();
@@ -102,95 +115,88 @@ impl<'a> Txn<'a> {
 
 #[cfg(test)]
 mod tests {
-    // TODO: redo testing
+    use super::*;
+    use anyhow::Result;
 
-    // use crate::test_util::TempDir;
+    fn snapshot(map: &Defer) -> BTreeMap<u64, Vec<u64>> {
+        map.inner.lock().to_free.clone()
+    }
 
-    // use super::*;
-    // use anyhow::Result;
-    // use function_name::named;
+    #[tokio::test]
+    async fn defer_workflow() -> Result<()> {
+        let defer = Defer::new();
 
-    // fn snapshot(map: &TxnFreeDeferMap) -> BTreeMap<u64, Vec<u64>> {
-    //     map.inner.lock().map.clone()
-    // }
+        let g1 = defer.begin();
+        let g1_id = g1.id;
+        let mut g2 = defer.begin();
+        let g2_id = g2.id;
 
-    // #[named]
-    // #[tokio::test]
-    // async fn freed_pages_moved_to_earlier_txn_and_freed_when_no_older_txns() -> Result<()> {
-    //     let dir = TempDir::new(function_name!()).unwrap();
-    //     let (alloc, _fio, meta) = dir.alloc("file").await?;
-    //     let map = TxnFreeDeferMap::new();
+        assert!(g1_id < g2_id);
 
-    //     let mut set = AllocationSet::new();
-    //     let pg1 = alloc.alloc(&meta, &mut set).await?;
-    //     let pg2 = alloc.alloc(&meta, &mut set).await?;
-    //     let pg3 = alloc.alloc(&meta, &mut set).await?;
-    //     set.flush(&alloc).await?;
+        g2.free(1);
+        g2.flush();
 
-    //     map.begin();
+        let snap = snapshot(&defer);
 
-    //     map.begin();
-    //     map.finish(1, &mut vec![pg2], &alloc);
+        assert_eq!(*snap.get(&g1_id).unwrap(), vec![]);
+        assert_eq!(*snap.get(&g2_id).unwrap(), vec![1u64]);
 
-    //     map.begin();
-    //     map.finish(2, &mut vec![pg3], &alloc);
+        drop(g2);
 
-    //     let snap = snapshot(&map);
-    //     println!("{:?}", snap);
-    //     assert_eq!(snap.get(&0), Some(&vec![pg2, pg3]));
-    //     assert!(!snap.contains_key(&2));
-    //     assert!(!snap.contains_key(&3));
+        let snap = snapshot(&defer);
 
-    //     assert!(!alloc.is_free(pg1));
-    //     assert!(!alloc.is_free(pg2));
-    //     assert!(!alloc.is_free(pg3));
+        assert_eq!(*snap.get(&g1_id).unwrap(), vec![1u64]);
+        assert!(snap.get(&g2_id).is_none());
 
-    //     map.finish(0, &mut vec![pg1], &alloc);
+        let mut g3 = defer.begin();
+        let g3_id = g3.id;
+        let g4 = defer.begin();
+        let g4_id = g4.id;
 
-    //     assert!(alloc.is_free(pg1));
-    //     assert!(alloc.is_free(pg2));
-    //     assert!(alloc.is_free(pg3));
+        assert!(g2_id < g3_id && g3_id < g4_id);
 
-    //     Ok(())
-    // }
+        g3.free(2);
+        g3.free(3);
+        g3.flush();
 
-    // #[named]
-    // #[tokio::test]
-    // async fn pages_moved_to_last_active_txn() -> Result<()> {
-    //     let dir = TempDir::new(function_name!()).unwrap();
-    //     let (alloc, _fio, meta) = dir.alloc("file").await?;
-    //     let map = TxnFreeDeferMap::new();
+        let snap = snapshot(&defer);
 
-    //     let mut set = AllocationSet::new();
-    //     let pg1 = alloc.alloc(&meta, &mut set).await?;
-    //     let pg2 = alloc.alloc(&meta, &mut set).await?;
-    //     let pg3 = alloc.alloc(&meta, &mut set).await?;
-    //     set.flush(&alloc).await?;
+        assert_eq!(*snap.get(&g1_id).unwrap(), vec![1u64]);
+        assert!(snap.get(&g2_id).is_none());
+        assert_eq!(*snap.get(&g3_id).unwrap(), vec![]);
+        assert_eq!(*snap.get(&g4_id).unwrap(), vec![2u64, 3u64]);
 
-    //     map.begin();
-    //     map.begin();
-    //     map.begin();
+        drop(g4);
 
-    //     map.finish(0, &mut vec![pg1], &alloc);
+        let snap = snapshot(&defer);
 
-    //     let snap = snapshot(&map);
-    //     assert_eq!(snap.get(&2), Some(&vec![pg1]));
+        assert_eq!(*snap.get(&g1_id).unwrap(), vec![1u64]);
+        assert!(snap.get(&g2_id).is_none());
+        assert_eq!(*snap.get(&g3_id).unwrap(), [2u64, 3u64]);
+        assert!(snap.get(&g4_id).is_none());
 
-    //     map.finish(1, &mut vec![pg2], &alloc);
+        drop(g3);
 
-    //     let snap = snapshot(&map);
-    //     assert_eq!(snap.get(&2), Some(&vec![pg1, pg2]));
+        let snap = snapshot(&defer);
 
-    //     assert!(!alloc.is_free(pg1));
-    //     assert!(!alloc.is_free(pg2));
-    //     assert!(!alloc.is_free(pg3));
+        assert_eq!(*snap.get(&g1_id).unwrap(), vec![1u64, 2u64, 3u64]);
+        assert!(snap.get(&g2_id).is_none());
+        assert!(snap.get(&g3_id).is_none());
+        assert!(snap.get(&g4_id).is_none());
 
-    //     map.finish(2, &mut vec![pg3], &alloc);
+        assert_eq!(3, defer.global.len());
 
-    //     assert!(alloc.is_free(pg1));
-    //     assert!(alloc.is_free(pg2));
-    //     assert!(alloc.is_free(pg3));
+        drop(g1);
 
-    //     Ok(())
-    // }
+        let snap = snapshot(&defer);
+
+        assert!(snap.get(&g2_id).is_none());
+        assert!(snap.get(&g2_id).is_none());
+        assert!(snap.get(&g3_id).is_none());
+        assert!(snap.get(&g4_id).is_none());
+
+        assert_eq!(0, defer.global.len());
+
+        Ok(())
+    }
 }
