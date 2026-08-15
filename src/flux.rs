@@ -54,9 +54,9 @@ impl FluxBuf {
     }
 }
 
-impl Txn {
+impl<'a> Txn<'a> {
     pub(crate) fn flux_buf(&mut self) -> FluxBuf {
-        FluxBuf::Unalloc(self.db.inner.fio.get_buf())
+        FluxBuf::Unalloc(self.db.fio.get_buf())
     }
 
     pub(crate) async fn flux_read(&mut self, pg_idx: u64) -> Result<FluxBuf> {
@@ -67,7 +67,7 @@ impl Txn {
                 free: self.flux.free.clone(),
             }))
         } else {
-            Ok(FluxBuf::Unalloc(self.db.inner.fio.read(pg_idx).await?))
+            Ok(FluxBuf::Unalloc(self.db.fio.read(pg_idx).await?))
         }
     }
 

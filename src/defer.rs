@@ -1,50 +1,65 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::collections::BTreeMap;
 
+use dashmap::DashSet;
 use parking_lot::Mutex;
 
-pub type TxnFreeDeferId = u64;
+use crate::{db::Txn, uint::PgIdx};
 
-/// Tracks currently running transactions and ensures that freeing of pages is deferred until no transactions reference them.
-#[derive(Clone, Debug)]
-pub(crate) struct TxnFreeDeferMap {
-    inner: Arc<Mutex<Inner>>,
+pub type DeferId = u64;
+
+/// Tracks currently running transactions and ensures that freeing of pages is deferred until no transactions can reference them
+#[derive(Debug)]
+pub(crate) struct Defer {
+    inner: Mutex<Inner>,
+    global: DashSet<PgIdx>,
 }
 
 #[derive(Debug)]
-struct Inner {
-    next: TxnFreeDeferId,
-    map: BTreeMap<TxnFreeDeferId, Vec<u64>>,
+pub(crate) struct Inner {
+    next: DeferId,
+    to_free: BTreeMap<DeferId, Vec<u64>>,
 }
 
-impl TxnFreeDeferMap {
+impl Defer {
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(Mutex::new(Inner {
+            inner: Mutex::new(Inner {
                 next: 0,
-                map: BTreeMap::new(),
-            })),
+                to_free: BTreeMap::new(),
+            }),
+            global: DashSet::new(),
         }
     }
 }
 
-impl TxnFreeDeferMap {
-    /// It is vital that transaction ids returned by this function be finished
-    /// otherwise it effecively causes a leak, and pages will never be freed.
-    pub fn begin(&self) -> TxnFreeDeferId {
-        let mut inner = self.inner.lock();
-        let txn_id = inner.next;
-        inner.next += 1;
-        inner.map.insert(txn_id, Vec::with_capacity(0));
-        txn_id
-    }
+pub(crate) struct DeferGaurd<'a> {
+    id: DeferId,
+    freed: Vec<PgIdx>,
+    defer: &'a Defer,
+}
 
-    pub fn finish(&self, txn_id: TxnFreeDeferId, freeable: &mut Vec<u64>) {
-        let free_pgs = {
-            let mut inner = self.inner.lock();
+impl Defer {
+    pub(crate) fn begin(&self) -> DeferGaurd<'_> {
+        let mut inner = self.inner.lock();
+        let id = inner.next;
+        inner.next += 1;
+        inner.to_free.insert(id, Vec::with_capacity(0));
+        DeferGaurd {
+            id,
+            freed: Vec::new(),
+            defer: &self,
+        }
+    }
+}
+
+impl<'a> DeferGaurd<'a> {
+    pub(crate) fn flush(&mut self) {
+        let free = {
+            let mut inner = self.defer.inner.lock();
             // Add pages to last transaction, since we can garuntee there will be no references to freed pages after it finishes
-            let last_txn = inner.map.iter_mut().next_back();
-            match last_txn {
-                Some((_, defer)) => defer.append(freeable),
+            let last = inner.to_free.iter_mut().next_back();
+            match last {
+                Some((_, to_free)) => to_free.append(&mut self.freed),
                 None => {
                     eprintln!(
                         "There should always be at least one entry since this transaction is still active"
@@ -52,31 +67,36 @@ impl TxnFreeDeferMap {
                 }
             }
 
-            let defer = inner.map.remove(&txn_id);
-            if let Some(mut defer) = defer {
-                let next_back = inner.map.range_mut(..txn_id).next_back();
+            let maybe_to_free = inner.to_free.remove(&self.id);
+            if let Some(mut to_free) = maybe_to_free {
+                let next_back = inner.to_free.range_mut(..self.id).next_back();
                 match next_back {
-                    Some((_, prev_defer)) => {
+                    Some((_, prev_to_free)) => {
                         // Move pages to previous transaction, so they can be freed when it finishes
-                        prev_defer.append(&mut defer);
+                        prev_to_free.append(&mut to_free);
                         Vec::new()
                     }
                     None => {
                         // No previous transactions exist which could reference these pages, so we can free them
-                        defer
+                        to_free
                     }
                 }
             } else {
                 eprintln!("Transaction was either already finished or was never added to the map");
-                Vec::new()
+                Vec::with_capacity(0)
             }
         };
 
         // frees do not need to occur inside lock
-        for _pg in free_pgs {
-            // TODO: need to figure out what the new free operation will be here
-            // alloc.free(pg);
+        for pg in free {
+            self.defer.global.remove(&pg);
         }
+    }
+}
+
+impl<'a> Txn<'a> {
+    pub(crate) fn free(&mut self, pg_idx: PgIdx) {
+        self.defer_gaurd.freed.push(pg_idx);
     }
 }
 

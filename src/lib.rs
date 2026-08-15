@@ -2,6 +2,7 @@
 pub mod btree;
 pub mod concache;
 pub mod db;
+pub mod defer;
 pub mod file;
 pub mod fio;
 pub mod flux;
@@ -13,7 +14,6 @@ pub mod lalloc;
 pub mod lock;
 pub mod meta;
 pub mod trie;
-pub mod txnmap;
 pub mod uint;
 pub mod util;
 

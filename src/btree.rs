@@ -148,7 +148,7 @@ enum LeafValue<'a> {
 }
 
 impl<'a> LeafValue<'a> {
-    pub async fn encode(self, txn: &mut Txn) -> Result<LeafValueEncoded<'a>> {
+    pub async fn encode(self, txn: &mut Txn<'_>) -> Result<LeafValueEncoded<'a>> {
         Ok(match self {
             LeafValue::Btree { pg_idx_1, pg_idx_2 } => {
                 LeafValueEncoded::Btree { pg_idx_1, pg_idx_2 }
@@ -672,7 +672,7 @@ enum InsertResult {
     Split(u64, Box<[u8]>, u64),
 }
 
-impl Txn {
+impl<'a> Txn<'a> {
     async fn btree_get(&mut self, key: &[u8], node: FluxBuf) -> Result<Option<BtreeGetResult>> {
         match node.get().header().kind {
             BTreeNodeKind::Leaf => {
@@ -869,19 +869,18 @@ impl Txn {
     }
 
     async fn create_value_linked_list(&mut self, value: &[u8]) -> Result<u64> {
-        let chunk_size =
-            self.db.inner.meta.page_size() as usize - size_of::<PgIdxDisk>() - CHECKSUM_SIZE;
+        let chunk_size = self.db.meta.page_size() as usize - size_of::<PgIdxDisk>() - CHECKSUM_SIZE;
         let mut prev_pg_idx: PgIdx = 0;
         for chunk in value.chunks(chunk_size).rev() {
             let pg_idx = self.alloc().await?;
-            let mut buf = self.db.inner.fio.get_buf();
+            let mut buf = self.db.fio.get_buf();
             let mbuf = buf.get_mut();
             let len = chunk.len();
             mbuf[..len].copy_from_slice(chunk);
             from_bytes_mut::<PgIdxDisk>(&mut mbuf[len..len + size_of::<PgIdxDisk>()])
                 .set(prev_pg_idx);
             prev_pg_idx = pg_idx;
-            self.db.inner.fio.write(pg_idx, buf).await?;
+            self.db.fio.write(pg_idx, buf).await?;
         }
         Ok(prev_pg_idx)
     }
@@ -889,7 +888,7 @@ impl Txn {
     async fn read_value_linked_list(&mut self, mut pg_idx: u64, buf: &mut [u8]) -> Result<()> {
         let mut empty = buf.len();
         while empty > 0 {
-            let pg = self.db.inner.fio.read(pg_idx).await?;
+            let pg = self.db.fio.read(pg_idx).await?;
             let pg_buf = pg.get();
             let len = pg_buf.len() - size_of::<PgIdxDisk>() - CHECKSUM_SIZE;
             let cp_len = std::cmp::min(len, empty);
@@ -1055,7 +1054,7 @@ mod tests {
         let dir = TempDir::new(function_name!())?;
         let db = dir.db("db").await?;
         let mut txn = db.txn().begin().await;
-        let value_len = txn.db.inner.meta.page_size() as usize * 2.5 as usize;
+        let value_len = txn.db.meta.page_size() as usize * 2.5 as usize;
         let value = vec![1u8; value_len];
         let mut value_test = vec![0u8; value_len];
         let pg_idx = txn.create_value_linked_list(&value).await?;

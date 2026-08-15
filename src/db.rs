@@ -6,6 +6,7 @@ use tokio::sync::Mutex;
 
 use crate::{
     concache::ConCache,
+    defer::{Defer, DeferGaurd},
     file::DbFile,
     fio::{DEFAULT_CQ_SIZE, DEFAULT_SQ_SIZE, Fio},
     flux::Flux,
@@ -14,7 +15,6 @@ use crate::{
     lock::{Lock, LockGuard, LockType},
     meta::{MetaHandler, NUM_HEADER_PAGES},
     trie::KeyTrie,
-    txnmap::TxnFreeDeferMap,
 };
 
 #[derive(Debug, Clone)]
@@ -28,7 +28,7 @@ pub(crate) struct DbInner {
     pub(crate) meta: MetaHandler,
     pub(crate) fio: Fio,
     pub(crate) galloc: Galloc,
-    pub(crate) txn_free_defer_map: TxnFreeDeferMap,
+    pub(crate) defer: Defer,
     pub(crate) read_locks: ConCache<KeyPathBuf, Lock>,
     pub(crate) write_locks: ConCache<KeyPathBuf, Mutex<()>>,
 }
@@ -74,7 +74,7 @@ impl Db {
                 meta,
                 fio,
                 galloc: Galloc::new(),
-                txn_free_defer_map: TxnFreeDeferMap::new(),
+                defer: Defer::new(),
                 read_locks: ConCache::new(Box::new(|| Lock::new())),
                 write_locks: ConCache::new(Box::new(|| Mutex::new(()))),
             }),
@@ -85,9 +85,9 @@ impl Db {
         self.inner.meta.page_size() as usize
     }
 
-    pub fn txn(&self) -> TxnBuilder {
+    pub fn txn(&self) -> TxnBuilder<'_> {
         TxnBuilder {
-            db: self.clone(),
+            db: &self.inner,
             ops: KeyTrie::new(),
         }
     }
@@ -109,12 +109,12 @@ impl Drop for DbInner {
     }
 }
 
-pub struct TxnBuilder {
-    db: Db,
+pub struct TxnBuilder<'a> {
+    db: &'a DbInner,
     ops: KeyTrie<LockType>,
 }
 
-impl TxnBuilder {
+impl<'a> TxnBuilder<'a> {
     pub fn read(mut self, path: &KeyPath) -> Result<Self> {
         self.ops.insert_lock(path, LockType::Read)?;
         Ok(self)
@@ -130,18 +130,17 @@ impl TxnBuilder {
         Ok(self)
     }
 
-    pub async fn begin(self) -> Txn {
+    pub async fn begin(self) -> Txn<'a> {
+        let defer_gaurd = self.db.defer.begin();
         let mut guards = Vec::new();
         for (path, lock_type) in self.ops.bfs_iter() {
-            guards.push(self.db.inner.read_locks.get(path).acquire(*lock_type).await);
+            guards.push(self.db.read_locks.get(path).acquire(*lock_type).await);
         }
         guards.reverse();
 
-        // There can be no failable code between this line and struct initialization
-        let txn_free_defer_id = self.db.inner.txn_free_defer_map.begin();
         Txn {
-            txn_free_defer_id,
             db: self.db,
+            defer_gaurd,
             guards,
             free: Vec::new(),
             ops: self.ops,
@@ -151,9 +150,9 @@ impl TxnBuilder {
     }
 }
 
-pub struct Txn {
-    pub(crate) txn_free_defer_id: u64,
-    pub(crate) db: Db,
+pub struct Txn<'a> {
+    pub(crate) db: &'a DbInner,
+    pub(crate) defer_gaurd: DeferGaurd<'a>,
     pub(crate) guards: Vec<LockGuard>,
     pub(crate) free: Vec<u64>,
     pub(crate) ops: KeyTrie<LockType>,
@@ -161,7 +160,7 @@ pub struct Txn {
     pub(crate) writes: KeyTrie<Option<u64>>,
 }
 
-impl Txn {
+impl<'a> Txn<'a> {
     pub async fn read(&self, _path: &KeyPath) -> Result<&[u8]> {
         self.ops
             .validate_read(_path)
@@ -205,15 +204,15 @@ impl Txn {
 
             todo!("implement")
         }
+
+        self.defer_gaurd.flush();
     }
 }
 
-impl Drop for Txn {
+impl<'a> Drop for Txn<'a> {
     fn drop(&mut self) {
-        self.db
-            .inner
-            .txn_free_defer_map
-            .finish(self.txn_free_defer_id, &mut self.free);
+        // no-op
+        // TODO: idk, does anything rly need to be done here
     }
 }
 

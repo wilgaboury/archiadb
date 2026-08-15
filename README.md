@@ -22,13 +22,15 @@ Like other OLTP data stores, the paradigm is defined by how records are organize
 
 - strictly serializable transactions using conservative 2PL
     - concurrent multi-writer when transactions do not conflict
-    - transaction locking is guaranteed to succeed
+    - transaction locking is fair and guaranteed to succeed eventually
 - non-blocking snapshot serializable read transactions
 - single file with architecture independent format
-- uses COW B+trees, crash-safe without requiring a WAL
-- unopinionated about key/value serialization
+- uses copy-on-write data structures
+    - crash-safe with O(1) recovery complexity, no WAL replay or integrity check needed
+    - does not assume [powersafe overwrite](https://sqlite.org/psow.html)
+- completely unopinionated about key/value serialization
 - relies on async rust, but is fully runtime agnostic
-- utilizes io_uring
+- utilizes io_uring and direct I/O when possible
 
 The internal workings are outlined in more detail here: [Design Doc](design.md)
 
