@@ -20,7 +20,7 @@ impl Galloc {
 }
 
 impl DbInner {
-    pub(crate) async fn pre_galloc(&self, front_idx: PgIdx, back_idx: PgIdx) -> Result<()> {
+    pub(crate) async fn pre_galloc(&self, _front_idx: PgIdx, _back_idx: PgIdx) -> Result<()> {
         todo!("implement pre_galloc");
     }
 

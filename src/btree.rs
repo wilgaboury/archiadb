@@ -1,18 +1,14 @@
-use std::{
-    cmp::Ordering,
-    time::{Duration, Instant},
-};
+use std::cmp::Ordering;
 
 use anyhow::{Result, bail};
 
 use crate::{
     const_assert,
-    db::{Db, Txn},
-    fio::{Fio, MIN_PAGE_SIZE, PageBuf},
+    db::Txn,
+    fio::MIN_PAGE_SIZE,
     flux::FluxBuf,
-    key::KeyPath,
     uint::{InPgIdx, InPgIdxDisk, PgIdx, PgIdxDisk, U64},
-    util::{CHECKSUM_SIZE, from_bytes, from_bytes_mut, has_valid_checksum},
+    util::{CHECKSUM_SIZE, from_bytes, from_bytes_mut},
 };
 
 type Slot = InPgIdx;
