@@ -1,0 +1,4 @@
+#!/bin/bash
+
+cargo fix
+cargo fmt
