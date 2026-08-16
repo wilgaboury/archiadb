@@ -1112,6 +1112,7 @@ pub fn alloc_aligned_buffer(pages: usize, page_size: usize) -> Result<Pin<Box<[u
     Ok(unsafe { Pin::from(Box::from_raw(std::slice::from_raw_parts_mut(ptr, size))) })
 }
 
+#[coverage(off)]
 #[cfg(test)]
 mod tests {
     use std::{

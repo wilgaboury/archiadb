@@ -116,6 +116,7 @@ pub(crate) async fn init_root(meta: &MetaHandler, fio: &Fio) -> Result<()> {
     Ok(())
 }
 
+#[coverage(off)]
 #[cfg(test)]
 mod tests {
     use function_name::named;

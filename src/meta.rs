@@ -333,6 +333,7 @@ impl MetaHandler {
     }
 }
 
+#[coverage(off)]
 #[cfg(test)]
 mod tests {
     use std::fs::File;

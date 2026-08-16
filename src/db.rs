@@ -216,6 +216,7 @@ impl<'a> Drop for Txn<'a> {
     }
 }
 
+#[coverage(off)]
 #[cfg(test)]
 mod tests {
     use std::{fs::File, os::unix::fs::FileExt};

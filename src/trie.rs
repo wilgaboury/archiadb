@@ -423,6 +423,7 @@ fn bfs_step<T>(
     None
 }
 
+#[coverage(off)]
 #[cfg(test)]
 mod tests {
     use crate::key_path;

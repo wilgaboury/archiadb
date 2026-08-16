@@ -183,6 +183,7 @@ where
     }
 }
 
+#[coverage(off)]
 #[cfg(test)]
 mod tests {
     use std::panic::panic_any;
@@ -352,5 +353,20 @@ mod tests {
         let err = result.unwrap_err();
         let msg = err.downcast_ref::<String>().unwrap();
         assert_eq!(msg, "thread panicked: unknown panic");
+    }
+
+    #[named]
+    #[tokio::test]
+    async fn check_header_version_getter() -> Result<()> {
+        let tmp = TempDir::new(function_name!())?;
+        let (fio, _meta) = tmp.fio("db")?;
+        let mut pg = fio.get_dyn_buf();
+        {
+            let meta = from_bytes_mut::<BTreeRootHeader>(pg.get_mut());
+            meta.init();
+            meta.version.set(0x1122334455);
+        }
+        assert_eq!(0x1122334455, btree_header_version(&pg));
+        Ok(())
     }
 }

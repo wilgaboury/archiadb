@@ -70,6 +70,7 @@ pub(crate) trait IntrusiveListNode: Sized {
     }
 }
 
+#[coverage(off)]
 #[cfg(test)]
 mod tests {
     use std::rc::Rc;

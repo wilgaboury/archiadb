@@ -242,6 +242,7 @@ macro_rules! key_path {
     }};
 }
 
+#[coverage(off)]
 #[cfg(test)]
 mod tests {
     use std::cmp::Ordering;

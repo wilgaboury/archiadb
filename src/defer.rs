@@ -113,6 +113,7 @@ impl<'a> Txn<'a> {
     }
 }
 
+#[coverage(off)]
 #[cfg(test)]
 mod tests {
     use super::*;

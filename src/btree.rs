@@ -913,6 +913,7 @@ fn test_access() {
     assert_eq!(header.header.len(), 0);
 }
 
+#[coverage(off)]
 #[cfg(test)]
 mod tests {
     use anyhow::Result;
