@@ -269,13 +269,11 @@ impl IntrusiveList for LockInner {
     }
 }
 
+#[coverage(off)]
 #[cfg(test)]
 mod tests {
     use std::{
-        sync::{
-            Mutex,
-            atomic::{AtomicU32, Ordering},
-        },
+        sync::atomic::{AtomicU32, Ordering},
         time::{Duration, Instant},
     };
 

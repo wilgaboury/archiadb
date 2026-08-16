@@ -1,3 +1,4 @@
+#![feature(coverage_attribute)]
 #![allow(dead_code)]
 
 pub mod btree;
