@@ -19,5 +19,6 @@ pub mod trie;
 pub mod uint;
 pub mod util;
 
+#[coverage(off)]
 #[cfg(test)]
 mod test;

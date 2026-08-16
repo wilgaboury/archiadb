@@ -123,6 +123,7 @@ impl U16 {
     }
 }
 
+#[coverage(off)]
 #[cfg(test)]
 mod test {
     use crate::uint::{U16, U24, U32, U40, U64, U128};
