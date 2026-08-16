@@ -18,4 +18,4 @@ pub mod uint;
 pub mod util;
 
 #[cfg(test)]
-mod test_util;
+mod test;

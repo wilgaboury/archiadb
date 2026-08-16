@@ -120,7 +120,7 @@ pub(crate) async fn init_root(meta: &MetaHandler, fio: &Fio) -> Result<()> {
 mod tests {
     use function_name::named;
 
-    use crate::{meta::Meta, test_util::TempDir, util::from_bytes};
+    use crate::{meta::Meta, test::TempDir, util::from_bytes};
 
     use super::*;
 

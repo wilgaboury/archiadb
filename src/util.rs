@@ -110,6 +110,11 @@ pub(crate) fn order_front_back<V, B: AsRef<[u8]>, F: Fn(&B) -> u64>(
     }
 }
 
+pub(crate) fn btree_header_version(pg: &PageBuf) -> u64 {
+    let root = from_bytes::<BTreeRootHeader>(&pg.as_ref());
+    root.version.get()
+}
+
 pub(crate) async fn read_root_w_retry(
     db: &Db,
     key: &KeyPath,
@@ -117,16 +122,11 @@ pub(crate) async fn read_root_w_retry(
     pg_idx2: PgIdx,
     timeout: Duration,
 ) -> Result<(PgIdx, PageBuf, PgIdx, PageBuf)> {
-    let version = |pg: &PageBuf| {
-        let root = from_bytes::<BTreeRootHeader>(&pg.as_ref());
-        root.version.get()
-    };
-
     let start = Instant::now();
     while Instant::now().duration_since(start) < timeout {
         let pg1 = db.inner.fio.read_unchecked(pg_idx1).await?;
         let pg2 = db.inner.fio.read_unchecked(pg_idx2).await?;
-        if let Ok(ret) = order_front_back(pg_idx1, pg1, pg_idx2, pg2, version) {
+        if let Ok(ret) = order_front_back(pg_idx1, pg1, pg_idx2, pg2, btree_header_version) {
             return Ok(ret);
         }
     }
@@ -135,7 +135,7 @@ pub(crate) async fn read_root_w_retry(
     let _gaurd = carc.lock().await;
     let pg1 = db.inner.fio.read_unchecked(pg_idx1).await?;
     let pg2 = db.inner.fio.read_unchecked(pg_idx2).await?;
-    order_front_back(pg_idx1, pg1, pg_idx2, pg2, version)
+    order_front_back(pg_idx1, pg1, pg_idx2, pg2, btree_header_version)
 }
 
 pub(crate) fn ceil_div(num: u64, den: u64) -> u64 {
@@ -153,10 +153,16 @@ mod tests {
 
     use crate::{
         key_path,
-        test_util::{TempDir, corrupt_checksum, uncorrput_checksum},
+        test::{TempDir, corrupt_checksum, uncorrput_checksum},
     };
 
     use super::*;
+
+    #[test]
+    fn check_ciel_div() {
+        assert_eq!(1, ceil_div(1, 2));
+        assert_eq!(2, ceil_div(3, 2));
+    }
 
     #[test]
     fn pick_block_size() {

@@ -223,7 +223,7 @@ mod tests {
     use crate::{
         key_path,
         meta::{MAGIC, MagicType},
-        test_util::TempDir,
+        test::TempDir,
         util::update_checksum,
     };
 

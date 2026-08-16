@@ -342,7 +342,7 @@ mod tests {
     use function_name::named;
 
     use crate::meta::{CUR_FMT_VER, MAGIC, Meta};
-    use crate::test_util::TempDir;
+    use crate::test::TempDir;
     use crate::util::{from_bytes, from_bytes_mut, update_checksum};
 
     #[named]

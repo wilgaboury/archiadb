@@ -1100,7 +1100,7 @@ mod tests {
 
     use function_name::named;
 
-    use crate::{meta::NUM_HEADER_PAGES, test_util::TempDir};
+    use crate::{meta::NUM_HEADER_PAGES, test::TempDir};
 
     use super::*;
 

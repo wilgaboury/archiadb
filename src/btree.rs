@@ -926,7 +926,7 @@ mod tests {
         },
         db::Db,
         key_path,
-        test_util::TempDir,
+        test::TempDir,
         util::from_bytes_mut,
     };
 
