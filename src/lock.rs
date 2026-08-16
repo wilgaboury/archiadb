@@ -355,7 +355,7 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "manual")]
+    #[ignore]
     #[test]
     fn contentious_mutex_test() -> Result<()> {
         let lock = Arc::new(Mutex::new(0));
@@ -367,7 +367,7 @@ mod tests {
         for _ in 0..THREAD_COUNT {
             let lock_clone = lock.clone();
             threads.push(std::thread::spawn(move || {
-                let mut gaurd = lock_clone.lock().unwrap();
+                let mut gaurd = lock_clone.lock();
                 for _ in 0..INC_COUNT {
                     let val = *gaurd;
                     std::thread::yield_now();
@@ -382,7 +382,7 @@ mod tests {
                 .map_err(|e| anyhow!("Thread panicked: {:?}", e))?;
         }
 
-        let gaurd = lock.lock().unwrap();
+        let gaurd = lock.lock();
         assert_eq!(THREAD_COUNT * INC_COUNT, *gaurd);
 
         Ok(())
@@ -440,7 +440,7 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "manual")]
+    #[ignore]
     #[tokio::test(flavor = "multi_thread")]
     async fn check_for_concurrent_overlap_tokio_mutex() -> Result<()> {
         let ptr_usize = Box::into_raw(Box::new(0)) as usize;
