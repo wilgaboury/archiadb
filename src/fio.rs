@@ -8,7 +8,6 @@ use std::{
         fd::{AsFd, AsRawFd},
         unix::fs::OpenOptionsExt,
     },
-    panic,
     pin::Pin,
     sync::{
         Arc,
