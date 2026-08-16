@@ -1,7 +1,9 @@
 use std::{
     fs::{File, OpenOptions},
+    panic,
     path::{Path, PathBuf},
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use anyhow::Result;
@@ -20,10 +22,28 @@ pub(crate) fn corrupt_checksum(buf: &mut [u8]) {
     checksum.set(checksum.get() + 1);
 }
 
-pub(crate) fn uncorrput_checksum(buf: &mut [u8]) {
-    let len = buf.len();
-    let checksum = from_bytes_mut::<ChecksumDisk>(&mut buf[len - size_of::<ChecksumDisk>()..]);
-    checksum.set(checksum.get() - 1);
+pub(crate) async fn retry_until_success_tokio<F, R>(
+    f: F,
+    retry_delay: Duration,
+    timeout: Duration,
+) -> R
+where
+    F: Fn() -> R + panic::UnwindSafe,
+{
+    let start = Instant::now();
+
+    loop {
+        if start.elapsed() > timeout {
+            panic!("Retry timed out after {:?}", timeout);
+        }
+
+        match panic::catch_unwind(panic::AssertUnwindSafe(&f)) {
+            Ok(result) => return result,
+            Err(_) => {
+                tokio::time::sleep(retry_delay).await;
+            }
+        }
+    }
 }
 
 pub(crate) struct TempDir {

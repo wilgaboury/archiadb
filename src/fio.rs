@@ -30,7 +30,7 @@ use thiserror::Error;
 use crate::{
     file::DbFile,
     uint::{InPgIdx, PgIdx},
-    util::{get_fs_block_size, has_valid_checksum, update_checksum},
+    util::{fs_block_size, has_valid_checksum, update_checksum},
 };
 
 pub const MIN_PAGE_SIZE: u64 = 4096; // smallest supported page size and most common filesystem block size
@@ -141,6 +141,9 @@ struct Inner {
     // free_read_states: ArrayQueue<usize>,
     generic_op_states: Box<[AtomicU32]>,
     free_generic_op_states: ArrayQueue<usize>,
+
+    #[cfg(test)]
+    park_signal: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -278,7 +281,7 @@ impl Fio {
             open.read(true);
             open.write(true);
             open.create(true);
-            if get_fs_block_size(file.path())? == page_size {
+            if fs_block_size(file.path())? == page_size {
                 open.custom_flags(O_DIRECT);
             }
             open.open(file.path())?
@@ -318,6 +321,8 @@ impl Fio {
             free_bufs,
             generic_op_states,
             free_generic_op_states,
+            #[cfg(test)]
+            park_signal: AtomicBool::new(false),
         });
 
         let join = {
@@ -787,8 +792,14 @@ impl IoLoop {
         loop {
             let mut submitted = 0;
 
-            if self.inner.queue.is_empty() && pending == 0 && !self.fsync_back.is_empty() {
+            if self.inner.queue.is_empty() && pending == 0 && self.fsync_back.is_empty() {
+                #[cfg(test)]
+                self.inner.park_signal.store(true, Ordering::Release);
+
                 thread::park();
+
+                #[cfg(test)]
+                self.inner.park_signal.store(false, Ordering::Release);
             }
             if self.inner.stop.load(Ordering::Acquire) {
                 return Ok(());
@@ -1096,11 +1107,18 @@ mod tests {
         fs,
         io::{Read, Write},
         path::Path,
+        time::Duration,
     };
 
     use function_name::named;
+    use futures::future::join_all;
+    use tokio::spawn;
 
-    use crate::{meta::NUM_HEADER_PAGES, test::TempDir};
+    use crate::{
+        meta::NUM_HEADER_PAGES,
+        test::{TempDir, retry_until_success_tokio},
+        util::ChecksumDisk,
+    };
 
     use super::*;
 
@@ -1189,14 +1207,6 @@ mod tests {
 
         let data = fio.read(NUM_HEADER_PAGES).await?;
 
-        if let PageBuf::Pool(shared) = &data {
-            println!(
-                "read page into shared buffer with idx {}, address {:p}",
-                shared.idx,
-                shared.ptr()
-            );
-        }
-
         assert_eq!(&test_buf, data.get());
 
         Ok(())
@@ -1283,6 +1293,114 @@ mod tests {
         );
 
         let _read_test = fio.read_unchecked(5).await?;
+
+        Ok(())
+    }
+
+    #[named]
+    #[tokio::test]
+    async fn check_thread_parking() -> Result<()> {
+        let tmp = TempDir::new(function_name!())?;
+        let (fio, _meta) = tmp.fio("db")?;
+
+        retry_until_success_tokio(
+            || {
+                assert_eq!(true, fio.inner.park_signal.load(Ordering::Acquire));
+            },
+            Duration::ZERO,
+            Duration::from_millis(100),
+        )
+        .await;
+        assert_eq!(true, fio.inner.park_signal.load(Ordering::Acquire));
+
+        let run = Arc::new(AtomicBool::new(true));
+
+        let task = {
+            let run = run.clone();
+            let fio = fio.clone();
+            spawn(async move {
+                while run.load(Ordering::Acquire) {
+                    let mut buf = fio.get_buf();
+                    buf.get_mut().fill(0xFF);
+                    fio.write(0, buf).await?;
+                }
+                Ok(())
+            })
+        };
+
+        retry_until_success_tokio(
+            || {
+                assert_eq!(false, fio.inner.park_signal.load(Ordering::Acquire));
+            },
+            Duration::ZERO,
+            Duration::from_millis(100),
+        )
+        .await;
+
+        run.store(false, Ordering::Release);
+        task.await??;
+
+        retry_until_success_tokio(
+            || {
+                assert_eq!(true, fio.inner.park_signal.load(Ordering::Acquire));
+            },
+            Duration::ZERO,
+            Duration::from_millis(100),
+        )
+        .await;
+        assert_eq!(true, fio.inner.park_signal.load(Ordering::Acquire));
+
+        Ok(())
+    }
+
+    #[named]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn minor_stress_test() -> Result<()> {
+        const PGS: PgIdx = 1 << 14; // ~67mb
+        const LOC: &str = "db";
+        let tmp = TempDir::new(function_name!())?;
+        let file = Arc::new(tmp.file(LOC)?);
+        let fio = Fio::builder()
+            .file(file.clone())
+            .page_size(fs_block_size(file.path())?)
+            .sq(32)
+            .cq(64)
+            .page_buf_pool(128)
+            .build()?;
+
+        fio.alloc(PGS).await?;
+
+        let mut writes = Vec::new();
+        for i in 0..PGS {
+            let mut buf = fio.get_buf();
+            buf.get_mut().fill(0xFF);
+            writes.push(fio.write(i, buf));
+        }
+
+        let results = join_all(writes).await;
+        for result in results {
+            result?;
+        }
+
+        fio.commit().await?;
+
+        let mut reads = Vec::new();
+        for i in 0..PGS {
+            reads.push(fio.read(i));
+        }
+
+        let results = join_all(reads).await;
+        for (i, result) in results.into_iter().enumerate() {
+            let pg = result?;
+            let buf = pg.get();
+            assert!(
+                buf[..buf.len() - size_of::<ChecksumDisk>()]
+                    .iter()
+                    .all(|&b| b == 0xFF),
+                "page {} was not written correctly",
+                i
+            );
+        }
 
         Ok(())
     }

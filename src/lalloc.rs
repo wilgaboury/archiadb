@@ -2,9 +2,10 @@ use std::collections::HashMap;
 
 use crate::{
     db::Txn,
+    fio::PageBuf,
     key::KeyPathBuf,
     uint::{PgIdx, PgIdxDisk},
-    util::ceil_div,
+    util::{FrontBack, ceil_div},
 };
 
 pub(crate) struct Arena {
@@ -40,7 +41,7 @@ impl Lalloc {
 }
 
 impl<'a> Txn<'a> {
-    pub(crate) async fn lalloc(&self) -> u64 {
+    pub(crate) async fn lalloc(&self, _fb: FrontBack, _pg: PageBuf) -> u64 {
         todo!("implement lalloc");
     }
 }

@@ -12,7 +12,7 @@ use anyhow::{Result, bail};
 use crate::{
     btree::BTreeRootHeader,
     db::Db,
-    fio::PageBuf,
+    fio::{Fio, PageBuf},
     key::KeyPath,
     uint::{InPgIdx, PgIdx, U64},
 };
@@ -29,7 +29,7 @@ pub const MAX_KEY_SIZE: usize = u8::MAX as usize;
 pub const MIN_PAGE_SIZE: u64 = 4096; // 4kb
 pub const MAX_PAGE_SIZE: u64 = 65536; // 64kb
 
-pub fn get_fs_block_size<P: AsRef<Path>>(path: P) -> Result<InPgIdx> {
+pub fn fs_block_size<P: AsRef<Path>>(path: P) -> Result<InPgIdx> {
     let file = File::open(path)?;
     let fd = file.as_fd();
     let fstatvfs = fstatvfs(fd)?;
@@ -37,8 +37,8 @@ pub fn get_fs_block_size<P: AsRef<Path>>(path: P) -> Result<InPgIdx> {
 }
 
 /// file must exist
-pub fn pick_page_size<P: AsRef<Path>>(path: P) -> Result<u64> {
-    let block_size = get_fs_block_size(path)?;
+pub fn default_page_size<P: AsRef<Path>>(path: P) -> Result<u64> {
+    let block_size = fs_block_size(path)?;
     if block_size >= MIN_PAGE_SIZE && block_size <= MAX_PAGE_SIZE && block_size % MIN_PAGE_SIZE == 0
     {
         Ok(block_size)
@@ -142,6 +142,25 @@ pub(crate) fn ceil_div(num: u64, den: u64) -> u64 {
     (num + den - 1) / den
 }
 
+pub(crate) struct FrontBack {
+    front: PgIdx,
+    back: PgIdx,
+}
+
+impl FrontBack {
+    pub(crate) async fn from_roots(
+        fio: &Fio,
+        pg_idx_1: PgIdx,
+        pg_idx_2: PgIdx,
+    ) -> Result<(FrontBack, PageBuf)> {
+        let pg1 = fio.read(pg_idx_1).await?;
+        let pg2 = fio.read(pg_idx_2).await?;
+        let (front, buf, back, _) =
+            order_front_back(pg_idx_1, pg1, pg_idx_2, pg2, btree_header_version)?;
+        Ok((Self { front, back }, buf))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use function_name::named;
@@ -153,7 +172,7 @@ mod tests {
 
     use crate::{
         key_path,
-        test::{TempDir, corrupt_checksum, uncorrput_checksum},
+        test::{TempDir, corrupt_checksum},
     };
 
     use super::*;
@@ -166,9 +185,9 @@ mod tests {
 
     #[test]
     fn pick_block_size() {
-        let block_size = get_fs_block_size(Path::new("/")).unwrap();
+        let block_size = fs_block_size(Path::new("/")).unwrap();
         println!("Filesystem block size: {}", block_size);
-        let page_size = pick_page_size(Path::new("/")).unwrap();
+        let page_size = default_page_size(Path::new("/")).unwrap();
         println!("Picked page size: {}", page_size);
     }
 
@@ -180,7 +199,7 @@ mod tests {
         assert!(has_valid_checksum(&content));
         corrupt_checksum(&mut content);
         assert!(!has_valid_checksum(&content));
-        uncorrput_checksum(&mut content);
+        update_checksum(&mut content);
         assert!(has_valid_checksum(&content));
     }
 
