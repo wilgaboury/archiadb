@@ -8,6 +8,7 @@ use std::{
         fd::{AsFd, AsRawFd},
         unix::fs::OpenOptionsExt,
     },
+    panic,
     pin::Pin,
     sync::{
         Arc,
@@ -30,7 +31,7 @@ use thiserror::Error;
 use crate::{
     file::DbFile,
     uint::{InPgIdx, PgIdx},
-    util::{fs_block_size, has_valid_checksum, update_checksum},
+    util::{catch_unwind_anyhow, fs_block_size, has_valid_checksum, update_checksum},
 };
 
 pub const MIN_PAGE_SIZE: u64 = 4096; // smallest supported page size and most common filesystem block size
@@ -144,6 +145,8 @@ struct Inner {
 
     #[cfg(test)]
     park_signal: AtomicBool,
+    #[cfg(test)]
+    fail: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -323,6 +326,8 @@ impl Fio {
             free_generic_op_states,
             #[cfg(test)]
             park_signal: AtomicBool::new(false),
+            #[cfg(test)]
+            fail: AtomicBool::new(false),
         });
 
         let join = {
@@ -754,7 +759,8 @@ impl IoLoop {
     }
 
     fn run(&mut self) {
-        if let Err(e) = self.run_unchecked() {
+        let res = catch_unwind_anyhow(std::panic::AssertUnwindSafe(|| self.run_unchecked()));
+        if let Err(e) = res {
             eprintln!("io_uring thread failed: {}", e);
 
             // wake all outstanding operations
@@ -803,6 +809,12 @@ impl IoLoop {
             }
             if self.inner.stop.load(Ordering::Acquire) {
                 return Ok(());
+            }
+            #[cfg(test)]
+            {
+                if self.inner.fail.load(Ordering::Acquire) {
+                    panic!("test induced failure");
+                }
             }
 
             if self.fsync_front.is_empty() && !self.fsync_back.is_empty() {
@@ -1112,7 +1124,7 @@ mod tests {
 
     use function_name::named;
     use futures::future::join_all;
-    use tokio::spawn;
+    use tokio::{spawn, time::sleep};
 
     use crate::{
         meta::NUM_HEADER_PAGES,
@@ -1401,6 +1413,28 @@ mod tests {
                 i
             );
         }
+
+        Ok(())
+    }
+
+    #[named]
+    #[tokio::test]
+    async fn thread_failure() -> Result<()> {
+        let tmp = TempDir::new(function_name!())?;
+        let (fio, _meta) = tmp.fio("db")?;
+
+        let _ = fio.read(0).await?;
+
+        fio.inner.fail.store(true, Ordering::Release);
+        fio.join().thread().unpark();
+
+        sleep(Duration::from_millis(100)).await;
+
+        let buf = fio.get_dyn_buf();
+        assert!(fio.write(0, buf).await.is_err());
+        assert!(fio.alloc(3).await.is_err());
+        assert!(fio.read(0).await.is_err());
+        assert!(fio.commit().await.is_err());
 
         Ok(())
     }

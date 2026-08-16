@@ -2,12 +2,13 @@ use rustix::fs::fstatvfs;
 use std::{
     fs::File,
     os::fd::AsFd,
+    panic,
     path::Path,
     time::{Duration, Instant},
 };
 use xxhash_rust::xxh3::xxh3_64;
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 
 use crate::{
     btree::BTreeRootHeader,
@@ -161,8 +162,31 @@ impl FrontBack {
     }
 }
 
+pub(crate) fn catch_unwind_anyhow<F, T>(f: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T> + panic::UnwindSafe,
+{
+    let result = panic::catch_unwind(f);
+    match result {
+        Ok(inner_result) => inner_result, // propagate any inner anyhow::Error
+        Err(payload) => {
+            // Convert the panic payload to a String
+            let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                s.to_string()
+            } else if let Some(s) = payload.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "unknown panic".to_string()
+            };
+            Err(anyhow!("thread panicked: {}", msg))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::panic::panic_any;
+
     use function_name::named;
     use tokio::{
         spawn,
@@ -291,5 +315,42 @@ mod tests {
         task.await???;
 
         Ok(())
+    }
+
+    #[test]
+    fn check_unwind_anyhow() {
+        let result = catch_unwind_anyhow(|| Ok::<_, anyhow::Error>(1));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 1);
+
+        let err_msg = "inner error";
+        let result = catch_unwind_anyhow(|| Err::<(), _>(anyhow!(err_msg)));
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.to_string(), err_msg);
+
+        let result = catch_unwind_anyhow(|| -> Result<(), anyhow::Error> {
+            panic!("static panic");
+        });
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        let msg = err.downcast_ref::<String>().unwrap();
+        assert_eq!(msg, "thread panicked: static panic");
+
+        let result = catch_unwind_anyhow(|| -> Result<(), anyhow::Error> {
+            panic!("{}", "formatted panic");
+        });
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        let msg = err.downcast_ref::<String>().unwrap();
+        assert_eq!(msg, "thread panicked: formatted panic");
+
+        let result = catch_unwind_anyhow(|| -> Result<(), anyhow::Error> {
+            panic_any(1);
+        });
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        let msg = err.downcast_ref::<String>().unwrap();
+        assert_eq!(msg, "thread panicked: unknown panic");
     }
 }
