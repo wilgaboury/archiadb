@@ -29,3 +29,6 @@ derive_more = { version = "2.1.1", features = ["full"] }
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
+
+[features]
+manual = []

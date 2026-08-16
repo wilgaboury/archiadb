@@ -357,7 +357,8 @@ mod tests {
         Ok(())
     }
 
-    // #[test]
+    #[cfg(feature = "manual")]
+    #[test]
     fn contentious_mutex_test() -> Result<()> {
         let lock = Arc::new(Mutex::new(0));
         let mut threads = Vec::new();
@@ -441,7 +442,8 @@ mod tests {
         Ok(())
     }
 
-    // #[tokio::test(flavor = "multi_thread")]
+    #[cfg(feature = "manual")]
+    #[tokio::test(flavor = "multi_thread")]
     async fn check_for_concurrent_overlap_tokio_mutex() -> Result<()> {
         let ptr_usize = Box::into_raw(Box::new(0)) as usize;
         let lock = Arc::new(tokio::sync::Mutex::new(0));
