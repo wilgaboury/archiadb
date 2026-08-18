@@ -240,7 +240,7 @@ mod tests {
     };
 
     use crate::{
-        key, key_path,
+        key_path,
         test::{TempDir, corrupt_checksum},
     };
 

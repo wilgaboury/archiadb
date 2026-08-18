@@ -239,7 +239,6 @@ mod tests {
     use std::{fs::File, os::unix::fs::FileExt};
 
     use crate::{
-        key_path,
         meta::{MAGIC, MagicType},
         test::TempDir,
         util::update_checksum,
