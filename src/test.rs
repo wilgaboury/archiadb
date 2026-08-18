@@ -52,8 +52,8 @@ pub(crate) struct TempDir {
 
 impl TempDir {
     pub fn new(suffix: &str) -> Result<Self> {
-        let path = std::env::temp_dir().join(format!(
-            "{}_{}_{}",
+        let path = std::env::current_dir()?.join(format!(
+            "tdat/{}_{}_{}",
             suffix,
             std::process::id(),
             std::time::SystemTime::now()

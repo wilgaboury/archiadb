@@ -1358,7 +1358,7 @@ mod tests {
     #[named]
     #[tokio::test(flavor = "multi_thread")]
     async fn minor_stress_test() -> Result<()> {
-        const PGS: PgIdx = 1 << 14; // ~67mb
+        const PGS: PgIdx = 1 << 16; // ~67mb
         const LOC: &str = "db";
         let tmp = TempDir::new(function_name!())?;
         let file = Arc::new(tmp.file(LOC)?);

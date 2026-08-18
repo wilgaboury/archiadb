@@ -1,0 +1,15 @@
+#!/bin/bash
+
+mkdir -p ./tdat
+fio --name=test \
+    --filename=./tdat/fs-pf-ck \
+    --ioengine=io_uring \
+    --rw=randwrite \
+    --bs=4k \
+    --size=256M \
+    --iodepth=256 \
+    --sqthread_poll=1 \
+    --direct=1 \
+    --runtime=10 \
+    --time_based
+rm ./tdat/fs-pf-ck
