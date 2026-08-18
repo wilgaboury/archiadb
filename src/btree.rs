@@ -871,7 +871,7 @@ impl<'a> Txn<'a> {
         for chunk in value.chunks(chunk_size).rev() {
             let pg_idx = self.alloc().await?;
             let mut buf = self.db.fio.get_buf();
-            let mbuf = buf.get_mut();
+            let mbuf = buf.as_mut();
             let len = chunk.len();
             mbuf[..len].copy_from_slice(chunk);
             from_bytes_mut::<PgIdxDisk>(&mut mbuf[len..len + size_of::<PgIdxDisk>()])
@@ -886,7 +886,7 @@ impl<'a> Txn<'a> {
         let mut empty = buf.len();
         while empty > 0 {
             let pg = self.db.fio.read(pg_idx).await?;
-            let pg_buf = pg.get();
+            let pg_buf = pg.as_ref();
             let len = pg_buf.len() - size_of::<PgIdxDisk>() - size_of::<ChecksumDisk>();
             let cp_len = std::cmp::min(len, empty);
             let cp_start = buf.len() - empty;

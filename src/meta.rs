@@ -69,7 +69,6 @@ impl Meta {
         self.root2.set(NUM_HEADER_PAGES + 1);
 
         self.set_version(0);
-        self.set_open(false);
         self.set_len(NUM_HEADER_PAGES);
 
         self.set_galloc_fidx(0);
@@ -102,14 +101,6 @@ impl Meta {
 
     fn set_version(&mut self, ver: u64) {
         self.version.set(ver);
-    }
-
-    pub(crate) fn open(&self) -> bool {
-        if self.open > 0 { true } else { false }
-    }
-
-    pub(crate) fn set_open(&mut self, is_open: bool) {
-        self.open = if is_open { 1 } else { 0 };
     }
 
     pub(crate) fn len(&self) -> u64 {
@@ -223,10 +214,6 @@ impl MetaHandler {
         self.len.load(Ordering::Acquire)
     }
 
-    pub(crate) async fn open_async(&self) -> bool {
-        self.access_async(|meta| meta.open()).await
-    }
-
     pub(crate) fn try_mutate(&self, file: &File, f: impl FnOnce(&mut Meta)) -> Result<()> {
         let mut inner_guard = self.inner.try_lock()?;
         let inner = &mut *inner_guard;
@@ -281,7 +268,7 @@ impl MetaHandler {
             let pg_idx = if inner.is_first { 1 } else { 0 };
             {
                 let mut buf = fio.get_buf();
-                buf.get_mut().copy_from_slice(&inner.back);
+                buf.as_mut().copy_from_slice(&inner.back);
                 fio.write(pg_idx, buf).await?;
                 fio.commit().await?;
             }
@@ -388,19 +375,19 @@ mod tests {
         let result: Result<()> = rt.block_on(async {
             meta_hand.mutate_async(&fio, |m| m.set_len(100)).await?;
             let buf = fio.read(1).await?;
-            let meta = from_bytes::<Meta>(&buf.get());
+            let meta = from_bytes::<Meta>(&buf.as_ref());
             assert_eq!(meta.len(), 100);
 
             meta_hand.mutate_async(&fio, |m| m.set_len(101)).await?;
             let buf = fio.read(0).await?;
-            let meta = from_bytes::<Meta>(&buf.get());
+            let meta = from_bytes::<Meta>(&buf.as_ref());
             assert_eq!(meta.len(), 101);
 
             meta_hand
                 .mutate_async(&fio, |m| m.set_len(0x0000005544332211))
                 .await?;
             let buf = fio.read(1).await?;
-            let meta = from_bytes::<Meta>(&buf.get());
+            let meta = from_bytes::<Meta>(&buf.as_ref());
             assert_eq!(meta.len(), 0x0000005544332211);
 
             Ok(())

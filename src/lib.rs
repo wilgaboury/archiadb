@@ -2,7 +2,6 @@
 #![allow(dead_code)]
 
 pub mod btree;
-pub mod concache;
 pub mod db;
 pub mod defer;
 pub mod file;
@@ -11,6 +10,7 @@ pub mod flux;
 pub mod free;
 pub mod galloc;
 pub mod intrusive;
+pub mod karc;
 pub mod key;
 pub mod lalloc;
 pub mod lock;

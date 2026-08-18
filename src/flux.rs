@@ -41,15 +41,15 @@ pub struct FluxBufAlloc {
 impl FluxBuf {
     pub fn get(&self) -> &[u8] {
         match self {
-            FluxBuf::Unalloc(buf) => buf.get(),
-            FluxBuf::Alloc(data) => data.buf.get(),
+            FluxBuf::Unalloc(buf) => buf.as_ref(),
+            FluxBuf::Alloc(data) => data.buf.as_ref(),
         }
     }
 
     pub fn get_mut(&mut self) -> &mut [u8] {
         match self {
-            FluxBuf::Unalloc(buf) => buf.get_mut(),
-            FluxBuf::Alloc(data) => data.buf.get_mut(),
+            FluxBuf::Unalloc(buf) => buf.as_mut(),
+            FluxBuf::Alloc(data) => data.buf.as_mut(),
         }
     }
 }

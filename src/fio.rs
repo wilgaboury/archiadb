@@ -194,18 +194,6 @@ pub enum PageBuf {
 
 impl AsRef<[u8]> for PageBuf {
     fn as_ref(&self) -> &[u8] {
-        self.get()
-    }
-}
-
-impl AsMut<[u8]> for PageBuf {
-    fn as_mut(&mut self) -> &mut [u8] {
-        self.get_mut()
-    }
-}
-
-impl PageBuf {
-    pub fn get(&self) -> &[u8] {
         match self {
             PageBuf::Pool(shared) => {
                 let page_size = shared.fio.page_size;
@@ -214,8 +202,10 @@ impl PageBuf {
             PageBuf::Dynamic(buf) => buf,
         }
     }
+}
 
-    pub fn get_mut(&mut self) -> &mut [u8] {
+impl AsMut<[u8]> for PageBuf {
+    fn as_mut(&mut self) -> &mut [u8] {
         match self {
             PageBuf::Pool(shared) => {
                 let page_size = shared.fio.page_size;
@@ -367,7 +357,7 @@ impl Fio {
     pub(crate) async fn read(&self, pg_idx: u64) -> std::result::Result<PageBuf, ReadError> {
         let pg = self.read_unchecked(pg_idx).await?;
 
-        if !has_valid_checksum(pg.get()) {
+        if !has_valid_checksum(pg.as_ref()) {
             return Err(ReadError::BadChecksum);
         }
 
@@ -427,7 +417,7 @@ impl Fio {
     }
 
     pub(crate) async fn write(&self, pg_idx: u64, mut buf: PageBuf) -> Result<()> {
-        update_checksum(buf.get_mut());
+        update_checksum(buf.as_mut());
         self.write_unchecked(pg_idx, buf).await
     }
 
@@ -1157,8 +1147,8 @@ mod tests {
         let mut buf = fio.get_buf();
         assert!(matches!(buf, PageBuf::Pool(_)));
 
-        buf.get_mut()[0] = 1;
-        assert_eq!(1, buf.get()[0]);
+        buf.as_mut()[0] = 1;
+        assert_eq!(1, buf.as_ref()[0]);
 
         Ok(())
     }
@@ -1189,7 +1179,7 @@ mod tests {
             );
         }
 
-        assert_eq!(&test_buf, data.get());
+        assert_eq!(&test_buf, data.as_ref());
 
         Ok(())
     }
@@ -1219,7 +1209,7 @@ mod tests {
 
         let data = fio.read(NUM_HEADER_PAGES).await?;
 
-        assert_eq!(&test_buf, data.get());
+        assert_eq!(&test_buf, data.as_ref());
 
         Ok(())
     }
@@ -1231,7 +1221,7 @@ mod tests {
         let (fio, _) = temp_dir.fio("db")?;
 
         let mut buf = fio.get_buf();
-        buf.get_mut()[0..].fill(1u8);
+        buf.as_mut()[0..].fill(1u8);
         fio.write(0, buf).await?;
         fio.commit().await?;
 
@@ -1263,7 +1253,7 @@ mod tests {
             .page_buf_pool(0)
             .build()?;
         let mut buf = fio.get_buf();
-        buf.get_mut()[0..].fill(1u8);
+        buf.as_mut()[0..].fill(1u8);
         fio.write(0, buf).await?;
         fio.commit_flush().await?;
 
@@ -1333,7 +1323,7 @@ mod tests {
             spawn(async move {
                 while run.load(Ordering::Acquire) {
                     let mut buf = fio.get_buf();
-                    buf.get_mut().fill(0xFF);
+                    buf.as_mut().fill(0xFF);
                     fio.write(0, buf).await?;
                 }
                 Ok(())
@@ -1385,7 +1375,7 @@ mod tests {
         let mut writes = Vec::new();
         for i in 0..PGS {
             let mut buf = fio.get_buf();
-            buf.get_mut().fill(0xFF);
+            buf.as_mut().fill(0xFF);
             writes.push(fio.write(i, buf));
         }
 
@@ -1404,7 +1394,7 @@ mod tests {
         let results = join_all(reads).await;
         for (i, result) in results.into_iter().enumerate() {
             let pg = result?;
-            let buf = pg.get();
+            let buf = pg.as_ref();
             assert!(
                 buf[..buf.len() - size_of::<ChecksumDisk>()]
                     .iter()

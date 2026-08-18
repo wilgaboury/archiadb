@@ -4,12 +4,12 @@ use derive_more::Debug; // This is the key!
 
 use dashmap::DashMap;
 
-/// Can be thought of like a keyed Arc. Values are retained in cache so long as there is
+/// A keyed atomic reference counter. Values are retained in cache so long as there is
 /// at least one reference to it, and removed when no longer referenced. The effect is that
 /// for a given key, there is always exactly one value that all concurrent operation reference.
 
 #[derive(Debug)]
-pub struct ConCache<K, V>
+pub struct Karc<K, V>
 where
     K: Hash + Eq + Clone,
 {
@@ -24,10 +24,10 @@ where
     K: Hash + Eq + Clone,
 {
     counts: DashMap<K, u64>,
-    values: DashMap<K, Carc<K, V>>,
+    values: DashMap<K, KarcEntry<K, V>>,
 }
 
-impl<K, V> ConCache<K, V>
+impl<K, V> Karc<K, V>
 where
     K: Hash + Eq + Clone,
 {
@@ -41,7 +41,7 @@ where
         }
     }
 
-    pub fn get(&self, key: K) -> Carc<K, V>
+    pub fn get(&self, key: K) -> KarcEntry<K, V>
     where
         K: Hash + Eq + Clone,
     {
@@ -55,7 +55,7 @@ where
             .entry(key.clone())
             .or_insert_with(|| {
                 let value = (self.create)();
-                Carc {
+                KarcEntry {
                     inner: NonNull::new(Box::into_raw(Box::new(CarcInner {
                         key: key,
                         data: value,
@@ -68,14 +68,14 @@ where
     }
 }
 
-unsafe impl<K, V> Send for Carc<K, V>
+unsafe impl<K, V> Send for KarcEntry<K, V>
 where
     K: Hash + Eq + Clone + Send,
     V: Send,
 {
 }
 
-unsafe impl<K, V> Sync for Carc<K, V>
+unsafe impl<K, V> Sync for KarcEntry<K, V>
 where
     K: Hash + Eq + Clone + Sync,
     V: Sync,
@@ -83,14 +83,14 @@ where
 }
 
 #[derive(Debug)]
-pub struct Carc<K, V>
+pub struct KarcEntry<K, V>
 where
     K: Hash + Eq + Clone,
 {
     inner: NonNull<CarcInner<K, V>>,
 }
 
-impl<K, V> Carc<K, V>
+impl<K, V> KarcEntry<K, V>
 where
     K: Hash + Eq + Clone,
 {
@@ -100,7 +100,7 @@ where
     }
 }
 
-impl<K, V> Clone for Carc<K, V>
+impl<K, V> Clone for KarcEntry<K, V>
 where
     K: Hash + Eq + Clone,
 {
@@ -121,7 +121,7 @@ where
     maps: Arc<Maps<K, V>>,
 }
 
-impl<K, V> Deref for Carc<K, V>
+impl<K, V> Deref for KarcEntry<K, V>
 where
     K: Hash + Eq + Clone,
 {
@@ -133,7 +133,7 @@ where
     }
 }
 
-impl<K, V> Drop for Carc<K, V>
+impl<K, V> Drop for KarcEntry<K, V>
 where
     K: Hash + Eq + Clone,
 {
@@ -173,7 +173,7 @@ mod tests {
         let create_count = Arc::new(AtomicUsize::new(0));
         let cache = {
             let create_count = create_count.clone();
-            ConCache::new(Box::new(move || {
+            Karc::new(Box::new(move || {
                 create_count.fetch_add(1, Ordering::SeqCst);
                 100
             }))

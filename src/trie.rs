@@ -94,6 +94,7 @@ impl<T> KeyTrie<T> {
         Some(&mut node.value)
     }
 
+    // TODO: this is super useless, we have keys, tree lca is overkill
     /// Lowest common ancestor of dirty nodes
     pub fn lca<F: Fn(&T) -> bool>(&self, cond: F) -> Option<KeyPathBuf> {
         let mut first: Option<KeyPathBuf> = None;

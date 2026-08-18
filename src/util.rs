@@ -14,7 +14,8 @@ use crate::{
     btree::BTreeRootHeader,
     db::Db,
     fio::{Fio, PageBuf},
-    key::KeyPath,
+    key::{KeyPath, KeyPathBuf},
+    key_path,
     uint::{InPgIdx, PgIdx, U64},
 };
 
@@ -149,6 +150,10 @@ pub(crate) struct FrontBack {
 }
 
 impl FrontBack {
+    pub(crate) fn new(front: PgIdx, back: PgIdx) -> Self {
+        Self { front, back }
+    }
+
     pub(crate) async fn from_roots(
         fio: &Fio,
         pg_idx_1: PgIdx,
@@ -159,6 +164,18 @@ impl FrontBack {
         let (front, buf, back, _) =
             order_front_back(pg_idx_1, pg1, pg_idx_2, pg2, btree_header_version)?;
         Ok((Self { front, back }, buf))
+    }
+
+    pub(crate) fn front(&self) -> PgIdx {
+        self.front
+    }
+
+    pub(crate) fn back(&self) -> PgIdx {
+        self.back
+    }
+
+    pub(crate) fn flip(&mut self) {
+        std::mem::swap(&mut self.front, &mut self.back);
     }
 }
 
@@ -183,6 +200,33 @@ where
     }
 }
 
+pub(crate) fn lca<'a>(iter: impl IntoIterator<Item = &'a KeyPath>) -> KeyPathBuf {
+    let mut iter = iter.into_iter();
+    let first = iter.next();
+    let mut lca = match first {
+        Some(path) => path.to_owned(),
+        None => return key_path![].to_owned(),
+    };
+
+    for path in iter {
+        let len = lca
+            .into_iter()
+            .zip(path)
+            .take_while(|(k1, k2)| k1 == k2)
+            .count();
+
+        while lca.len() > len {
+            lca.pop();
+        }
+
+        if lca.len() == 0 {
+            return lca;
+        }
+    }
+
+    lca
+}
+
 #[coverage(off)]
 #[cfg(test)]
 mod tests {
@@ -196,11 +240,51 @@ mod tests {
     };
 
     use crate::{
-        key_path,
+        key, key_path,
         test::{TempDir, corrupt_checksum},
     };
 
     use super::*;
+
+    #[test]
+    fn test_lca() {
+        let paths = vec![
+            key_path![b"a", b"b", b"c"],
+            key_path![b"a", b"b", b"c", b"d"],
+            key_path![b"a", b"b"],
+        ];
+        assert_eq!(key_path![b"a", b"b"], lca(paths).as_ref());
+
+        let paths = vec![key_path![b"a"], key_path![b"b"]];
+        assert_eq!(key_path![], lca(paths).as_ref());
+
+        let paths = vec![key_path![b"a"], key_path![b"b"], key_path![b"c"]];
+        assert_eq!(key_path![], lca(paths).as_ref());
+
+        let paths = vec![
+            key_path![b"a", b"b", b"c", b"d"],
+            key_path![b"a", b"b", b"c", b"d"],
+            key_path![b"a", b"b", b"c", b"d"],
+            key_path![b"a", b"b", b"c", b"d"],
+        ];
+        assert_eq!(key_path![b"a", b"b", b"c", b"d"], lca(paths).as_ref());
+
+        let paths = vec![
+            key_path![b"a", b"b", b"c", b"d"],
+            key_path![b"a", b"b", b"c", b"d"],
+            key_path![b"a", b"b", b"c", b"d"],
+            key_path![b"a"],
+        ];
+        assert_eq!(key_path![b"a"], lca(paths).as_ref());
+
+        let paths = vec![
+            key_path![b"a"],
+            key_path![b"a", b"b", b"c", b"d"],
+            key_path![b"a", b"b", b"c", b"d"],
+            key_path![b"a", b"b", b"c", b"d"],
+        ];
+        assert_eq!(key_path![b"a"], lca(paths).as_ref());
+    }
 
     #[test]
     fn check_ciel_div() {
@@ -251,10 +335,10 @@ mod tests {
         let db = tmp.db("db").await?;
 
         let mut buf: PageBuf = db.inner.fio.read(2).await?;
-        corrupt_checksum(buf.get_mut());
+        corrupt_checksum(buf.as_mut());
         db.inner.fio.write_unchecked(2, buf).await?;
         let mut buf: PageBuf = db.inner.fio.read(3).await?;
-        corrupt_checksum(buf.get_mut());
+        corrupt_checksum(buf.as_mut());
         db.inner.fio.write_unchecked(3, buf).await?;
         db.inner.fio.commit().await?;
 
@@ -288,7 +372,7 @@ mod tests {
         let db = tmp.db("db").await?;
 
         let mut buf: PageBuf = db.inner.fio.read(3).await?;
-        corrupt_checksum(buf.get_mut());
+        corrupt_checksum(buf.as_mut());
         db.inner.fio.write_unchecked(3, buf).await?;
         db.inner.fio.commit().await?;
 
@@ -362,7 +446,7 @@ mod tests {
         let (fio, _meta) = tmp.fio("db")?;
         let mut pg = fio.get_dyn_buf();
         {
-            let meta = from_bytes_mut::<BTreeRootHeader>(pg.get_mut());
+            let meta = from_bytes_mut::<BTreeRootHeader>(pg.as_mut());
             meta.init();
             meta.version.set(0x1122334455);
         }

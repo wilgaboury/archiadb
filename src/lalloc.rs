@@ -1,11 +1,14 @@
 use std::collections::HashMap;
 
+use anyhow::Result;
+
 use crate::{
+    btree::BTreeRootHeader,
     db::Txn,
     fio::PageBuf,
     key::KeyPathBuf,
     uint::{PgIdx, PgIdxDisk},
-    util::{FrontBack, ceil_div},
+    util::{FrontBack, ceil_div, from_bytes},
 };
 
 pub(crate) struct Arena {
@@ -41,7 +44,12 @@ impl Lalloc {
 }
 
 impl<'a> Txn<'a> {
-    pub(crate) async fn lalloc(&self, _fb: FrontBack, _pg: PageBuf) -> u64 {
+    pub(crate) async fn lalloc(&self, fb: &mut FrontBack, pg: PageBuf) -> Result<PgIdx> {
+        let root = from_bytes::<BTreeRootHeader>(pg.as_ref());
+        if root.free.get() == 0 && root.arena.start.get() == 0 {
+            self.db.galloc(fb, 8).await?;
+        }
+
         todo!("implement lalloc");
     }
 }

@@ -1,20 +1,22 @@
-use std::{path::Path, sync::Arc};
+use std::{collections::HashMap, path::Path, sync::Arc};
 
 use anyhow::{Context, Result, anyhow};
 use bon::bon;
 use tokio::sync::Mutex;
 
 use crate::{
-    concache::ConCache,
+    btree::BTreeRootHeader,
     defer::{Defer, DeferGaurd},
     file::DbFile,
     fio::{DEFAULT_CQ_SIZE, DEFAULT_SQ_SIZE, Fio},
     flux::Flux,
-    galloc::{Galloc, galloc_recover, init_root},
+    galloc::{Galloc, galloc_recover},
+    karc::Karc,
     key::{KeyPath, KeyPathBuf},
     lock::{Lock, LockGuard, LockType},
-    meta::{MetaHandler, NUM_HEADER_PAGES},
+    meta::MetaHandler,
     trie::KeyTrie,
+    util::{FrontBack, from_bytes_mut, lca},
 };
 
 #[derive(Debug, Clone)]
@@ -29,8 +31,8 @@ pub(crate) struct DbInner {
     pub(crate) fio: Fio,
     pub(crate) galloc: Galloc,
     pub(crate) defer: Defer,
-    pub(crate) read_locks: ConCache<KeyPathBuf, Lock>,
-    pub(crate) write_locks: ConCache<KeyPathBuf, Mutex<()>>,
+    pub(crate) read_locks: Karc<KeyPathBuf, Lock>,
+    pub(crate) write_locks: Karc<KeyPathBuf, Mutex<()>>,
 }
 
 #[bon]
@@ -54,18 +56,10 @@ impl Db {
             generic_op_state_pool,
         )?;
 
-        // check if database file suffered dirty shutdown
-        if meta.open_async().await {
-            galloc_recover(&meta, &fio).await?;
-        }
+        galloc_recover(&meta, &fio).await?;
 
-        meta.mutate_async(&fio, |meta| {
-            meta.set_open(true);
-        })
-        .await?;
-
-        if meta.len() == NUM_HEADER_PAGES {
-            init_root(&meta, &fio).await?;
+        if meta.len() == 2 {
+            init_db_root(&meta, &fio).await?;
         }
 
         Ok(Self {
@@ -75,8 +69,8 @@ impl Db {
                 fio,
                 galloc: Galloc::new(),
                 defer: Defer::new(),
-                read_locks: ConCache::new(Box::new(|| Lock::new())),
-                write_locks: ConCache::new(Box::new(|| Mutex::new(()))),
+                read_locks: Karc::new(Box::new(|| Lock::new())),
+                write_locks: Karc::new(Box::new(|| Mutex::new(()))),
             }),
         })
     }
@@ -99,14 +93,36 @@ impl Db {
     }
 }
 
-impl Drop for DbInner {
-    fn drop(&mut self) {
-        if let Err(e) = self.meta.try_mutate(self.file.file(), |meta| {
-            meta.set_open(false);
-        }) {
-            eprintln!("Failed to set close flag: {}", e);
-        }
-    }
+// impl Drop for DbInner {
+//     fn drop(&mut self) {
+//         if let Err(e) = self.meta.try_mutate(self.file.file(), |meta| {
+//             meta.set_open(false);
+//         }) {
+//             eprintln!("Failed to set close flag: {}", e);
+//         }
+//     }
+// }
+
+pub(crate) async fn init_db_root(meta: &MetaHandler, fio: &Fio) -> Result<()> {
+    let front_idx = 2;
+    let back_idx = 3;
+    fio.alloc(4).await?;
+
+    let mut front = fio.get_buf();
+    let mut back = fio.get_buf();
+    from_bytes_mut::<BTreeRootHeader>(front.as_mut()).init();
+    from_bytes_mut::<BTreeRootHeader>(back.as_mut()).init();
+    fio.write(front_idx, front).await?;
+    fio.write(back_idx, back).await?;
+
+    fio.commit().await?;
+
+    meta.mutate_async(&fio, |meta| {
+        meta.set_len(4);
+    })
+    .await?;
+
+    Ok(())
 }
 
 pub struct TxnBuilder<'a> {
@@ -146,6 +162,7 @@ impl<'a> TxnBuilder<'a> {
             ops: self.ops,
             flux: Flux::new(),
             writes: KeyTrie::new(),
+            writes2: HashMap::new(),
         }
     }
 }
@@ -158,6 +175,7 @@ pub struct Txn<'a> {
     pub(crate) ops: KeyTrie<LockType>,
     pub(crate) flux: Flux,
     pub(crate) writes: KeyTrie<Option<u64>>,
+    pub(crate) writes2: HashMap<KeyPathBuf, FrontBack>,
 }
 
 impl<'a> Txn<'a> {
@@ -190,20 +208,19 @@ impl<'a> Txn<'a> {
 
     // TODO: significant work idea, batch all write futures from btree operations and allocations
     // at once into a batch. That way each commit would be
-    // 1. submit batch of all writes (btree + allocations)
+    // 1. submit batch of all writes
     // 2. fsync
     // 3. swap buf root
     // 4. fysnc
     pub async fn commit(&mut self) {
-        if let Some(lca) = self.writes.lca(|v| v.is_some()) {
-            for (key, _node) in self.ops.dfs_iter_mut() {
-                if key.as_path().starts_with(&lca) {
-                    todo!("implement")
-                }
+        let lca = lca(self.writes2.keys().map(|k| k.as_ref()));
+        for (key, _node) in self.ops.dfs_iter_mut() {
+            if key.as_path().starts_with(&lca) {
+                todo!("implement")
             }
-
-            todo!("implement")
         }
+
+        // TODO: implement
 
         self.defer_gaurd.flush();
     }
@@ -263,27 +280,27 @@ mod tests {
         Ok(())
     }
 
-    #[named]
-    #[tokio::test]
-    async fn db_open_meta_flag() -> Result<()> {
-        let tmp = TempDir::new(function_name!()).unwrap();
-        let db = tmp.db("db").await?;
-        {
-            let _t1 = db.txn().read(key_path![b"key1"])?.begin().await;
-        }
-        db.try_close()?;
+    // #[named]
+    // #[tokio::test]
+    // async fn db_open_meta_flag() -> Result<()> {
+    //     let tmp = TempDir::new(function_name!()).unwrap();
+    //     let db = tmp.db("db").await?;
+    //     {
+    //         let _t1 = db.txn().read(key_path![b"key1"])?.begin().await;
+    //     }
+    //     db.try_close()?;
 
-        {
-            let meta = tmp.meta("db")?;
-            assert_eq!(false, meta.open_async().await);
-        }
+    //     {
+    //         let meta = tmp.meta("db")?;
+    //         assert_eq!(false, meta.open_async().await);
+    //     }
 
-        let _db = tmp.db("db").await?;
-        {
-            let meta = tmp.meta("db")?;
-            assert_eq!(true, meta.open_async().await);
-        }
+    //     let _db = tmp.db("db").await?;
+    //     {
+    //         let meta = tmp.meta("db")?;
+    //         assert_eq!(true, meta.open_async().await);
+    //     }
 
-        Ok(())
-    }
+    //     Ok(())
+    // }
 }

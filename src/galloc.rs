@@ -2,8 +2,12 @@ use anyhow::Result;
 use tokio::sync::Mutex;
 
 use crate::{
-    btree::BTreeRootHeader, db::DbInner, fio::Fio, meta::MetaHandler, uint::PgIdx,
-    util::from_bytes_mut,
+    btree::BTreeRootHeader,
+    db::DbInner,
+    fio::Fio,
+    meta::MetaHandler,
+    uint::PgIdx,
+    util::{FrontBack, from_bytes_mut},
 };
 
 #[derive(Debug)]
@@ -24,14 +28,9 @@ impl DbInner {
         todo!("implement pre_galloc");
     }
 
-    pub(crate) async fn galloc(
-        &self,
-        front_idx: PgIdx,
-        back_idx: PgIdx,
-        alen: PgIdx,
-    ) -> Result<()> {
+    pub(crate) async fn galloc(&self, fb: &mut FrontBack, alen: PgIdx) -> Result<()> {
         let _gaurd = self.galloc.lock.lock().await;
-        galloc_helper(&self.meta, &self.fio, front_idx, back_idx, alen).await?;
+        galloc_helper(&self.meta, &self.fio, fb, alen).await?;
         Ok(())
     }
 }
@@ -39,20 +38,19 @@ impl DbInner {
 pub(crate) async fn galloc_helper(
     meta: &MetaHandler,
     fio: &Fio,
-    front_idx: PgIdx,
-    back_idx: PgIdx,
+    fb: &mut FrontBack,
     alen: PgIdx,
 ) -> Result<()> {
-    let mut root = fio.read(front_idx).await?;
-    let btree = from_bytes_mut::<BTreeRootHeader>(root.get_mut());
+    let mut root = fio.read(fb.front()).await?;
+    let btree = from_bytes_mut::<BTreeRootHeader>(root.as_mut());
     let prev_len = meta.len();
     let len = meta.len() + alen;
 
     fio.alloc(len).await?;
 
     meta.mutate_async(&fio, |meta| {
-        meta.galloc_fidx.set(front_idx);
-        meta.galloc_bidx.set(back_idx);
+        meta.galloc_fidx.set(fb.front());
+        meta.galloc_bidx.set(fb.back());
         meta.galloc_len.set(alen);
     })
     .await?;
@@ -61,7 +59,7 @@ pub(crate) async fn galloc_helper(
     btree.arena.start.set(prev_len);
     btree.arena.len.set(alen);
     btree.arena.next.set(0);
-    fio.write(back_idx, root).await?;
+    fio.write(fb.back(), root).await?;
     fio.commit().await?;
 
     meta.mutate_async(&fio, |meta| {
@@ -71,6 +69,8 @@ pub(crate) async fn galloc_helper(
         meta.galloc_len.set(0);
     })
     .await?;
+
+    fb.flip();
 
     Ok(())
 }
@@ -86,33 +86,8 @@ pub(crate) async fn galloc_recover(meta: &MetaHandler, fio: &Fio) -> Result<()> 
         })
         .await;
     if front_idx != 0 && back_idx != 0 {
-        galloc_helper(meta, fio, front_idx, back_idx, alen).await?;
+        galloc_helper(meta, fio, &mut FrontBack::new(front_idx, back_idx), alen).await?;
     }
-    Ok(())
-}
-
-pub(crate) async fn init_root(meta: &MetaHandler, fio: &Fio) -> Result<()> {
-    let len = meta.len();
-    let front_idx = len;
-    let back_idx = len + 1;
-    fio.alloc(len + 2).await?;
-
-    let mut front = fio.get_buf();
-    let mut back = fio.get_buf();
-    from_bytes_mut::<BTreeRootHeader>(front.get_mut()).init();
-    from_bytes_mut::<BTreeRootHeader>(back.get_mut()).init();
-    fio.write(front_idx, front).await?;
-    fio.write(back_idx, back).await?;
-
-    fio.commit().await?;
-
-    meta.mutate_async(&fio, |meta| {
-        meta.set_len(len + 2);
-    })
-    .await?;
-
-    galloc_helper(meta, fio, front_idx, back_idx, 4).await?;
-
     Ok(())
 }
 
@@ -132,10 +107,15 @@ mod tests {
         let tmp = TempDir::new(function_name!()).unwrap();
         let db = tmp.db(LOC).await?;
 
+        assert_eq!(4, db.inner.meta.len());
+
+        db.inner
+            .galloc(&mut FrontBack::from_roots(&db.inner.fio, 2, 3).await?.0, 4)
+            .await?;
         assert_eq!(8, db.inner.meta.len());
 
         let buf = db.inner.fio.read(3).await?;
-        let root = from_bytes::<BTreeRootHeader>(&buf.get());
+        let root = from_bytes::<BTreeRootHeader>(&buf.as_ref());
         assert_eq!(4, root.arena.start.get());
         assert_eq!(4, root.arena.len.get());
         assert_eq!(0, root.arena.next.get());
@@ -154,19 +134,18 @@ mod tests {
         {
             let (fio, _meta) = tmp.fio(LOC)?;
             let mut buf = fio.read(0).await?;
-            let meta = from_bytes_mut::<Meta>(buf.get_mut());
+            let meta = from_bytes_mut::<Meta>(buf.as_mut());
             meta.open = 0;
-            assert_eq!(4, meta.version.get());
+            assert_eq!(0, meta.version.get());
             meta.version.set(meta.version.get() + 1);
             meta.galloc_fidx.set(2);
             meta.galloc_bidx.set(3);
             meta.galloc_len.set(4);
             meta.len.set(4);
-            meta.set_open(true);
             fio.write(0, buf).await?;
 
             let mut buf = fio.read(3).await?;
-            let root = from_bytes_mut::<BTreeRootHeader>(buf.get_mut());
+            let root = from_bytes_mut::<BTreeRootHeader>(buf.as_mut());
             root.arena.start.set(0);
 
             fio.commit().await?;
@@ -174,7 +153,7 @@ mod tests {
 
         let db = tmp.db(LOC).await?;
         let buf = db.inner.fio.read(3).await?;
-        let root = from_bytes::<BTreeRootHeader>(buf.get());
+        let root = from_bytes::<BTreeRootHeader>(buf.as_ref());
         assert_eq!(4, root.arena.start.get());
         assert_eq!(4, root.arena.len.get());
         assert_eq!(0, root.arena.next.get());
