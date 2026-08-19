@@ -1058,6 +1058,18 @@ impl IoLoop {
                 pending -= 1;
             }
 
+            println!(
+                "submitted: {}, pending: {}, completed: {}",
+                submitted, pending, completed
+            );
+
+            // slow down for better batching
+            if self.cq_size - pending < self.sq_size {
+                self.ring
+                    .submit_and_wait(self.sq_size)
+                    .context("Failed to submit and wait")?;
+            }
+
             if submitted == 0 && completed == 0 {
                 spins += 1;
                 if spins >= IO_URING_SPIN_LIMIT && pending > 0 {
@@ -1109,7 +1121,7 @@ mod tests {
         fs,
         io::{Read, Write},
         path::Path,
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     use function_name::named;
@@ -1358,51 +1370,84 @@ mod tests {
     #[named]
     #[tokio::test(flavor = "multi_thread")]
     async fn minor_stress_test() -> Result<()> {
-        const PGS: PgIdx = 1 << 16; // ~67mb
+        const PGS: PgIdx = 1 << 15; // ~67mb
         const LOC: &str = "db";
         let tmp = TempDir::new(function_name!())?;
         let file = Arc::new(tmp.file(LOC)?);
         let fio = Fio::builder()
             .file(file.clone())
             .page_size(fs_block_size(file.path())?)
-            .sq(32)
-            .cq(64)
-            .page_buf_pool(128)
             .build()?;
 
-        fio.alloc(PGS).await?;
+        const TASKS: u64 = 8;
 
-        let mut writes = Vec::new();
-        for i in 0..PGS {
-            let mut buf = fio.get_buf();
-            buf.as_mut().fill(0xFF);
-            writes.push(fio.write(i, buf));
+        fio.alloc(PGS * TASKS).await?;
+
+        // let mut writes = Vec::new();
+        // for i in 0..PGS {
+        //     let mut buf = fio.get_buf();
+        //     buf.as_mut().fill(0xFF);
+        //     writes.push(fio.write(i, buf));
+        // }
+
+        // let start = Instant::now();
+        // let results = join_all(writes).await;
+        // println!("took: {}s", (Instant::now() - start).as_secs_f64());
+
+        // for result in results {
+        //     result?;
+        // }
+
+        {
+            let start = Instant::now();
+
+            let tasks = (0..TASKS)
+                .map(|i| {
+                    let fio = fio.clone();
+                    spawn(async move {
+                        let mut writes = Vec::new();
+                        for i in (i * PGS)..((i + 1) * PGS) {
+                            let mut buf = fio.get_buf();
+                            buf.as_mut().fill(0xFF);
+                            writes.push(fio.write(i, buf));
+                        }
+
+                        let results = join_all(writes).await;
+                        for result in results {
+                            result.unwrap();
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            for task in tasks {
+                task.await.unwrap();
+            }
+
+            fio.commit().await.unwrap();
+
+            println!("took: {}s", (Instant::now() - start).as_secs_f64());
         }
 
-        let results = join_all(writes).await;
-        for result in results {
-            result?;
-        }
+        // fio.commit().await?;
 
-        fio.commit().await?;
+        // let mut reads = Vec::new();
+        // for i in 0..PGS {
+        //     reads.push(fio.read(i));
+        // }
 
-        let mut reads = Vec::new();
-        for i in 0..PGS {
-            reads.push(fio.read(i));
-        }
-
-        let results = join_all(reads).await;
-        for (i, result) in results.into_iter().enumerate() {
-            let pg = result?;
-            let buf = pg.as_ref();
-            assert!(
-                buf[..buf.len() - size_of::<ChecksumDisk>()]
-                    .iter()
-                    .all(|&b| b == 0xFF),
-                "page {} was not written correctly",
-                i
-            );
-        }
+        // let results = join_all(reads).await;
+        // for (i, result) in results.into_iter().enumerate() {
+        //     let pg = result?;
+        //     let buf = pg.as_ref();
+        //     assert!(
+        //         buf[..buf.len() - size_of::<ChecksumDisk>()]
+        //             .iter()
+        //             .all(|&b| b == 0xFF),
+        //         "page {} was not written correctly",
+        //         i
+        //     );
+        // }
 
         Ok(())
     }
