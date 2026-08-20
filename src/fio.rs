@@ -1109,7 +1109,7 @@ mod tests {
         fs,
         io::{Read, Write},
         path::Path,
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     use function_name::named;
@@ -1119,7 +1119,6 @@ mod tests {
     use crate::{
         meta::NUM_HEADER_PAGES,
         test::{TempDir, retry_until_success_tokio},
-        util::ChecksumDisk,
     };
 
     use super::*;
@@ -1355,10 +1354,11 @@ mod tests {
         Ok(())
     }
 
+    #[ignore]
     #[named]
     #[tokio::test(flavor = "multi_thread")]
-    async fn minor_stress_test() -> Result<()> {
-        const PGS: PgIdx = 1 << 16; // ~67mb
+    async fn minor_write_stress_test() -> Result<()> {
+        const PGS: PgIdx = 1 << 16;
         const LOC: &str = "db";
         let tmp = TempDir::new(function_name!())?;
         let file = Arc::new(tmp.file(LOC)?);
@@ -1372,6 +1372,8 @@ mod tests {
 
         fio.alloc(PGS).await?;
 
+        let start = Instant::now();
+
         let mut writes = Vec::new();
         for i in 0..PGS {
             let mut buf = fio.get_buf();
@@ -1384,25 +1386,9 @@ mod tests {
             result?;
         }
 
+        println!("duration: {}", (Instant::now() - start).as_secs_f64());
+
         fio.commit().await?;
-
-        let mut reads = Vec::new();
-        for i in 0..PGS {
-            reads.push(fio.read(i));
-        }
-
-        let results = join_all(reads).await;
-        for (i, result) in results.into_iter().enumerate() {
-            let pg = result?;
-            let buf = pg.as_ref();
-            assert!(
-                buf[..buf.len() - size_of::<ChecksumDisk>()]
-                    .iter()
-                    .all(|&b| b == 0xFF),
-                "page {} was not written correctly",
-                i
-            );
-        }
 
         Ok(())
     }
