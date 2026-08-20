@@ -4,6 +4,7 @@ use std::{
     collections::VecDeque,
     ffi::c_void,
     fs::{File, OpenOptions},
+    mem::MaybeUninit,
     os::{
         fd::{AsFd, AsRawFd},
         unix::fs::OpenOptionsExt,
@@ -22,7 +23,7 @@ use anyhow::{Context, Ok, Result, anyhow};
 use bon::bon;
 use crossbeam::queue::{ArrayQueue, SegQueue};
 use io_uring::IoUring;
-use libc::{O_DIRECT, iovec};
+use libc::{O_DIRECT, RLIM_INFINITY, RLIMIT_MEMLOCK, getrlimit, iovec, rlimit};
 use parking_lot::Mutex;
 use rustix::fs::fstatvfs;
 use thiserror::Error;
@@ -50,6 +51,7 @@ pub(crate) enum ReadError {
 
 enum FioOp {
     Read(ReadData),
+    ReadFinish(Waker),
     Write(WriteData),
     Commit(CommitData),
     CommitFlush(CommitData),
@@ -236,12 +238,31 @@ impl Drop for PoolBuf {
     }
 }
 
+const MAX_PINNED_PAGES: PgIdx = 1 << 14;
+pub(crate) fn max_pinned_pages(page_size: InPgIdx) -> Result<PgIdx> {
+    let mut rlim = MaybeUninit::<rlimit>::uninit();
+
+    let ret = unsafe { getrlimit(RLIMIT_MEMLOCK, rlim.as_mut_ptr()) };
+
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error()).context("Failed to get RLIMIT_MEMLOCK");
+    }
+
+    let rlim = unsafe { rlim.assume_init() };
+    let limit = rlim.rlim_cur;
+    Ok(if limit == RLIM_INFINITY {
+        MAX_PINNED_PAGES
+    } else {
+        limit / page_size / 2 // this is a hack, figure out why can't allocate full amount
+    })
+}
+
 #[bon]
 impl Fio {
     #[builder]
     pub(crate) fn builder(
         file: Arc<DbFile>,
-        page_size: u64,
+        page_size: InPgIdx,
         #[builder(default = DEFAULT_SQ_SIZE)] sq: usize,
         #[builder(default = DEFAULT_CQ_SIZE)] cq: usize,
         page_buf_pool: Option<usize>,
@@ -265,7 +286,8 @@ impl Fio {
         page_buf_pool: Option<usize>,
         generic_op_state_pool: Option<usize>,
     ) -> Result<Self> {
-        let page_buf_pool = page_buf_pool.unwrap_or_else(|| 2 * cq);
+        let max_pinned_pages = max_pinned_pages(page_size).unwrap_or(cq as u64);
+        let page_buf_pool = page_buf_pool.unwrap_or_else(|| max_pinned_pages as usize - cq);
         let generic_op_state_pool = generic_op_state_pool.unwrap_or_else(|| cq);
 
         let fio_file = {
@@ -717,6 +739,9 @@ impl IoLoop {
                 }
                 waker.wake();
             }
+            FioOp::ReadFinish(waker) => {
+                waker.wake();
+            }
             FioOp::Write(WriteData { waker, state, .. }) => {
                 state
                     .get()
@@ -781,12 +806,11 @@ impl IoLoop {
         let mut pending: usize = 0;
 
         let mut ids: VecDeque<usize> = (0..self.cq_size as usize).collect();
+        let mut completions = VecDeque::with_capacity(self.cq_size as usize);
 
         let mut spins = 0;
 
         loop {
-            let mut submitted = 0;
-
             if self.inner.queue.is_empty() && pending == 0 && self.fsync_back.is_empty() {
                 #[cfg(test)]
                 self.inner.park_signal.store(true, Ordering::Release);
@@ -805,6 +829,45 @@ impl IoLoop {
                     panic!("test induced failure");
                 }
             }
+
+            let cq: io_uring::CompletionQueue = self.ring.completion();
+            let mut completed: u32 = 0;
+            for cqe in cq {
+                completed += 1;
+                let id = cqe.user_data() as usize;
+                let completion = std::mem::take(&mut self.ops[id]);
+                if let Some(completion) = completion {
+                    let completion = match completion {
+                        FioOp::Read(ReadData {
+                            waker,
+                            mut buf,
+                            state,
+                            ..
+                        }) => {
+                            let mut inner = state.lock();
+                            if cqe.result() >= 0 {
+                                if let PageBuf::Dynamic(buf) = &mut buf {
+                                    buf.copy_from_slice(
+                                        &self.bufs[id * self.pg_size as usize
+                                            ..(id + 1) * self.pg_size as usize],
+                                    );
+                                }
+                                *inner = ReadState::Ready(buf);
+                            } else {
+                                eprintln!("Read failed with error: {}", cqe.result());
+                                *inner = ReadState::Err;
+                            }
+                            FioOp::ReadFinish(waker)
+                        }
+                        completion => completion,
+                    };
+                    completions.push_back((cqe.result(), completion));
+                }
+                ids.push_back(id);
+                pending -= 1;
+            }
+
+            let mut submitted = 0;
 
             if self.fsync_front.is_empty() && !self.fsync_back.is_empty() {
                 submitted += 1;
@@ -850,6 +913,9 @@ impl IoLoop {
                                 .context("Failed to push read entry onto submission queue")?;
                         }
                         self.ops[id] = Some(FioOp::Read(data));
+                    }
+                    FioOp::ReadFinish(_) => {
+                        eprintln!("read finish should never be submitted to queue");
                     }
                     FioOp::Write(data) => {
                         submitted += 1;
@@ -960,71 +1026,50 @@ impl IoLoop {
                 pending += submitted;
             }
 
-            let cq: io_uring::CompletionQueue = self.ring.completion();
-            let mut completed: u32 = 0;
-            for cqe in cq {
-                completed += 1;
-
-                let id = cqe.user_data() as usize;
-                match std::mem::take(&mut self.ops[id]) {
-                    Some(FioOp::Read(ReadData {
-                        pgidx: _,
-                        waker,
-                        mut buf,
-                        state: result,
-                    })) => {
-                        {
-                            let mut inner = result.lock();
-                            if cqe.result() >= 0 {
-                                if let PageBuf::Dynamic(buf) = &mut buf {
-                                    buf.copy_from_slice(
-                                        &self.bufs[id * self.pg_size as usize
-                                            ..(id + 1) * self.pg_size as usize],
-                                    );
-                                }
-                                *inner = ReadState::Ready(buf);
-                            } else {
-                                eprintln!("Read failed with error: {}", cqe.result());
-                                *inner = ReadState::Err;
-                            }
-                        }
+            while !completions.is_empty() {
+                let (cqe_res, completion) = completions.pop_front().unwrap();
+                match completion {
+                    FioOp::Read(_) => {
+                        // no-op
+                    }
+                    FioOp::ReadFinish(waker) => {
                         waker.wake();
                     }
-                    Some(FioOp::Write(WriteData { waker, state, .. })) => {
-                        if cqe.result() >= 0 {
+                    FioOp::Write(WriteData { waker, state, .. }) => {
+                        if cqe_res >= 0 {
                             state
                                 .get()
                                 .store(GenericOpState::Ready as u32, Ordering::Release);
                         } else {
-                            eprintln!("Write failed with error: {}", cqe.result());
+                            eprintln!("Write failed with error: {}", cqe_res);
                             state
                                 .get()
                                 .store(GenericOpState::Err as u32, Ordering::Release);
                         }
                         waker.wake();
                     }
-                    Some(FioOp::Commit(CommitData { state, waker }))
-                    | Some(FioOp::CommitFlush(CommitData { state, waker })) => {
-                        if cqe.result() >= 0 {
+                    FioOp::Commit(CommitData { state, waker })
+                    | FioOp::CommitFlush(CommitData { state, waker }) => {
+                        if cqe_res >= 0 {
                             state
                                 .get()
                                 .store(GenericOpState::Ready as u32, Ordering::Release);
                         } else {
-                            eprintln!("Commit failed with error: {}", cqe.result());
+                            eprintln!("Commit failed with error: {}", cqe_res);
                             state
                                 .get()
                                 .store(GenericOpState::Err as u32, Ordering::Release);
                         }
                         waker.wake();
                     }
-                    Some(FioOp::CommitBatch) => {
+                    FioOp::CommitBatch => {
                         for CommitData { state, waker } in self.fsync_front.drain(..) {
-                            if cqe.result() >= 0 {
+                            if cqe_res >= 0 {
                                 state
                                     .get()
                                     .store(GenericOpState::Ready as u32, Ordering::Release);
                             } else {
-                                eprintln!("Commit failed with error: {}", cqe.result());
+                                eprintln!("Commit failed with error: {}", cqe_res);
                                 state
                                     .get()
                                     .store(GenericOpState::Err as u32, Ordering::Release);
@@ -1032,30 +1077,20 @@ impl IoLoop {
                             waker.wake();
                         }
                     }
-                    Some(FioOp::Alloc(AllocData { len, waker, state })) => {
-                        if cqe.result() >= 0 {
+                    FioOp::Alloc(AllocData { len, waker, state }) => {
+                        if cqe_res >= 0 {
                             state
                                 .get()
                                 .store(GenericOpState::Ready as u32, Ordering::Release);
                         } else {
-                            eprintln!(
-                                "File alloc for len {} failed with error: {}",
-                                len,
-                                cqe.result()
-                            );
+                            eprintln!("File alloc for len {} failed with error: {}", len, cqe_res);
                             state
                                 .get()
                                 .store(GenericOpState::Err as u32, Ordering::Release);
                         }
                         waker.wake();
                     }
-                    _ => {
-                        eprintln!("completion user data did not match a valid operation");
-                    }
                 }
-
-                ids.push_back(id);
-                pending -= 1;
             }
 
             if submitted == 0 && completed == 0 {
@@ -1365,9 +1400,6 @@ mod tests {
         let fio = Fio::builder()
             .file(file.clone())
             .page_size(fs_block_size(file.path())?)
-            .sq(32)
-            .cq(64)
-            .page_buf_pool(128)
             .build()?;
 
         fio.alloc(PGS).await?;
