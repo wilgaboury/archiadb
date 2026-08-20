@@ -1087,10 +1087,15 @@ impl IoLoop {
             }
 
             if !self.ring.submission().is_empty() {
-                self.ring
-                    .submit_and_wait(cmp::min(4, pending))
-                    .context("Failed to submit submission queue")?;
                 pending += submitted;
+
+                let wait_for = std::cmp::min(64, pending);
+
+                self.ring
+                    // .submit()
+                    // .submit_and_wait(cmp::min(4, pending))
+                    .submit_and_wait(wait_for)
+                    .context("Failed to submit submission queue")?;
                 println!("pending: {}, submitted: {}", pending, submitted)
             }
 
@@ -1470,7 +1475,7 @@ mod tests {
         let file = Arc::new(tmp.file(LOC)?);
         let fio = Fio::builder()
             .file(file.clone())
-            .sq(124)
+            .sq(256)
             .cq(256)
             .page_size(fs_block_size(file.path())?)
             .build()?;
@@ -1478,44 +1483,69 @@ mod tests {
         fio.alloc(PGS).await?;
 
         {
-            let mut writes = Vec::with_capacity(PGS as usize);
-            let mut bufs = VecDeque::with_capacity(4);
-            for i in 0..(PGS / 4) {
-                for j in 0..4 {
-                    let j = (i * (PGS / 4)) + j;
-                    let mut buf = fio.get_pool_buf().await;
-                    buf.as_mut().fill(0xFF);
-                    bufs.push_back((j, buf));
-                }
+            // let mut writes = Vec::with_capacity(PGS as usize);
+            // let mut bufs = VecDeque::with_capacity(4);
+            // for i in 0..(PGS / 4) {
+            //     for j in 0..4 {
+            //         let j = (i * (PGS / 4)) + j;
+            //         let mut buf = fio.get_pool_buf().await;
+            //         buf.as_mut().fill(0xFF);
+            //         bufs.push_back((j, buf));
+            //     }
 
-                while !bufs.is_empty() {
-                    let (j, buf) = bufs.pop_front().unwrap();
-                    writes.push(fio.write(j, buf));
-                }
+            //     while !bufs.is_empty() {
+            //         let (j, buf) = bufs.pop_front().unwrap();
+            //         writes.push(fio.write(j, buf));
+            //     }
+            // }
+
+            // let results = join_all(writes).await;
+            // for result in results {
+            //     result?;
+            // }
+
+            let mut writes = Vec::with_capacity(PGS as usize);
+            for i in 0..PGS {
+                let mut buf = fio.get_buf();
+                buf.as_mut().fill(0xFF);
+                writes.push(fio.write_unchecked(i, buf));
             }
 
             let results = join_all(writes).await;
             for result in results {
                 result?;
             }
+
             fio.commit().await?;
         }
 
         let start = Instant::now();
-        let mut writes = Vec::with_capacity(PGS as usize);
-        let mut bufs = VecDeque::with_capacity(4);
-        for i in 0..(PGS / 4) {
-            for j in 0..4 {
-                let j = (i * (PGS / 4)) + j;
-                let mut buf = fio.get_pool_buf().await;
-                buf.as_mut().fill(0xAA);
-                bufs.push_back((j, buf));
-            }
+        // let mut writes = Vec::with_capacity(PGS as usize);
+        // let mut bufs = VecDeque::with_capacity(4);
+        // for i in 0..(PGS / 8) {
+        //     for j in 0..8 {
+        //         let j = (i * (PGS / 8)) + j;
+        //         let mut buf = fio.get_pool_buf().await;
+        //         buf.as_mut().fill(0xAA);
+        //         bufs.push_back((j, buf));
+        //     }
 
-            while !bufs.is_empty() {
-                let (j, buf) = bufs.pop_front().unwrap();
-                writes.push(fio.write(j, buf));
-            }
+        //     while !bufs.is_empty() {
+        //         let (j, buf) = bufs.pop_front().unwrap();
+        //         writes.push(fio.write(j, buf));
+        //     }
+        // }
+
+        // let results = join_all(writes).await;
+        // for result in results {
+        //     result?;
+        // }
+
+        let mut writes = Vec::with_capacity(PGS as usize);
+        for i in 0..PGS {
+            let mut buf = fio.get_buf();
+            buf.as_mut().fill(0xAA);
+            writes.push(fio.write_unchecked(i, buf));
         }
 
         let results = join_all(writes).await;
