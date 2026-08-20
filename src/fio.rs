@@ -1,3 +1,5 @@
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::{
     alloc::{Layout, alloc},
     cmp,
@@ -41,6 +43,13 @@ pub const MAX_PAGE_SIZE: u64 = 65536;
 pub const DEFAULT_SQ_SIZE: usize = 128;
 pub const DEFAULT_CQ_SIZE: usize = 256;
 const IO_URING_SPIN_LIMIT: u64 = 32;
+
+#[cfg(test)]
+static DYN_BUFS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static STAT_BUFS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static PAUSES: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Error, Debug)]
 pub(crate) enum ReadError {
@@ -635,12 +644,20 @@ fn get_buf(inner: &Arc<Inner>) -> PageBuf {
         .free_bufs
         .pop()
         .map(|idx| {
+            #[cfg(test)]
+            STAT_BUFS.fetch_add(1, Ordering::AcqRel);
+
             PageBuf::Pool(PoolBuf {
                 idx,
                 fio: inner.clone(),
             })
         })
-        .unwrap_or_else(|| get_dyn_buf(&inner))
+        .unwrap_or_else(|| {
+            #[cfg(test)]
+            DYN_BUFS.fetch_add(1, Ordering::AcqRel);
+
+            get_dyn_buf(&inner)
+        })
 }
 
 fn get_dyn_buf(inner: &Inner) -> PageBuf {
@@ -828,6 +845,9 @@ impl IoLoop {
             if self.inner.queue.is_empty() && pending == 0 && self.fsync_back.is_empty() {
                 #[cfg(test)]
                 self.inner.park_signal.store(true, Ordering::Release);
+
+                #[cfg(test)]
+                PAUSES.fetch_add(1, Ordering::AcqRel);
 
                 thread::park();
 
@@ -1038,6 +1058,7 @@ impl IoLoop {
                     .submit()
                     .context("Failed to submit submission queue")?;
                 pending += submitted;
+                println!("pending: {}, submitted: {}", pending, submitted)
             }
 
             while !completions.is_empty() {
@@ -1406,11 +1427,11 @@ mod tests {
         Ok(())
     }
 
-    #[ignore]
+    // #[ignore]
     #[named]
     #[tokio::test(flavor = "multi_thread")]
     async fn minor_write_stress_test() -> Result<()> {
-        const PGS: PgIdx = 1 << 18;
+        const PGS: PgIdx = 1 << 16;
         const LOC: &str = "db";
         let tmp = TempDir::new(function_name!())?;
         let file = Arc::new(tmp.file(LOC)?);
@@ -1436,6 +1457,13 @@ mod tests {
         }
 
         println!("duration: {}", (Instant::now() - start).as_secs_f64());
+        println!(
+            "dyn: {}, stat: {}, ratio: {}",
+            DYN_BUFS.load(Ordering::Acquire),
+            STAT_BUFS.load(Ordering::Acquire),
+            DYN_BUFS.load(Ordering::Acquire) as f64 / STAT_BUFS.load(Ordering::Acquire) as f64,
+        );
+        println!("pauses: {}", PAUSES.load(Ordering::Acquire));
 
         fio.commit().await?;
 
