@@ -22,6 +22,7 @@ use std::{
 use anyhow::{Context, Ok, Result, anyhow};
 use bon::bon;
 use crossbeam::queue::{ArrayQueue, SegQueue};
+
 use io_uring::IoUring;
 use libc::{O_DIRECT, RLIM_INFINITY, RLIMIT_MEMLOCK, getrlimit, iovec, rlimit};
 use parking_lot::Mutex;
@@ -99,8 +100,12 @@ enum ReadState {
 struct WriteData {
     pg_idx: PgIdx,
     buf: PageBuf,
-    waker: Waker,
-    state: GenericOpStateRef,
+    state: Arc<Mutex<WriteState>>,
+}
+
+struct WriteState {
+    waker: Option<Waker>,
+    state: GenericOpState,
 }
 
 struct CommitData {
@@ -447,45 +452,53 @@ impl Fio {
         struct WriteFuture<'a> {
             fio: &'a Fio,
             pg_idx: u64,
-            buf: Option<PageBuf>,
-            state: GenericOpStateRef,
+            state: Arc<Mutex<WriteState>>,
         }
 
         impl<'a> Future for WriteFuture<'a> {
             type Output = Result<()>;
 
-            fn poll(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
-                let state = self.state.get().load(Ordering::Acquire).try_into().unwrap();
-                match state {
+            fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
+                let mut state = self.state.lock();
+                let cur = std::mem::replace(&mut state.state, GenericOpState::Err);
+                match cur {
                     GenericOpState::Init => {
-                        self.state
-                            .get()
-                            .store(GenericOpState::Pending as u32, Ordering::Release);
-
-                        let op = FioOp::Write(WriteData {
-                            pg_idx: self.pg_idx,
-                            buf: std::mem::replace(&mut self.buf, None).unwrap(),
-                            waker: cx.waker().clone(),
-                            state: self.state.clone(),
-                        });
-                        self.fio.inner.queue.push(op);
-                        self.fio.join().thread().unpark();
+                        state.waker = Some(cx.waker().clone());
+                        state.state = GenericOpState::Pending;
                         Poll::Pending
                     }
-                    GenericOpState::Pending => Poll::Pending,
-                    GenericOpState::Ready => Poll::Ready(Ok(())),
+                    GenericOpState::Pending => {
+                        state.state = cur;
+                        Poll::Pending
+                    }
+                    GenericOpState::Ready => {
+                        state.state = cur;
+                        Poll::Ready(Ok(()))
+                    }
                     GenericOpState::Err => {
+                        state.state = cur;
                         Poll::Ready(Err(anyhow!("Failed to perform disk write")))
                     }
                 }
             }
         }
 
+        let state = Arc::new(Mutex::new(WriteState {
+            waker: None,
+            state: GenericOpState::Init,
+        }));
+        let op = FioOp::Write(WriteData {
+            pg_idx,
+            buf,
+            state: state.clone(),
+        });
+        self.inner.queue.push(op);
+        self.join().thread().unpark();
+
         WriteFuture {
             fio: self,
             pg_idx,
-            buf: Some(buf),
-            state: get_generic_op_state(&self.inner),
+            state,
         }
         .await
     }
@@ -742,11 +755,12 @@ impl IoLoop {
             FioOp::ReadFinish(waker) => {
                 waker.wake();
             }
-            FioOp::Write(WriteData { waker, state, .. }) => {
-                state
-                    .get()
-                    .store(GenericOpState::Err as u32, Ordering::Release);
-                waker.wake();
+            FioOp::Write(WriteData { state, .. }) => {
+                let mut state = state.lock();
+                state.state = GenericOpState::Err;
+                if let Some(waker) = std::mem::replace(&mut state.waker, None) {
+                    waker.wake();
+                }
             }
             FioOp::Commit(CommitData { waker, state, .. })
             | FioOp::CommitFlush(CommitData { waker, state, .. }) => {
@@ -1035,18 +1049,21 @@ impl IoLoop {
                     FioOp::ReadFinish(waker) => {
                         waker.wake();
                     }
-                    FioOp::Write(WriteData { waker, state, .. }) => {
+                    FioOp::Write(WriteData { state, .. }) => {
                         if cqe_res >= 0 {
-                            state
-                                .get()
-                                .store(GenericOpState::Ready as u32, Ordering::Release);
+                            let mut state = state.lock();
+                            state.state = GenericOpState::Ready;
+                            if let Some(waker) = std::mem::replace(&mut state.waker, None) {
+                                waker.wake();
+                            }
                         } else {
                             eprintln!("Write failed with error: {}", cqe_res);
-                            state
-                                .get()
-                                .store(GenericOpState::Err as u32, Ordering::Release);
+                            let mut state = state.lock();
+                            state.state = GenericOpState::Err;
+                            if let Some(waker) = std::mem::replace(&mut state.waker, None) {
+                                waker.wake();
+                            }
                         }
-                        waker.wake();
                     }
                     FioOp::Commit(CommitData { state, waker })
                     | FioOp::CommitFlush(CommitData { state, waker }) => {
@@ -1393,7 +1410,7 @@ mod tests {
     #[named]
     #[tokio::test(flavor = "multi_thread")]
     async fn minor_write_stress_test() -> Result<()> {
-        const PGS: PgIdx = 1 << 16;
+        const PGS: PgIdx = 1 << 18;
         const LOC: &str = "db";
         let tmp = TempDir::new(function_name!())?;
         let file = Arc::new(tmp.file(LOC)?);
