@@ -61,7 +61,7 @@ impl TempDir {
                 .unwrap()
                 .as_nanos()
         ));
-        std::fs::create_dir(&path)?;
+        std::fs::create_dir_all(&path)?;
         Ok(Self { path })
     }
 
