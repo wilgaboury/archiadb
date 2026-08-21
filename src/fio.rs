@@ -45,7 +45,6 @@ pub const MAX_PAGE_SIZE: u64 = 65536;
 
 pub const DEFAULT_SQ_SIZE: usize = 128;
 pub const DEFAULT_CQ_SIZE: usize = 256;
-const IO_URING_SPIN_LIMIT: u64 = 32;
 
 #[cfg(test)]
 static DYN_BUFS: AtomicUsize = AtomicUsize::new(0);
@@ -249,7 +248,6 @@ impl PoolBuf {
 
 impl Drop for PoolBuf {
     fn drop(&mut self) {
-        // println!("returning pool idx: {}", self.idx);
         if let Err(_) = self.fio.free_bufs.0.try_send(self.idx) {
             eprintln!("Failed to return buffer idx {} to free pool", self.idx);
         }
@@ -403,7 +401,6 @@ impl Fio {
 
     pub async fn get_pool_buf(&self) -> PageBuf {
         let idx = self.inner.free_bufs.1.recv_async().await.unwrap();
-        // println!("got pool idx: {}", idx);
         PageBuf::Pool(PoolBuf {
             idx,
             fio: self.inner.clone(),
@@ -810,7 +807,6 @@ impl IoLoop {
                 if let Some(waker) = std::mem::replace(&mut state.waker, None) {
                     waker.wake();
                 }
-                println!("buf should get dropped");
             }
             FioOp::Commit(CommitData { waker, state, .. })
             | FioOp::CommitFlush(CommitData { waker, state, .. }) => {
@@ -872,8 +868,6 @@ impl IoLoop {
         let mut ids: VecDeque<usize> = (0..self.cq_size as usize).collect();
         let mut completions = VecDeque::with_capacity(self.cq_size as usize);
 
-        let mut spins = 0;
-
         loop {
             if self.inner.queue.is_empty() && pending == 0 && self.fsync_back.is_empty() {
                 #[cfg(test)]
@@ -898,9 +892,7 @@ impl IoLoop {
             }
 
             let cq: io_uring::CompletionQueue = self.ring.completion();
-            let mut completed: u32 = 0;
             for cqe in cq {
-                completed += 1;
                 let id = cqe.user_data() as usize;
                 let completion = std::mem::take(&mut self.ops[id]);
                 if let Some(completion) = completion {
@@ -1088,15 +1080,13 @@ impl IoLoop {
 
             if !self.ring.submission().is_empty() {
                 pending += submitted;
-
-                let wait_for = std::cmp::min(64, pending);
-
                 self.ring
-                    // .submit()
-                    // .submit_and_wait(cmp::min(4, pending))
-                    .submit_and_wait(wait_for)
+                    .submit()
                     .context("Failed to submit submission queue")?;
-                println!("pending: {}, submitted: {}", pending, submitted)
+            } else if pending > 0 {
+                self.ring
+                    .submit_and_wait(1)
+                    .context("Failed to submit submission queue")?;
             }
 
             while !completions.is_empty() {
@@ -1168,18 +1158,6 @@ impl IoLoop {
                     }
                 }
             }
-
-            // if submitted == 0 && completed == 0 {
-            //     spins += 1;
-            //     if spins >= IO_URING_SPIN_LIMIT && pending > 0 {
-            //         self.ring
-            //             .submit_and_wait(1)
-            //             .context("Failed to submit and wait on io_uring")?;
-            //         spins = 0;
-            //     }
-            // } else {
-            //     spins = 0;
-            // }
         }
     }
 }
@@ -1225,6 +1203,7 @@ mod tests {
 
     use function_name::named;
     use futures::future::join_all;
+    use rand::{Rng, random, thread_rng};
     use tokio::{spawn, time::sleep};
 
     use crate::{
@@ -1468,42 +1447,20 @@ mod tests {
     #[ignore]
     #[named]
     #[tokio::test(flavor = "multi_thread")]
-    async fn minor_write_stress_test() -> Result<()> {
+    async fn random_write_stress_test() -> Result<()> {
         const PGS: PgIdx = 1 << 16;
         const LOC: &str = "db";
         let tmp = TempDir::new(function_name!())?;
         let file = Arc::new(tmp.file(LOC)?);
+        let mut rng = thread_rng();
         let fio = Fio::builder()
             .file(file.clone())
-            .sq(256)
-            .cq(256)
             .page_size(fs_block_size(file.path())?)
             .build()?;
 
         fio.alloc(PGS).await?;
 
         {
-            // let mut writes = Vec::with_capacity(PGS as usize);
-            // let mut bufs = VecDeque::with_capacity(4);
-            // for i in 0..(PGS / 4) {
-            //     for j in 0..4 {
-            //         let j = (i * (PGS / 4)) + j;
-            //         let mut buf = fio.get_pool_buf().await;
-            //         buf.as_mut().fill(0xFF);
-            //         bufs.push_back((j, buf));
-            //     }
-
-            //     while !bufs.is_empty() {
-            //         let (j, buf) = bufs.pop_front().unwrap();
-            //         writes.push(fio.write(j, buf));
-            //     }
-            // }
-
-            // let results = join_all(writes).await;
-            // for result in results {
-            //     result?;
-            // }
-
             let mut writes = Vec::with_capacity(PGS as usize);
             for i in 0..PGS {
                 let mut buf = fio.get_buf();
@@ -1520,32 +1477,12 @@ mod tests {
         }
 
         let start = Instant::now();
-        // let mut writes = Vec::with_capacity(PGS as usize);
-        // let mut bufs = VecDeque::with_capacity(4);
-        // for i in 0..(PGS / 8) {
-        //     for j in 0..8 {
-        //         let j = (i * (PGS / 8)) + j;
-        //         let mut buf = fio.get_pool_buf().await;
-        //         buf.as_mut().fill(0xAA);
-        //         bufs.push_back((j, buf));
-        //     }
-
-        //     while !bufs.is_empty() {
-        //         let (j, buf) = bufs.pop_front().unwrap();
-        //         writes.push(fio.write(j, buf));
-        //     }
-        // }
-
-        // let results = join_all(writes).await;
-        // for result in results {
-        //     result?;
-        // }
-
         let mut writes = Vec::with_capacity(PGS as usize);
-        for i in 0..PGS {
+        for _ in 0..PGS {
             let mut buf = fio.get_buf();
             buf.as_mut().fill(0xAA);
-            writes.push(fio.write_unchecked(i, buf));
+            buf.as_mut()[0] = random();
+            writes.push(fio.write_unchecked(rng.gen_range(0..PGS), buf));
         }
 
         let results = join_all(writes).await;
@@ -1555,7 +1492,13 @@ mod tests {
         let dur = (Instant::now() - start).as_secs_f64();
 
         println!("mem pg size: {}", get_sys_mem_page_size());
-        println!("duration: {}, IOPS: {}", dur, PGS as f64 / dur);
+        println!(
+            "duration: {}, pages: {}, IOPS: {}, throughput: {}MiBps",
+            dur,
+            PGS,
+            PGS as f64 / dur,
+            ((PGS as f64 * fio.page_size() as f64) / 1000000f64) / dur
+        );
         println!(
             "dyn: {}, stat: {}, ratio: {}",
             DYN_BUFS.load(Ordering::Acquire),
