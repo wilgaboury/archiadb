@@ -30,12 +30,16 @@ impl Defer {
             global: DashSet::new(),
         }
     }
+
+    pub fn contains(&self, pg_idx: PgIdx) -> bool {
+        self.global.contains(&pg_idx)
+    }
 }
 
-pub(crate) struct DeferGaurd<'a> {
+pub(crate) struct DeferGaurd<'txn> {
     id: DeferId,
     freed: Vec<PgIdx>,
-    defer: &'a Defer,
+    defer: &'txn Defer,
 }
 
 impl Defer {

@@ -4,17 +4,44 @@ use anyhow::Result;
 
 use crate::{
     btree::BTreeRootHeader,
-    db::Txn,
+    db::{DirtyEntry, Txn},
     fio::PageBuf,
     key::KeyPathBuf,
-    uint::{PgIdx, PgIdxDisk},
-    util::{FrontBack, ceil_div, from_bytes},
+    uint::{InPgIdx, InPgIdxDisk, PgIdx, PgIdxDisk},
+    util::{ceil_div, from_bytes},
 };
+
+const INIT_ARENA_SIZE: PgIdx = 8;
+
+#[repr(C, packed)]
+pub(crate) struct FreeListHeader {
+    pub(crate) next: PgIdxDisk,
+    pub(crate) len: InPgIdxDisk,
+}
+
+pub(crate) fn read_fl(buf: &[u8], idx: InPgIdx) -> PgIdx {
+    from_bytes::<PgIdxDisk>(
+        &buf[size_of::<FreeListHeader>() + (idx as usize * size_of::<PgIdxDisk>())..],
+    )
+    .get()
+}
 
 pub(crate) struct Arena {
     pub(crate) start: PgIdx,
     pub(crate) len: PgIdx,
     pub(crate) next: PgIdx,
+}
+
+impl Arena {
+    pub(crate) fn pop_w_resv(&mut self, reserve: PgIdx) -> Option<PgIdx> {
+        if self.len - self.next < reserve + 1 {
+            let ret = self.start + self.next;
+            self.next += 1;
+            Some(ret)
+        } else {
+            None
+        }
+    }
 }
 
 pub(crate) struct LallocMap {
@@ -26,7 +53,7 @@ pub(crate) struct Lalloc {
     from_arena: PgIdx, // # of allocns via this arena, needs to be flushed to disk before galloc
 
     clean: Option<PgIdx>, // pointer to unmodified tail of free list
-    free: Option<PgIdx>,  // usable pointers
+    free: Vec<PgIdx>,     // usable pointers
     deferred: Vec<PgIdx>, // pgs that fail the deffered set check
 }
 
@@ -43,13 +70,48 @@ impl Lalloc {
     }
 }
 
-impl<'a> Txn<'a> {
-    pub(crate) async fn lalloc(&self, fb: &mut FrontBack, pg: PageBuf) -> Result<PgIdx> {
+impl<'txn> Txn<'txn> {
+    pub(crate) async fn lalloc(&self, dirty: &mut DirtyEntry, pg: PageBuf) -> Result<PgIdx> {
         let root = from_bytes::<BTreeRootHeader>(pg.as_ref());
         if root.free.get() == 0 && root.arena.start.get() == 0 {
-            self.db.galloc(fb, 8).await?;
+            self.db.galloc(&mut dirty.fb, INIT_ARENA_SIZE).await?;
         }
 
-        todo!("implement lalloc");
+        let mut clean = if let Some(clean) = dirty.lalloc.clean.as_ref() {
+            *clean
+        } else {
+            root.free.get()
+        };
+
+        while clean != 0 {
+            if !dirty.lalloc.free.is_empty() {
+                return Ok(dirty.lalloc.free.pop().unwrap());
+            }
+
+            let fl_pg = self.db.fio.read(clean).await?;
+            let header = from_bytes::<FreeListHeader>(fl_pg.as_ref());
+            for i in 0..header.len.get() {
+                let free_pg_idx = read_fl(fl_pg.as_ref(), i);
+                if self.db.defer.contains(free_pg_idx) {
+                    dirty.lalloc.deferred.push(free_pg_idx);
+                } else {
+                    dirty.lalloc.free.push(free_pg_idx);
+                }
+            }
+            clean = header.next.get();
+            dirty.lalloc.clean = Some(clean);
+        }
+
+        let arena_reserve = dirty
+            .lalloc
+            .pages_to_encode_arena(self.db.meta.page_size(), root.free_len.get());
+
+        Ok(
+            if let Some(free_pg) = dirty.lalloc.arena.pop_w_resv(arena_reserve) {
+                free_pg
+            } else {
+                todo!("encode arena, galloc, and return")
+            },
+        )
     }
 }

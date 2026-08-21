@@ -13,6 +13,7 @@ use crate::{
     galloc::{Galloc, galloc_recover},
     karc::Karc,
     key::{KeyPath, KeyPathBuf},
+    lalloc::Lalloc,
     lock::{Lock, LockGuard, LockType},
     meta::MetaHandler,
     trie::KeyTrie,
@@ -125,12 +126,12 @@ pub(crate) async fn init_db_root(meta: &MetaHandler, fio: &Fio) -> Result<()> {
     Ok(())
 }
 
-pub struct TxnBuilder<'a> {
-    db: &'a DbInner,
+pub struct TxnBuilder<'txn> {
+    db: &'txn DbInner,
     ops: KeyTrie<LockType>,
 }
 
-impl<'a> TxnBuilder<'a> {
+impl<'txn> TxnBuilder<'txn> {
     pub fn read(mut self, path: &KeyPath) -> Result<Self> {
         self.ops.insert_lock(path, LockType::Read)?;
         Ok(self)
@@ -146,7 +147,7 @@ impl<'a> TxnBuilder<'a> {
         Ok(self)
     }
 
-    pub async fn begin(self) -> Txn<'a> {
+    pub async fn begin(self) -> Txn<'txn> {
         let defer_gaurd = self.db.defer.begin();
         let mut guards = Vec::new();
         for (path, lock_type) in self.ops.bfs_iter() {
@@ -167,18 +168,23 @@ impl<'a> TxnBuilder<'a> {
     }
 }
 
-pub struct Txn<'a> {
-    pub(crate) db: &'a DbInner,
-    pub(crate) defer_gaurd: DeferGaurd<'a>,
+pub(crate) struct DirtyEntry {
+    pub(crate) fb: FrontBack,
+    pub(crate) lalloc: Lalloc,
+}
+
+pub struct Txn<'txn> {
+    pub(crate) db: &'txn DbInner,
+    pub(crate) defer_gaurd: DeferGaurd<'txn>,
     pub(crate) guards: Vec<LockGuard>,
     pub(crate) free: Vec<u64>,
     pub(crate) ops: KeyTrie<LockType>,
     pub(crate) flux: Flux,
     pub(crate) writes: KeyTrie<Option<u64>>,
-    pub(crate) writes2: HashMap<KeyPathBuf, FrontBack>,
+    pub(crate) writes2: HashMap<KeyPathBuf, DirtyEntry>,
 }
 
-impl<'a> Txn<'a> {
+impl<'txn> Txn<'txn> {
     pub async fn read(&self, _path: &KeyPath) -> Result<&[u8]> {
         self.ops
             .validate_read(_path)
@@ -226,7 +232,7 @@ impl<'a> Txn<'a> {
     }
 }
 
-impl<'a> Drop for Txn<'a> {
+impl<'txn> Drop for Txn<'txn> {
     fn drop(&mut self) {
         // no-op
         // TODO: idk, does anything rly need to be done here
@@ -278,28 +284,4 @@ mod tests {
 
         Ok(())
     }
-
-    // #[named]
-    // #[tokio::test]
-    // async fn db_open_meta_flag() -> Result<()> {
-    //     let tmp = TempDir::new(function_name!()).unwrap();
-    //     let db = tmp.db("db").await?;
-    //     {
-    //         let _t1 = db.txn().read(key_path![b"key1"])?.begin().await;
-    //     }
-    //     db.try_close()?;
-
-    //     {
-    //         let meta = tmp.meta("db")?;
-    //         assert_eq!(false, meta.open_async().await);
-    //     }
-
-    //     let _db = tmp.db("db").await?;
-    //     {
-    //         let meta = tmp.meta("db")?;
-    //         assert_eq!(true, meta.open_async().await);
-    //     }
-
-    //     Ok(())
-    // }
 }
