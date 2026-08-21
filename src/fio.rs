@@ -25,7 +25,6 @@ use anyhow::{Context, Ok, Result, anyhow};
 use bon::bon;
 use crossbeam::queue::{ArrayQueue, SegQueue};
 
-use flume::{Receiver, Sender};
 use io_uring::IoUring;
 use libc::{
     _SC_PAGESIZE, O_DIRECT, RLIM_INFINITY, RLIMIT_MEMLOCK, getrlimit, iovec, rlimit, sysconf,
@@ -152,7 +151,7 @@ struct Inner {
     queue: SegQueue<FioOp>,
 
     bufs: Pin<Box<[u8]>>,
-    free_bufs: (Sender<usize>, Receiver<usize>),
+    free_bufs: ArrayQueue<usize>,
 
     // TODO: fully implement
     // read_states: Box<Mutex<ReadState>>,
@@ -248,7 +247,7 @@ impl PoolBuf {
 
 impl Drop for PoolBuf {
     fn drop(&mut self) {
-        if let Err(_) = self.fio.free_bufs.0.try_send(self.idx) {
+        if let Err(_) = self.fio.free_bufs.push(self.idx) {
             eprintln!("Failed to return buffer idx {} to free pool", self.idx);
         }
     }
@@ -328,18 +327,10 @@ impl Fio {
         let stop = AtomicBool::new(false);
         let queue = SegQueue::new();
         let bufs = alloc_aligned_buffer(page_buf_pool, page_size as usize)?;
-        // let free_bufs = ArrayQueue::new(cmp::max(1, page_buf_pool as usize));
-        // for idx in 0usize..(page_buf_pool as usize) {
-        //     free_bufs
-        //         .push(idx)
-        //         .map_err(|idx| anyhow!("Failed to initialize idx {} in free buffer pool", idx))?;
-        // }
-
-        let free_bufs = flume::bounded(cmp::max(1, page_buf_pool as usize));
+        let free_bufs = ArrayQueue::new(cmp::max(1, page_buf_pool as usize));
         for idx in 0usize..(page_buf_pool as usize) {
             free_bufs
-                .0
-                .try_send(idx)
+                .push(idx)
                 .map_err(|idx| anyhow!("Failed to initialize idx {} in free buffer pool", idx))?;
         }
 
@@ -400,7 +391,7 @@ impl Fio {
     }
 
     pub async fn get_pool_buf(&self) -> PageBuf {
-        let idx = self.inner.free_bufs.1.recv_async().await.unwrap();
+        let idx = self.inner.free_bufs.pop().unwrap();
         PageBuf::Pool(PoolBuf {
             idx,
             fio: self.inner.clone(),
@@ -670,8 +661,7 @@ impl Fio {
 fn get_buf(inner: &Arc<Inner>) -> PageBuf {
     inner
         .free_bufs
-        .1
-        .try_recv()
+        .pop()
         .map(|idx| {
             #[cfg(test)]
             POOL_BUFS.fetch_add(1, Ordering::AcqRel);
@@ -681,7 +671,7 @@ fn get_buf(inner: &Arc<Inner>) -> PageBuf {
                 fio: inner.clone(),
             })
         })
-        .unwrap_or_else(|_| {
+        .unwrap_or_else(|| {
             #[cfg(test)]
             DYN_BUFS.fetch_add(1, Ordering::AcqRel);
 
@@ -1482,7 +1472,7 @@ mod tests {
             let mut buf = fio.get_buf();
             buf.as_mut().fill(0xAA);
             buf.as_mut()[0] = random();
-            writes.push(fio.write_unchecked(rng.gen_range(0..PGS), buf));
+            writes.push(fio.write(rng.gen_range(0..PGS), buf));
         }
 
         let results = join_all(writes).await;

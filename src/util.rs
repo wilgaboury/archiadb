@@ -1,3 +1,4 @@
+use rapidhash::v3::rapidhash_v3;
 use rustix::fs::fstatvfs;
 use std::{
     fs::File,
@@ -6,7 +7,6 @@ use std::{
     path::Path,
     time::{Duration, Instant},
 };
-use xxhash_rust::xxh3::xxh3_64;
 
 use anyhow::{Result, anyhow, bail};
 
@@ -54,14 +54,14 @@ pub(crate) type ChecksumDisk = U64;
 
 pub(crate) fn update_checksum(buf: &mut [u8]) {
     let len = buf.len();
-    let checksum = xxh3_64(&buf[..len - size_of::<ChecksumDisk>()]);
+    let checksum = rapidhash_v3(&buf[..len - size_of::<ChecksumDisk>()]);
     from_bytes_mut::<ChecksumDisk>(&mut buf[len - size_of::<ChecksumDisk>()..]).set(checksum);
 }
 
 pub(crate) fn has_valid_checksum(buf: &[u8]) -> bool {
     let len = buf.len();
     let disk_checksum = from_bytes::<ChecksumDisk>(&buf[len - size_of::<ChecksumDisk>()..]).get();
-    let content_checksum = xxh3_64(&buf[..len - size_of::<ChecksumDisk>()]);
+    let content_checksum = rapidhash_v3(&buf[..len - size_of::<ChecksumDisk>()]);
     disk_checksum == content_checksum
 }
 

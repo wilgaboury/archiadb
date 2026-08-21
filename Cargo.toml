@@ -22,10 +22,10 @@ rustix = { version = "1.1.4", features = ["fs", "io_uring"] }
 libc = "0.2"
 parking_lot = "0.12.5"
 tokio = { version = "1", features = ["sync"] }
-xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 thiserror = "2.0.19"
 derive_more = { version = "2.1.1", features = ["full"] }
-flume = { version = "0.12", default-features = false, features = ["async"] }
+# flume = { version = "0.12", default-features = false, features = ["async"] }
+rapidhash = "4.5.1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
