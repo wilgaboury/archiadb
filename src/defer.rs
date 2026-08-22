@@ -111,12 +111,6 @@ impl<'a> Drop for DeferGaurd<'a> {
     }
 }
 
-impl<'a> Txn<'a> {
-    pub(crate) fn free(&mut self, pg_idx: PgIdx) {
-        self.defer_gaurd.freed.push(pg_idx);
-    }
-}
-
 #[coverage(off)]
 #[cfg(test)]
 mod tests {

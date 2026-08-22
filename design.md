@@ -4,6 +4,13 @@
 
 ArchiaDB is a hierarchical, embedded, transactional database. This document provides a broad overview of its implementation and design decisions.
 
+## Primary Motivations
+
+- Async rust and io_uring - These technologies make it possible to significantly reduce kernel space context switching. I wanted to explore this design space for my own educational purposes, and see if it would have any notable impact on overall performance.
+- Strictly serializable by default - The pervasiveness of snapshot serializable isolation or weaker models by default is baffling to me. Even for experienced engineers, it is far too easy to introduce subtle bugs in complex read-write transactions.
+- Hierarchical data model - This paradigm struck me as intriguing and fairly underutilized. Combined with strict serializable isolation hierarchical modelling makes implementing multi-index data and complex transactions intuitive, safe, and parallelizable. It also lends itself quite naturally to the COW data structures.
+- Non-declarative - While query languages provide a convenient and powerful abstraction for rapid iteration and business applications development, they are also very leaky abstractions that carry a lot of overhead. Expressing operations procedurally with native code is fast, clear, and easier to integrate.
+
 ## Hierarchical Modeling
 
 Hierarchical modelling is one paradigm among others like relational, document, or graph; providing a higher-level structure to a set of records. It may help to think of it as nothing more than a nestable key-value store. The following in-memory representation is effectively equivalent:
@@ -60,7 +67,7 @@ These refer to locks that are acquired/released during the commit procedure, whi
 2. acquire bottom-up locks
 3. write pages on path to LCA
 4. fsync
-5. double-buffered atomic LCA write 
+5. double-buffered atomic LCA write
 6. fsync
 7. release bottom-up locks
 

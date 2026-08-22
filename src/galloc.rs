@@ -5,6 +5,7 @@ use crate::{
     btree::BTreeRootHeader,
     db::DbInner,
     fio::Fio,
+    lalloc::Arena,
     meta::MetaHandler,
     uint::PgIdx,
     util::{FrontBack, from_bytes_mut},
@@ -24,14 +25,9 @@ impl Galloc {
 }
 
 impl DbInner {
-    pub(crate) async fn pre_galloc(&self, _front_idx: PgIdx, _back_idx: PgIdx) -> Result<()> {
-        todo!("implement pre_galloc");
-    }
-
-    pub(crate) async fn galloc(&self, fb: &mut FrontBack, alen: PgIdx) -> Result<()> {
+    pub(crate) async fn galloc(&self, fb: &mut FrontBack, alen: PgIdx) -> Result<Arena> {
         let _gaurd = self.galloc.lock.lock().await;
-        galloc_helper(&self.meta, &self.fio, fb, alen).await?;
-        Ok(())
+        galloc_helper(&self.meta, &self.fio, fb, alen).await
     }
 }
 
@@ -39,31 +35,31 @@ pub(crate) async fn galloc_helper(
     meta: &MetaHandler,
     fio: &Fio,
     fb: &mut FrontBack,
-    alen: PgIdx,
-) -> Result<()> {
+    len: PgIdx,
+) -> Result<Arena> {
     let mut root = fio.read(fb.front()).await?;
     let btree = from_bytes_mut::<BTreeRootHeader>(root.as_mut());
-    let prev_len = meta.len();
-    let len = meta.len() + alen;
+    let start = meta.len();
+    let flen = meta.len() + len;
 
-    fio.alloc(len).await?;
+    fio.alloc(flen).await?;
 
     meta.mutate_async(&fio, |meta| {
         meta.galloc_fidx.set(fb.front());
         meta.galloc_bidx.set(fb.back());
-        meta.galloc_len.set(alen);
+        meta.galloc_len.set(len);
     })
     .await?;
 
     btree.version.set(btree.version.get() + 1);
-    btree.arena.start.set(prev_len);
-    btree.arena.len.set(alen);
+    btree.arena.start.set(start);
+    btree.arena.len.set(len);
     btree.arena.next.set(0);
     fio.write(fb.back(), root).await?;
     fio.commit().await?;
 
     meta.mutate_async(&fio, |meta| {
-        meta.len.set(len);
+        meta.len.set(flen);
         meta.galloc_fidx.set(0);
         meta.galloc_bidx.set(0);
         meta.galloc_len.set(0);
@@ -72,7 +68,7 @@ pub(crate) async fn galloc_helper(
 
     fb.flip();
 
-    Ok(())
+    Ok(Arena::new(start, len))
 }
 
 pub(crate) async fn galloc_recover(meta: &MetaHandler, fio: &Fio) -> Result<()> {

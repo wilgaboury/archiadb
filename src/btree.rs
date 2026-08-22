@@ -263,7 +263,6 @@ pub(crate) struct BTreeRootHeader {
     pub(crate) header: BTreeHeader,
     pub(crate) version: U64,
     pub(crate) free: PgIdxDisk,
-    pub(crate) free_len: PgIdxDisk,
     pub(crate) arena: ArenaDisk,
 }
 

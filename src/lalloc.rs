@@ -7,16 +7,20 @@ use crate::{
     db::{DirtyEntry, Txn},
     fio::PageBuf,
     key::KeyPathBuf,
-    uint::{InPgIdx, InPgIdxDisk, PgIdx, PgIdxDisk},
-    util::{ceil_div, from_bytes},
+    uint::{InPgIdx, PgIdx, PgIdxDisk},
+    util::{from_bytes, from_bytes_mut},
 };
 
 const INIT_ARENA_SIZE: PgIdx = 8;
 
+// Page format for free list node
+// header, idxs, 0
+// null terminated, or terminated by max idxs in page
+// this keeps iteration simple and is space efficent
+
 #[repr(C, packed)]
 pub(crate) struct FreeListHeader {
     pub(crate) next: PgIdxDisk,
-    pub(crate) len: InPgIdxDisk,
 }
 
 pub(crate) fn read_fl(buf: &[u8], idx: InPgIdx) -> PgIdx {
@@ -26,6 +30,28 @@ pub(crate) fn read_fl(buf: &[u8], idx: InPgIdx) -> PgIdx {
     .get()
 }
 
+pub(crate) fn write_fl(buf: &mut [u8], idx: InPgIdx, pg_idx: PgIdx) {
+    from_bytes_mut::<PgIdxDisk>(
+        &mut buf[size_of::<FreeListHeader>() + (idx as usize * size_of::<PgIdxDisk>())..],
+    )
+    .set(pg_idx)
+}
+
+pub(crate) fn cap_fl(buf: &mut [u8], idx: InPgIdx) {
+    let idxs_per = idxs_per_fl_page(buf.len() as u64);
+    if idx < idxs_per {
+        from_bytes_mut::<PgIdxDisk>(
+            &mut buf[size_of::<FreeListHeader>() + (idx as usize * size_of::<PgIdxDisk>())..],
+        )
+        .set(0)
+    }
+}
+
+pub(crate) fn idxs_per_fl_page(pg_sz: InPgIdx) -> InPgIdx {
+    (pg_sz - size_of::<FreeListHeader>() as InPgIdx) / size_of::<PgIdxDisk>() as InPgIdx
+}
+
+#[derive(Clone, Copy)]
 pub(crate) struct Arena {
     pub(crate) start: PgIdx,
     pub(crate) len: PgIdx,
@@ -33,6 +59,24 @@ pub(crate) struct Arena {
 }
 
 impl Arena {
+    pub(crate) fn new(start: PgIdx, len: PgIdx) -> Self {
+        Self {
+            start,
+            len,
+            next: 0,
+        }
+    }
+
+    pub(crate) fn pop(&mut self) -> Option<PgIdx> {
+        if self.len - self.next > 0 {
+            let ret = self.start + self.next;
+            self.next += 1;
+            Some(ret)
+        } else {
+            None
+        }
+    }
+
     pub(crate) fn pop_w_resv(&mut self, reserve: PgIdx) -> Option<PgIdx> {
         if self.len - self.next < reserve + 1 {
             let ret = self.start + self.next;
@@ -50,7 +94,7 @@ pub(crate) struct LallocMap {
 
 pub(crate) struct Lalloc {
     arena: Arena,
-    from_arena: PgIdx, // # of allocns via this arena, needs to be flushed to disk before galloc
+    orig_next: PgIdx,
 
     clean: Option<PgIdx>, // pointer to unmodified tail of free list
     free: Vec<PgIdx>,     // usable pointers
@@ -58,23 +102,30 @@ pub(crate) struct Lalloc {
 }
 
 impl Lalloc {
-    pub(crate) fn pages_to_encode_arena(&self, pg_size: PgIdx, free_len: PgIdx) -> PgIdx {
-        let idxs_per = pg_size / size_of::<PgIdxDisk>() as PgIdx;
-        let from_div = self.from_arena / idxs_per;
-        let from_rem = self.from_arena % idxs_per;
-        let in_arena = self.arena.len - self.arena.next;
-        let in_div = in_arena / (idxs_per + 1);
-        let in_rem = in_arena % (idxs_per + 1);
-        let head_rem = free_len % idxs_per;
-        from_div + in_div + ceil_div(from_rem + in_rem + head_rem, idxs_per)
+    pub(crate) fn free(&mut self, txn: &mut Txn, pg_idx: PgIdx) {
+        self.deferred.push(pg_idx);
+        txn.defer_gaurd.free(pg_idx);
+    }
+
+    pub(crate) fn pages_to_fl_encode_arena(&self, pg_size: PgIdx) -> PgIdx {
+        let idxs_per = idxs_per_fl_page(pg_size);
+        let idxs = self.arena.len - self.orig_next;
+        // +1 is accounting for page needed to store free list node
+        let div = idxs / (idxs_per + 1);
+        // +2 is counting remaining arena idxs and idxs in free list head, maximum of 2 pages needed for those
+        div + 2
     }
 }
 
 impl<'txn> Txn<'txn> {
     pub(crate) async fn lalloc(&self, dirty: &mut DirtyEntry, pg: PageBuf) -> Result<PgIdx> {
         let root = from_bytes::<BTreeRootHeader>(pg.as_ref());
+
+        // bootstrap condition
         if root.free.get() == 0 && root.arena.start.get() == 0 {
-            self.db.galloc(&mut dirty.fb, INIT_ARENA_SIZE).await?;
+            dirty.lalloc.arena = self.db.galloc(&mut dirty.fb, INIT_ARENA_SIZE).await?;
+            dirty.lalloc.orig_next = dirty.lalloc.arena.next;
+            return Ok(dirty.lalloc.arena.pop().unwrap());
         }
 
         let mut clean = if let Some(clean) = dirty.lalloc.clean.as_ref() {
@@ -90,8 +141,13 @@ impl<'txn> Txn<'txn> {
 
             let fl_pg = self.db.fio.read(clean).await?;
             let header = from_bytes::<FreeListHeader>(fl_pg.as_ref());
-            for i in 0..header.len.get() {
+            let idxs_per = idxs_per_fl_page(self.db.meta.page_size());
+            for i in 0..idxs_per {
                 let free_pg_idx = read_fl(fl_pg.as_ref(), i);
+                if free_pg_idx == 0 {
+                    break;
+                }
+
                 if self.db.defer.contains(free_pg_idx) {
                     dirty.lalloc.deferred.push(free_pg_idx);
                 } else {
@@ -104,8 +160,7 @@ impl<'txn> Txn<'txn> {
 
         let arena_reserve = dirty
             .lalloc
-            .pages_to_encode_arena(self.db.meta.page_size(), root.free_len.get());
-
+            .pages_to_fl_encode_arena(self.db.meta.page_size());
         Ok(
             if let Some(free_pg) = dirty.lalloc.arena.pop_w_resv(arena_reserve) {
                 free_pg
@@ -113,5 +168,14 @@ impl<'txn> Txn<'txn> {
                 todo!("encode arena, galloc, and return")
             },
         )
+    }
+
+    pub(crate) async fn encode_arena(&self, dirty: &mut DirtyEntry) -> Result<()> {
+        let to_encode = dirty
+            .lalloc
+            .pages_to_fl_encode_arena(self.db.meta.page_size());
+        assert!(dirty.lalloc.arena.len - dirty.lalloc.arena.next <= to_encode);
+
+        todo!("implement")
     }
 }
