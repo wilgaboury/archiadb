@@ -173,8 +173,9 @@ pub(crate) async fn lalloc(
     let root = from_bytes::<BTreeRootHeader>(root_buf.as_ref());
 
     if should_init_arena(root) {
-        dirty.lalloc.arena =
-            galloc_w_lock(galloc, meta, fio, &mut dirty.fb, INIT_ARENA_SIZE).await?;
+        // unlikely case, but post arena encode crash + fl depletion could leave inlavid arena with large len. use that len for galloc not init.
+        let len = cmp::max(INIT_ARENA_SIZE, next_arena_len(root.arena.len.get()));
+        dirty.lalloc.arena = galloc_w_lock(galloc, meta, fio, &mut dirty.fb, len).await?;
         dirty.lalloc.orig_next = dirty.lalloc.arena.next;
         return Ok(dirty.lalloc.arena.pop().unwrap());
     }
@@ -197,7 +198,7 @@ pub(crate) async fn lalloc(
 }
 
 pub(crate) fn should_init_arena(root: &BTreeRootHeader) -> bool {
-    root.free.get() == 0 && root.arena.start.get() == 0
+    root.free.get() == 0 && root.arena.is_valid()
 }
 
 pub(crate) async fn find_free_idx_in_fl(
@@ -284,6 +285,7 @@ pub(crate) async fn encode_arena(fio: &Fio, dirty: &mut DirtyEntry) -> Result<()
         fio.write(next, fl_buf).await?;
     }
 
+    root.arena.invalidate();
     root.free.set(next);
     root.version.set(root.version.get() + 1);
     fio.write(dirty.fb.back(), root_buf).await?;

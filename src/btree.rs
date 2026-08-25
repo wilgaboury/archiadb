@@ -258,6 +258,14 @@ impl ArenaDisk {
         self.next.set(0);
     }
 
+    pub(crate) fn invalidate(&mut self) {
+        self.start.set(0);
+    }
+
+    pub(crate) fn is_valid(&self) -> bool {
+        self.start.get() == 0
+    }
+
     pub(crate) fn to_mem(&self) -> Arena {
         Arena {
             start: self.start.get(),

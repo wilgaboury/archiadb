@@ -148,10 +148,6 @@ mod tests {
             meta.len.set(4);
             fio.write(0, buf).await?;
 
-            let mut buf = fio.read(3).await?;
-            let root = from_bytes_mut::<BTreeRootHeader>(buf.as_mut());
-            root.arena.start.set(0);
-
             fio.commit().await?;
         }
 
