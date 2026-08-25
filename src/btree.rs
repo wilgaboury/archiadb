@@ -936,7 +936,7 @@ mod tests {
         },
         db::Db,
         key_path,
-        test::TempDir,
+        test::TmpDir,
         util::from_bytes_mut,
     };
 
@@ -1058,8 +1058,8 @@ mod tests {
     #[named]
     #[tokio::test]
     async fn test_linked_list() -> Result<()> {
-        let dir = TempDir::new(function_name!())?;
-        let db = dir.db("db").await?;
+        let dir = TmpDir::new(function_name!())?;
+        let db = dir.db().await?;
         let mut txn = db.txn().begin().await;
         let value_len = txn.db.meta.page_size() as usize * 2.5 as usize;
         let value = vec![1u8; value_len];
@@ -1284,7 +1284,7 @@ mod tests {
     #[named]
     #[tokio::test]
     async fn test_upsert() -> Result<()> {
-        let dir = TempDir::new(function_name!()).unwrap();
+        let dir = TmpDir::new(function_name!()).unwrap();
         let db = Db::builder().path(dir.root().join("file")).build().await?;
         {
             let mut txn = db.txn().write(key_path![])?.begin().await;

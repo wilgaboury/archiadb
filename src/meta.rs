@@ -330,16 +330,16 @@ mod tests {
     use function_name::named;
 
     use crate::meta::{CUR_FMT_VER, MAGIC, Meta};
-    use crate::test::TempDir;
+    use crate::test::TmpDir;
     use crate::util::{from_bytes, from_bytes_mut, update_checksum};
 
     #[named]
     #[test]
     fn test_mutate_sync() -> Result<()> {
-        let temp_dir = TempDir::new(function_name!())?;
+        let temp_dir = TmpDir::new(function_name!())?;
 
-        let file = temp_dir.file_raw("sync.db")?;
-        let meta_hand = temp_dir.meta("sync.db")?;
+        let file = temp_dir.file_raw_at("sync.db")?;
+        let meta_hand = temp_dir.meta_at("sync.db")?;
 
         let mut buf = vec![0u8; meta_hand.pg_size as usize];
 
@@ -364,9 +364,9 @@ mod tests {
     #[named]
     #[test]
     fn test_mutate_async() -> Result<()> {
-        let temp_dir = TempDir::new(function_name!())?;
+        let temp_dir = TmpDir::new(function_name!())?;
 
-        let (fio, meta_hand) = temp_dir.fio_and_meta("sync.db")?;
+        let (fio, meta_hand) = temp_dir.fio_and_meta_at("sync.db")?;
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -400,8 +400,8 @@ mod tests {
     #[named]
     #[test]
     fn test_get() -> Result<()> {
-        let temp_dir = TempDir::new(function_name!())?;
-        let meta_hand = temp_dir.meta("sync.db")?;
+        let temp_dir = TmpDir::new(function_name!())?;
+        let meta_hand = temp_dir.meta_at("sync.db")?;
 
         assert_eq!(meta_hand.fmt_ver(), CUR_FMT_VER);
         assert_eq!(meta_hand.root1(), 2);
@@ -423,34 +423,34 @@ mod tests {
             Ok(())
         }
 
-        let temp_dir = TempDir::new(function_name!())?;
+        let temp_dir = TmpDir::new(function_name!())?;
         let loc = "meta.db";
-        let file = temp_dir.file_raw(loc)?;
+        let file = temp_dir.file_raw_at(loc)?;
         let page_size = {
-            let meta_hand = temp_dir.meta(loc)?;
+            let meta_hand = temp_dir.meta_at(loc)?;
             meta_hand.pg_size
         };
 
         corrupt_page(&file, page_size, 0)?;
         corrupt_page(&file, page_size, 1)?;
         {
-            assert!(temp_dir.meta(loc).is_err());
+            assert!(temp_dir.meta_at(loc).is_err());
         }
 
         fix_corrupt_page(&file, page_size, 0)?;
         {
-            assert!(temp_dir.meta(loc)?.inner.blocking_lock().is_first);
+            assert!(temp_dir.meta_at(loc)?.inner.blocking_lock().is_first);
         }
 
         corrupt_page(&file, page_size, 0)?;
         fix_corrupt_page(&file, page_size, 1)?;
         {
-            assert!(!temp_dir.meta(loc)?.inner.blocking_lock().is_first);
+            assert!(!temp_dir.meta_at(loc)?.inner.blocking_lock().is_first);
         }
 
         fix_corrupt_page(&file, page_size, 0)?;
         {
-            assert!(temp_dir.meta(loc)?.inner.blocking_lock().is_first);
+            assert!(temp_dir.meta_at(loc)?.inner.blocking_lock().is_first);
         }
 
         let mut buf = vec![0u8; page_size as usize];
@@ -463,7 +463,7 @@ mod tests {
 
         file.write_all_at(&buf, page_size)?;
         {
-            let meta_hand = temp_dir.meta(loc)?;
+            let meta_hand = temp_dir.meta_at(loc)?;
             let inner = meta_hand.inner.blocking_lock();
             assert!(!inner.is_first);
             assert_eq!(1, inner.version);

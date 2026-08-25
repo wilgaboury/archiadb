@@ -255,7 +255,7 @@ mod tests {
 
     use crate::{
         meta::{MAGIC, MagicType},
-        test::TempDir,
+        test::TmpDir,
         util::update_checksum,
     };
 
@@ -276,16 +276,15 @@ mod tests {
             Ok(())
         }
 
-        const LOC: &str = "db";
-        let tmp = TempDir::new(function_name!()).unwrap();
-        let db = tmp.db(LOC).await?;
+        let tmp = TmpDir::new(function_name!()).unwrap();
+        let db = tmp.db().await?;
         let page_size = db.page_size();
         db.try_close()?;
 
-        corrput_magic(page_size, &tmp.file_raw(LOC)?, 0)?;
-        corrput_magic(page_size, &tmp.file_raw(LOC)?, 1)?;
+        corrput_magic(page_size, &tmp.file_raw()?, 0)?;
+        corrput_magic(page_size, &tmp.file_raw()?, 1)?;
 
-        let err = tmp.db(LOC).await.unwrap_err();
+        let err = tmp.db().await.unwrap_err();
         assert!(
             err.to_string()
                 .contains("file is not an archia db file or magic number is corrupted")

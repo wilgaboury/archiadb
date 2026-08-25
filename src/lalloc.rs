@@ -299,12 +299,12 @@ mod tests {
     use anyhow::Result;
     use function_name::named;
 
-    use crate::test::TempDir;
+    use crate::test::TmpDir;
 
     #[named]
     #[tokio::test]
     async fn test_encode_arena() -> Result<()> {
-        let tmp = TempDir::new(function_name!())?;
+        let tmp = TmpDir::new(function_name!())?;
         let _fio = tmp.fio()?;
 
         Ok(())

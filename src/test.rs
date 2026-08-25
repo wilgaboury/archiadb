@@ -48,11 +48,11 @@ where
     }
 }
 
-pub(crate) struct TempDir {
+pub(crate) struct TmpDir {
     path: PathBuf,
 }
 
-impl TempDir {
+impl TmpDir {
     pub fn new(suffix: &str) -> Result<Self> {
         let path = std::env::current_dir()?.join(format!(
             "tdat/{}_{}_{}",
@@ -75,7 +75,11 @@ impl TempDir {
         self.path.join(path)
     }
 
-    pub async fn db<P: AsRef<Path>>(&self, path: P) -> Result<Db> {
+    pub async fn db(&self) -> Result<Db> {
+        self.db_at(DEFAULT_FILE_PATH).await
+    }
+
+    pub async fn db_at<P: AsRef<Path>>(&self, path: P) -> Result<Db> {
         Db::builder()
             .path(self.path(path))
             .sq(2)
@@ -85,11 +89,19 @@ impl TempDir {
             .await
     }
 
-    pub fn file<P: AsRef<Path>>(&self, path: P) -> Result<DbFile> {
+    pub fn file(&self) -> Result<DbFile> {
+        self.file_at(DEFAULT_FILE_PATH)
+    }
+
+    pub fn file_at<P: AsRef<Path>>(&self, path: P) -> Result<DbFile> {
         DbFile::open(self.path.join(path.as_ref()))
     }
 
-    pub fn file_raw<P: AsRef<Path>>(&self, path: P) -> Result<File> {
+    pub fn file_raw(&self) -> Result<File> {
+        self.file_raw_at(DEFAULT_FILE_PATH)
+    }
+
+    pub fn file_raw_at<P: AsRef<Path>>(&self, path: P) -> Result<File> {
         Ok(OpenOptions::new()
             .read(true)
             .write(true)
@@ -97,8 +109,12 @@ impl TempDir {
             .open(self.path.join(path.as_ref()))?)
     }
 
-    pub fn meta<P: AsRef<Path>>(&self, path: P) -> Result<MetaHandler> {
-        let file = self.file_raw(path)?;
+    pub fn meta(&self) -> Result<MetaHandler> {
+        self.meta_at(DEFAULT_FILE_PATH)
+    }
+
+    pub fn meta_at<P: AsRef<Path>>(&self, path: P) -> Result<MetaHandler> {
+        let file = self.file_raw_at(path)?;
         MetaHandler::new(&file)
     }
 
@@ -107,7 +123,7 @@ impl TempDir {
     }
 
     pub fn fio_at<P: AsRef<Path>>(&self, path: P) -> Result<Fio> {
-        let file = self.file(path)?;
+        let file = self.file_at(path)?;
         let meta = MetaHandler::new(file.file())?;
         Ok(Fio::builder()
             .file(Arc::new(file))
@@ -118,8 +134,12 @@ impl TempDir {
             .build()?)
     }
 
-    pub fn fio_and_meta<P: AsRef<Path>>(&self, path: P) -> Result<(Fio, MetaHandler)> {
-        let file = self.file(path)?;
+    pub fn fio_and_meta(&self) -> Result<(Fio, MetaHandler)> {
+        self.fio_and_meta_at(DEFAULT_FILE_PATH)
+    }
+
+    pub fn fio_and_meta_at<P: AsRef<Path>>(&self, path: P) -> Result<(Fio, MetaHandler)> {
+        let file = self.file_at(path)?;
         let meta = MetaHandler::new(file.file())?;
         Ok((
             Fio::builder()
@@ -132,15 +152,9 @@ impl TempDir {
             meta,
         ))
     }
-
-    pub fn fio_cust<P: AsRef<Path>>(&self, path: P) -> Result<(Arc<DbFile>, MetaHandler)> {
-        let file = self.file(path)?;
-        let meta = MetaHandler::new(file.file())?;
-        Ok((Arc::new(file), meta))
-    }
 }
 
-impl Drop for TempDir {
+impl Drop for TmpDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.path);
     }

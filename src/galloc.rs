@@ -102,16 +102,15 @@ pub(crate) async fn galloc_recover(meta: &MetaHandler, fio: &Fio) -> Result<()> 
 mod tests {
     use function_name::named;
 
-    use crate::{meta::Meta, test::TempDir, util::from_bytes};
+    use crate::{meta::Meta, test::TmpDir, util::from_bytes};
 
     use super::*;
 
     #[named]
     #[tokio::test]
     async fn basic_galloc() -> Result<()> {
-        const LOC: &str = "db";
-        let tmp = TempDir::new(function_name!()).unwrap();
-        let db = tmp.db(LOC).await?;
+        let tmp = TmpDir::new(function_name!()).unwrap();
+        let db = tmp.db().await?;
 
         assert_eq!(4, db.inner.meta.len());
 
@@ -132,13 +131,12 @@ mod tests {
     #[named]
     #[tokio::test]
     async fn galloc_recover_finish_galloc() -> Result<()> {
-        const LOC: &str = "db";
-        let tmp = TempDir::new(function_name!()).unwrap();
-        let db = tmp.db(LOC).await?;
+        let tmp = TmpDir::new(function_name!()).unwrap();
+        let db = tmp.db().await?;
         db.try_close()?;
 
         {
-            let (fio, _meta) = tmp.fio_and_meta(LOC)?;
+            let fio = tmp.fio()?;
             let mut buf = fio.read(0).await?;
             let meta = from_bytes_mut::<Meta>(buf.as_mut());
             meta.open = 0;
@@ -157,7 +155,7 @@ mod tests {
             fio.commit().await?;
         }
 
-        let db = tmp.db(LOC).await?;
+        let db = tmp.db().await?;
         let buf = db.inner.fio.read(3).await?;
         let root = from_bytes::<BTreeRootHeader>(buf.as_ref());
         assert_eq!(4, root.arena.start.get());

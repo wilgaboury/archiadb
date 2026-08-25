@@ -241,7 +241,7 @@ mod tests {
 
     use crate::{
         key_path,
-        test::{TempDir, corrupt_checksum},
+        test::{TmpDir, corrupt_checksum},
     };
 
     use super::*;
@@ -331,8 +331,8 @@ mod tests {
     #[named]
     #[tokio::test]
     async fn root_rety_no_lock() -> Result<()> {
-        let tmp = TempDir::new(function_name!())?;
-        let db = tmp.db("db").await?;
+        let tmp = TmpDir::new(function_name!())?;
+        let db = tmp.db().await?;
 
         let mut buf: PageBuf = db.inner.fio.read(2).await?;
         corrupt_checksum(buf.as_mut());
@@ -368,8 +368,8 @@ mod tests {
     #[named]
     #[tokio::test]
     async fn root_rety_lock() -> Result<()> {
-        let tmp = TempDir::new(function_name!())?;
-        let db = tmp.db("db").await?;
+        let tmp = TmpDir::new(function_name!())?;
+        let db = tmp.db().await?;
 
         let mut buf: PageBuf = db.inner.fio.read(3).await?;
         corrupt_checksum(buf.as_mut());
@@ -442,8 +442,8 @@ mod tests {
     #[named]
     #[tokio::test]
     async fn check_header_version_getter() -> Result<()> {
-        let tmp = TempDir::new(function_name!())?;
-        let (fio, _meta) = tmp.fio_and_meta("db")?;
+        let tmp = TmpDir::new(function_name!())?;
+        let (fio, _meta) = tmp.fio_and_meta_at("db")?;
         let mut pg = fio.get_dyn_buf();
         {
             let meta = from_bytes_mut::<BTreeRootHeader>(pg.as_mut());

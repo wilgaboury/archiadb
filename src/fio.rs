@@ -1198,7 +1198,7 @@ mod tests {
 
     use crate::{
         meta::NUM_HEADER_PAGES,
-        test::{TempDir, retry_until_success_tokio},
+        test::{TmpDir, retry_until_success_tokio},
     };
 
     use super::*;
@@ -1213,8 +1213,9 @@ mod tests {
     #[named]
     #[test]
     fn test_buf() -> Result<()> {
-        let temp_dir = TempDir::new(function_name!())?;
-        let (file, meta) = temp_dir.fio_cust("db")?;
+        let tmp = TmpDir::new(function_name!())?;
+        let file = Arc::new(tmp.file()?);
+        let meta = tmp.meta()?;
 
         let fio = Fio::builder()
             .file(file)
@@ -1235,8 +1236,8 @@ mod tests {
     #[named]
     #[tokio::test]
     async fn test_single_read_page() -> Result<()> {
-        let temp_dir = TempDir::new(function_name!())?;
-        let (fio, _) = temp_dir.fio_and_meta("db")?;
+        let dir = TmpDir::new(function_name!())?;
+        let fio = dir.fio()?;
         let mut file = OpenOptions::new()
             .write(true)
             .append(true)
@@ -1266,8 +1267,9 @@ mod tests {
     #[named]
     #[tokio::test]
     async fn test_single_read_page_dynamic() -> Result<()> {
-        let temp_dir = TempDir::new(function_name!())?;
-        let (file, meta) = temp_dir.fio_cust("db")?;
+        let tmp = TmpDir::new(function_name!())?;
+        let file = Arc::new(tmp.file()?);
+        let meta = tmp.meta()?;
 
         let fio = Fio::builder()
             .file(file.clone())
@@ -1296,8 +1298,8 @@ mod tests {
     #[named]
     #[tokio::test]
     async fn test_single_write_page() -> Result<()> {
-        let temp_dir = TempDir::new(function_name!())?;
-        let (fio, _) = temp_dir.fio_and_meta("db")?;
+        let dir = TmpDir::new(function_name!())?;
+        let fio = dir.fio()?;
 
         let mut buf = fio.get_buf();
         buf.as_mut()[0..].fill(1u8);
@@ -1321,8 +1323,9 @@ mod tests {
     #[named]
     #[tokio::test]
     async fn test_single_write_page_dynamic() -> Result<()> {
-        let temp_dir = TempDir::new(function_name!())?;
-        let (file, meta) = temp_dir.fio_cust("db")?;
+        let tmp = TmpDir::new(function_name!())?;
+        let file = Arc::new(tmp.file()?);
+        let meta = tmp.meta()?;
 
         let fio = Fio::builder()
             .file(file.clone())
@@ -1353,8 +1356,8 @@ mod tests {
     #[named]
     #[tokio::test]
     async fn test_simple_alloc() -> Result<()> {
-        let temp_dir = TempDir::new(function_name!())?;
-        let (fio, meta) = temp_dir.fio_and_meta("db")?;
+        let temp_dir = TmpDir::new(function_name!())?;
+        let (fio, meta) = temp_dir.fio_and_meta_at("db")?;
         assert_eq!(NUM_HEADER_PAGES, meta.len());
 
         fio.alloc(NUM_HEADER_PAGES + 1).await?;
@@ -1381,8 +1384,8 @@ mod tests {
     #[named]
     #[tokio::test]
     async fn check_thread_parking() -> Result<()> {
-        let tmp = TempDir::new(function_name!())?;
-        let (fio, _meta) = tmp.fio_and_meta("db")?;
+        let tmp = TmpDir::new(function_name!())?;
+        let fio = tmp.fio()?;
 
         retry_until_success_tokio(
             || {
@@ -1440,8 +1443,8 @@ mod tests {
     async fn random_write_stress_test() -> Result<()> {
         const PGS: PgIdx = 1 << 16;
         const LOC: &str = "db";
-        let tmp = TempDir::new(function_name!())?;
-        let file = Arc::new(tmp.file(LOC)?);
+        let tmp = TmpDir::new(function_name!())?;
+        let file = Arc::new(tmp.file_at(LOC)?);
         let mut rng = thread_rng();
         let fio = Fio::builder()
             .file(file.clone())
@@ -1505,8 +1508,8 @@ mod tests {
     #[named]
     #[tokio::test]
     async fn thread_failure() -> Result<()> {
-        let tmp = TempDir::new(function_name!())?;
-        let (fio, _meta) = tmp.fio_and_meta("db")?;
+        let tmp = TmpDir::new(function_name!())?;
+        let fio = tmp.fio()?;
 
         let _ = fio.read(0).await?;
 
