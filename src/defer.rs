@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use dashmap::DashSet;
 use parking_lot::Mutex;
 
-use crate::{db::Txn, uint::PgIdx};
+use crate::uint::PgIdx;
 
 pub type DeferId = u64;
 
