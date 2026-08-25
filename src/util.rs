@@ -443,7 +443,7 @@ mod tests {
     #[tokio::test]
     async fn check_header_version_getter() -> Result<()> {
         let tmp = TempDir::new(function_name!())?;
-        let (fio, _meta) = tmp.fio("db")?;
+        let (fio, _meta) = tmp.fio_and_meta("db")?;
         let mut pg = fio.get_dyn_buf();
         {
             let meta = from_bytes_mut::<BTreeRootHeader>(pg.as_mut());

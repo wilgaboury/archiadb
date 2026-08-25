@@ -110,6 +110,17 @@ pub(crate) struct Lalloc {
 }
 
 impl Lalloc {
+    pub(crate) fn new(root: &BTreeRootHeader) -> Self {
+        Self {
+            arena: root.arena.to_mem(),
+            orig_next: root.arena.next.get(),
+
+            clean: None,
+            free: Vec::new(),
+            deferred: Vec::new(),
+        }
+    }
+
     pub(crate) fn free(&mut self, txn: &mut Txn, pg_idx: PgIdx) {
         self.deferred.push(pg_idx);
         txn.defer_gaurd.free(pg_idx);
@@ -280,4 +291,22 @@ pub(crate) async fn encode_arena(fio: &Fio, dirty: &mut DirtyEntry) -> Result<()
     dirty.fb.flip();
 
     Ok(())
+}
+
+#[coverage(off)]
+#[cfg(test)]
+mod tests {
+    use anyhow::Result;
+    use function_name::named;
+
+    use crate::test::TempDir;
+
+    #[named]
+    #[tokio::test]
+    async fn test_encode_arena() -> Result<()> {
+        let tmp = TempDir::new(function_name!())?;
+        let _fio = tmp.fio()?;
+
+        Ok(())
+    }
 }

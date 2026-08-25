@@ -366,7 +366,7 @@ mod tests {
     fn test_mutate_async() -> Result<()> {
         let temp_dir = TempDir::new(function_name!())?;
 
-        let (fio, meta_hand) = temp_dir.fio("sync.db")?;
+        let (fio, meta_hand) = temp_dir.fio_and_meta("sync.db")?;
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()

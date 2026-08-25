@@ -7,6 +7,7 @@ use crate::{
     db::Txn,
     fio::MIN_PAGE_SIZE,
     flux::FluxBuf,
+    lalloc::Arena,
     uint::{InPgIdx, InPgIdxDisk, PgIdx, PgIdxDisk, U24, U64},
     util::{ChecksumDisk, from_bytes, from_bytes_mut},
 };
@@ -255,6 +256,14 @@ impl ArenaDisk {
         self.start.set(0);
         self.len.set(0);
         self.next.set(0);
+    }
+
+    pub(crate) fn to_mem(&self) -> Arena {
+        Arena {
+            start: self.start.get(),
+            len: self.len.get(),
+            next: self.next.get(),
+        }
     }
 }
 

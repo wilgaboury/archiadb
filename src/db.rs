@@ -173,6 +173,15 @@ pub(crate) struct DirtyEntry {
     pub(crate) lalloc: Lalloc,
 }
 
+impl DirtyEntry {
+    pub fn new(fb: FrontBack, root: &BTreeRootHeader) -> Self {
+        Self {
+            fb,
+            lalloc: Lalloc::new(root),
+        }
+    }
+}
+
 pub struct Txn<'txn> {
     pub(crate) db: &'txn DbInner,
     pub(crate) defer_gaurd: DeferGaurd<'txn>,

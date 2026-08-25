@@ -1236,7 +1236,7 @@ mod tests {
     #[tokio::test]
     async fn test_single_read_page() -> Result<()> {
         let temp_dir = TempDir::new(function_name!())?;
-        let (fio, _) = temp_dir.fio("db")?;
+        let (fio, _) = temp_dir.fio_and_meta("db")?;
         let mut file = OpenOptions::new()
             .write(true)
             .append(true)
@@ -1297,7 +1297,7 @@ mod tests {
     #[tokio::test]
     async fn test_single_write_page() -> Result<()> {
         let temp_dir = TempDir::new(function_name!())?;
-        let (fio, _) = temp_dir.fio("db")?;
+        let (fio, _) = temp_dir.fio_and_meta("db")?;
 
         let mut buf = fio.get_buf();
         buf.as_mut()[0..].fill(1u8);
@@ -1354,7 +1354,7 @@ mod tests {
     #[tokio::test]
     async fn test_simple_alloc() -> Result<()> {
         let temp_dir = TempDir::new(function_name!())?;
-        let (fio, meta) = temp_dir.fio("db")?;
+        let (fio, meta) = temp_dir.fio_and_meta("db")?;
         assert_eq!(NUM_HEADER_PAGES, meta.len());
 
         fio.alloc(NUM_HEADER_PAGES + 1).await?;
@@ -1382,7 +1382,7 @@ mod tests {
     #[tokio::test]
     async fn check_thread_parking() -> Result<()> {
         let tmp = TempDir::new(function_name!())?;
-        let (fio, _meta) = tmp.fio("db")?;
+        let (fio, _meta) = tmp.fio_and_meta("db")?;
 
         retry_until_success_tokio(
             || {
@@ -1506,7 +1506,7 @@ mod tests {
     #[tokio::test]
     async fn thread_failure() -> Result<()> {
         let tmp = TempDir::new(function_name!())?;
-        let (fio, _meta) = tmp.fio("db")?;
+        let (fio, _meta) = tmp.fio_and_meta("db")?;
 
         let _ = fio.read(0).await?;
 

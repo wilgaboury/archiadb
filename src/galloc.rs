@@ -138,7 +138,7 @@ mod tests {
         db.try_close()?;
 
         {
-            let (fio, _meta) = tmp.fio(LOC)?;
+            let (fio, _meta) = tmp.fio_and_meta(LOC)?;
             let mut buf = fio.read(0).await?;
             let meta = from_bytes_mut::<Meta>(buf.as_mut());
             meta.open = 0;
