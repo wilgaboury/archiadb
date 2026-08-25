@@ -25,13 +25,23 @@ impl Galloc {
 }
 
 impl DbInner {
-    pub(crate) async fn galloc(&self, fb: &mut FrontBack, alen: PgIdx) -> Result<Arena> {
-        let _gaurd = self.galloc.lock.lock().await;
-        galloc_helper(&self.meta, &self.fio, fb, alen).await
+    pub(crate) async fn galloc(&self, fb: &mut FrontBack, len: PgIdx) -> Result<Arena> {
+        galloc_w_lock(&self.galloc, &self.meta, &self.fio, fb, len).await
     }
 }
 
-pub(crate) async fn galloc_helper(
+pub(crate) async fn galloc_w_lock(
+    lock: &Galloc,
+    meta: &MetaHandler,
+    fio: &Fio,
+    fb: &mut FrontBack,
+    len: PgIdx,
+) -> Result<Arena> {
+    let _gaurd = lock.lock.lock().await;
+    galloc_io_proc(meta, fio, fb, len).await
+}
+
+pub(crate) async fn galloc_io_proc(
     meta: &MetaHandler,
     fio: &Fio,
     fb: &mut FrontBack,
@@ -82,7 +92,7 @@ pub(crate) async fn galloc_recover(meta: &MetaHandler, fio: &Fio) -> Result<()> 
         })
         .await;
     if front_idx != 0 && back_idx != 0 {
-        galloc_helper(meta, fio, &mut FrontBack::new(front_idx, back_idx), alen).await?;
+        galloc_io_proc(meta, fio, &mut FrontBack::new(front_idx, back_idx), alen).await?;
     }
     Ok(())
 }
