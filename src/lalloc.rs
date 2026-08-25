@@ -67,6 +67,10 @@ impl Arena {
         }
     }
 
+    pub(crate) fn is_empty(&self) -> bool {
+        self.next >= self.len
+    }
+
     pub(crate) fn pop(&mut self) -> Option<PgIdx> {
         if self.len - self.next > 0 {
             let ret = self.start + self.next;
@@ -78,7 +82,7 @@ impl Arena {
     }
 
     pub(crate) fn pop_w_resv(&mut self, reserve: PgIdx) -> Option<PgIdx> {
-        if self.len - self.next < reserve + 1 {
+        if self.len - self.next < reserve {
             let ret = self.start + self.next;
             self.next += 1;
             Some(ret)
@@ -112,8 +116,7 @@ impl Lalloc {
         let idxs = self.arena.len - self.orig_next;
         // +1 is accounting for page needed to store free list node
         let div = idxs / (idxs_per + 1);
-        // +2 is counting remaining arena idxs and idxs in free list head, maximum of 2 pages needed for those
-        div + 2
+        div + 1 // change to +2 if moving to head compaction on pre-galloc
     }
 }
 
@@ -165,7 +168,10 @@ impl<'txn> Txn<'txn> {
             if let Some(free_pg) = dirty.lalloc.arena.pop_w_resv(arena_reserve) {
                 free_pg
             } else {
-                todo!("encode arena, galloc, and return")
+                self.encode_arena(dirty).await?;
+                dirty.lalloc.arena = self.db.galloc(&mut dirty.fb, INIT_ARENA_SIZE).await?;
+                dirty.lalloc.orig_next = 0;
+                dirty.lalloc.arena.pop().unwrap()
             },
         )
     }
@@ -174,8 +180,43 @@ impl<'txn> Txn<'txn> {
         let to_encode = dirty
             .lalloc
             .pages_to_fl_encode_arena(self.db.meta.page_size());
-        assert!(dirty.lalloc.arena.len - dirty.lalloc.arena.next <= to_encode);
+        assert!(dirty.lalloc.arena.len - dirty.lalloc.arena.next == to_encode);
 
-        todo!("implement")
+        let idxs_per = idxs_per_fl_page(self.db.meta.page_size());
+        let mut root_buf = self.db.fio.read(dirty.fb.front()).await?;
+        let root = from_bytes_mut::<BTreeRootHeader>(root_buf.as_mut());
+
+        // TODO: for simplity not compacting previous head node, consider implementing this later
+
+        let arena = &dirty.lalloc.arena;
+        let mut encode_idx = dirty.lalloc.orig_next;
+        let mut alloc_idx = arena.next;
+
+        let mut next = root.free.get();
+        while encode_idx < arena.next {
+            let mut fl_buf = self.db.fio.get_buf();
+            from_bytes_mut::<FreeListHeader>(fl_buf.as_mut())
+                .next
+                .set(next);
+
+            let mut i = 0;
+            while i < idxs_per && encode_idx < arena.next {
+                write_fl(fl_buf.as_mut(), i, arena.start + encode_idx);
+
+                i += 1;
+                encode_idx += 1;
+            }
+
+            next = arena.start + alloc_idx;
+            alloc_idx += 1;
+            self.db.fio.write(next, fl_buf).await?;
+        }
+
+        root.free.set(next);
+        self.db.fio.write(dirty.fb.back(), root_buf).await?;
+        self.db.fio.commit().await?;
+        dirty.fb.flip();
+
+        Ok(())
     }
 }
