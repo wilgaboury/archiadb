@@ -13,7 +13,7 @@ use crate::{
     galloc::{Galloc, galloc_recover},
     karc::Karc,
     key::{KeyPath, KeyPathBuf},
-    lalloc::Lalloc,
+    lalloc::{Arena, Lalloc},
     lock::{Lock, LockGuard, LockType},
     meta::MetaHandler,
     trie::KeyTrie,
@@ -174,10 +174,10 @@ pub(crate) struct DirtyEntry {
 }
 
 impl DirtyEntry {
-    pub fn new(fb: FrontBack, root: &BTreeRootHeader) -> Self {
+    pub fn new(fb: FrontBack, arena: Arena) -> Self {
         Self {
             fb,
-            lalloc: Lalloc::new(root),
+            lalloc: Lalloc::new(arena),
         }
     }
 }

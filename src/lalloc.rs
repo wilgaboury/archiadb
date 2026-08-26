@@ -86,7 +86,7 @@ impl Arena {
     }
 
     pub(crate) fn pop_w_reserve(&mut self, reserve: PgIdx) -> Option<PgIdx> {
-        if self.len - self.next < reserve {
+        if self.len - self.next > reserve {
             let ret = self.start + self.next;
             self.next += 1;
             Some(ret)
@@ -110,10 +110,11 @@ pub(crate) struct Lalloc {
 }
 
 impl Lalloc {
-    pub(crate) fn new(root: &BTreeRootHeader) -> Self {
+    pub(crate) fn new(arena: Arena) -> Self {
+        let orig_next = arena.next;
         Self {
-            arena: root.arena.to_mem(),
-            orig_next: root.arena.next.get(),
+            arena,
+            orig_next,
 
             clean: None,
             free: Vec::new(),
@@ -188,7 +189,7 @@ pub(crate) async fn lalloc(
         if let Some(free) = dirty.lalloc.pop_arena_with_encode_reserve(fio.page_size()) {
             free
         } else {
-            encode_arena(fio, dirty).await?;
+            encode_arena_and_commit(fio, dirty).await?;
             let next_len = next_arena_len(root.arena.len.get());
             dirty.lalloc.arena = galloc_w_lock(galloc, meta, fio, &mut dirty.fb, next_len).await?;
             dirty.lalloc.orig_next = dirty.lalloc.arena.next;
@@ -249,13 +250,18 @@ pub(crate) async fn load_fl_node(
 }
 
 pub(crate) fn next_arena_len(prev: PgIdx) -> PgIdx {
-    1 << cmp::min(MAX_ARENA_EXP, prev.ilog2() as u64 + 1)
+    if prev < INIT_ARENA_SIZE {
+        INIT_ARENA_SIZE
+    } else {
+        1 << cmp::min(MAX_ARENA_EXP, prev.ilog2() as u64 + 1)
+    }
 }
 
 // for simplity this makes no attempt to compact the previous head node
-pub(crate) async fn encode_arena(fio: &Fio, dirty: &mut DirtyEntry) -> Result<()> {
+pub(crate) async fn encode_arena_and_commit(fio: &Fio, dirty: &mut DirtyEntry) -> Result<()> {
     let to_encode = dirty.lalloc.pages_to_fl_encode_arena(fio.page_size());
-    assert!(dirty.lalloc.arena.len - dirty.lalloc.arena.next == to_encode);
+    let left = dirty.lalloc.arena.len - dirty.lalloc.arena.next;
+    assert!(left == to_encode);
 
     let idxs_per = idxs_per_fl_page(fio.page_size());
     let mut root_buf = fio.read(dirty.fb.front()).await?;
@@ -287,7 +293,8 @@ pub(crate) async fn encode_arena(fio: &Fio, dirty: &mut DirtyEntry) -> Result<()
 
     root.arena.invalidate();
     root.free.set(next);
-    root.version.set(root.version.get() + 1);
+    let version = root.version.get() + 1;
+    root.version.set(version);
     fio.write(dirty.fb.back(), root_buf).await?;
     fio.commit().await?;
     dirty.fb.flip();
@@ -301,13 +308,63 @@ mod tests {
     use anyhow::Result;
     use function_name::named;
 
-    use crate::test::TmpDir;
+    use crate::{
+        btree::BTreeRootHeader,
+        db::DirtyEntry,
+        key_path,
+        lalloc::{Arena, FreeListHeader, INIT_ARENA_SIZE, read_fl},
+        test::TmpDir,
+        util::{FrontBack, from_bytes},
+    };
 
     #[named]
     #[tokio::test]
-    async fn test_encode_arena() -> Result<()> {
+    async fn test_single_encode_arena() -> Result<()> {
         let tmp = TmpDir::new(function_name!())?;
-        let _fio = tmp.fio()?;
+        let db = tmp.db().await?;
+        let fio = &db.inner.fio;
+        let txn = db.txn().write(key_path![])?.begin().await;
+        let mut dirty = DirtyEntry::new(FrontBack::new(2, 3), Arena::new(0, 0));
+        assert_eq!(4, txn.lalloc(&mut dirty).await?);
+
+        {
+            assert_eq!(3, dirty.fb.front());
+            assert_eq!(2, dirty.fb.back());
+        }
+
+        assert_eq!(5, txn.lalloc(&mut dirty).await?);
+        assert_eq!(6, txn.lalloc(&mut dirty).await?);
+        assert_eq!(7, txn.lalloc(&mut dirty).await?);
+        assert_eq!(8, txn.lalloc(&mut dirty).await?);
+        assert_eq!(9, txn.lalloc(&mut dirty).await?);
+        assert_eq!(10, txn.lalloc(&mut dirty).await?);
+
+        let root_buf = fio.read(dirty.fb.front()).await?;
+        let root = from_bytes::<BTreeRootHeader>(root_buf.as_ref());
+        let start_version = root.version.get();
+        assert_eq!(12, txn.lalloc(&mut dirty).await?);
+
+        assert_eq!(3, dirty.fb.front());
+        assert_eq!(2, dirty.fb.back());
+        let root_buf = fio.read(dirty.fb.front()).await?;
+        let root = from_bytes::<BTreeRootHeader>(root_buf.as_ref());
+        assert_eq!(11, root.free.get());
+        assert_eq!(start_version + 2, root.version.get());
+
+        let fl_buf = fio.read(root.free.get()).await?;
+        assert_eq!(0, from_bytes::<FreeListHeader>(fl_buf.as_ref()).next.get());
+        assert_eq!(4, read_fl(fl_buf.as_ref(), 0));
+        assert_eq!(5, read_fl(fl_buf.as_ref(), 1));
+        assert_eq!(6, read_fl(fl_buf.as_ref(), 2));
+        assert_eq!(7, read_fl(fl_buf.as_ref(), 3));
+        assert_eq!(8, read_fl(fl_buf.as_ref(), 4));
+        assert_eq!(9, read_fl(fl_buf.as_ref(), 5));
+        assert_eq!(10, read_fl(fl_buf.as_ref(), 6));
+        assert_eq!(0, read_fl(fl_buf.as_ref(), 7));
+
+        assert_eq!(12, root.arena.start.get());
+        assert_eq!(INIT_ARENA_SIZE * 2, root.arena.len.get());
+        assert_eq!(0, root.arena.next.get());
 
         Ok(())
     }

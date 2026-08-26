@@ -67,6 +67,7 @@ pub(crate) async fn galloc_io_proc(
     btree.arena.next.set(0);
     fio.write(fb.back(), root).await?;
     fio.commit().await?;
+    fb.flip();
 
     meta.mutate_async(&fio, |meta| {
         meta.len.set(flen);
@@ -75,8 +76,6 @@ pub(crate) async fn galloc_io_proc(
         meta.galloc_len.set(0);
     })
     .await?;
-
-    fb.flip();
 
     Ok(Arena::new(start, len))
 }
