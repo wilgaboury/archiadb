@@ -19,7 +19,10 @@ use crate::{
     meta::MetaHandler,
     trie::KeyTrie,
     uint::PgIdx,
-    util::{FrontBack, from_bytes, from_bytes_mut, lca, read_root_w_retry},
+    util::{
+        FrontBack, LockVec, collect_intermediary_decendants, from_bytes, from_bytes_mut, lca,
+        read_root_w_retry,
+    },
 };
 
 #[derive(Debug, Clone)]
@@ -141,11 +144,12 @@ impl<'txn> TxnBuilder<'txn> {
 
     pub async fn begin(self) -> Txn<'txn> {
         let defer_gaurd = self.db.defer.begin();
-        let mut guards = Vec::new();
+        let mut guards = LockVec(Vec::new());
         for (path, lock_type) in self.ops.bfs_iter() {
-            guards.push(self.db.read_locks.get(path).acquire(*lock_type).await);
+            guards
+                .0
+                .push(self.db.read_locks.get(path).acquire(*lock_type).await);
         }
-        guards.reverse();
 
         Txn {
             db: self.db,
@@ -154,8 +158,7 @@ impl<'txn> TxnBuilder<'txn> {
             free: Vec::new(),
             ops: self.ops,
             flux: Flux::new(),
-            writes: KeyTrie::new(),
-            writes2: HashMap::new(),
+            writes: HashMap::new(),
         }
     }
 }
@@ -177,12 +180,11 @@ impl DirtyEntry {
 pub struct Txn<'txn> {
     pub(crate) db: &'txn DbInner,
     pub(crate) defer_gaurd: DeferGaurd<'txn>,
-    pub(crate) guards: Vec<LockGuard>,
+    pub(crate) guards: LockVec<LockGuard>,
     pub(crate) free: Vec<u64>,
     pub(crate) ops: KeyTrie<LockType>,
     pub(crate) flux: Flux,
-    pub(crate) writes: KeyTrie<Option<u64>>,
-    pub(crate) writes2: HashMap<KeyPathBuf, DirtyEntry>,
+    pub(crate) writes: HashMap<KeyPathBuf, DirtyEntry>,
 }
 
 impl<'txn> Txn<'txn> {
@@ -240,15 +242,25 @@ impl<'txn> Txn<'txn> {
     // 3. swap buf root
     // 4. fysnc
     pub async fn commit(&mut self) {
-        let lca = lca(self.writes2.keys().map(|k| k.as_ref()));
-        for (key, _node) in self.ops.dfs_iter_mut() {
-            if key.as_path().starts_with(&lca) {
-                todo!("implement")
-            }
+        // acquire all write locks
+
+        let lca = lca(self.writes.keys().map(|k| k.as_ref()));
+        let mut wlock_keys =
+            collect_intermediary_decendants(lca.as_ref(), self.writes.keys().map(|k| k.as_ref()));
+        wlock_keys.reverse(); // aquired in bottom-up order
+
+        let wlocks: Vec<_> = wlock_keys
+            .into_iter()
+            .map(|k| self.db.write_locks.get(k))
+            .collect();
+        let mut wgaurds = LockVec(Vec::with_capacity(wlocks.len()));
+        for wlock in wlocks.iter() {
+            wgaurds.0.push(wlock.lock().await);
         }
 
-        // TODO: implement
+        // TODO: implement intermediary btree writes
 
+        // free page in-mem bookkeeping
         self.defer_gaurd.flush();
     }
 }

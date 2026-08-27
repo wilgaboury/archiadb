@@ -1,6 +1,7 @@
 use rapidhash::v3::rapidhash_v3;
 use rustix::fs::fstatvfs;
 use std::{
+    collections::HashSet,
     fs::File,
     os::fd::AsFd,
     panic,
@@ -225,6 +226,37 @@ pub(crate) fn lca<'a>(iter: impl IntoIterator<Item = &'a KeyPath>) -> KeyPathBuf
     }
 
     lca
+}
+
+pub(crate) fn collect_intermediary_decendants<'a>(
+    lca: &KeyPath,
+    iter: impl IntoIterator<Item = &'a KeyPath>,
+) -> Vec<KeyPathBuf> {
+    let mut set = HashSet::new();
+    set.insert(lca.to_owned());
+
+    for path in iter {
+        let mut buf = path.to_owned();
+        while buf.as_ref() != lca {
+            set.insert(buf.clone());
+            buf.pop();
+        }
+    }
+
+    let mut ret = set.into_iter().collect::<Vec<_>>();
+    ret.sort();
+    ret
+}
+
+/// because Vec does not provide a garunteed drop order
+pub(crate) struct LockVec<T>(pub(crate) Vec<T>);
+
+impl<T> Drop for LockVec<T> {
+    fn drop(&mut self) {
+        while !self.0.is_empty() {
+            drop(self.0.pop());
+        }
+    }
 }
 
 #[coverage(off)]
