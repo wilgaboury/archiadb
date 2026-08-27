@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, anyhow};
 use bon::bon;
@@ -13,11 +13,13 @@ use crate::{
     galloc::{Galloc, galloc_recover},
     karc::Karc,
     key::{KeyPath, KeyPathBuf},
+    key_path,
     lalloc::{Arena, Lalloc},
     lock::{Lock, LockGuard, LockType},
     meta::MetaHandler,
     trie::KeyTrie,
-    util::{FrontBack, from_bytes_mut, lca},
+    uint::PgIdx,
+    util::{FrontBack, from_bytes, from_bytes_mut, lca, read_root_w_retry},
 };
 
 #[derive(Debug, Clone)]
@@ -93,16 +95,6 @@ impl Db {
         Ok(())
     }
 }
-
-// impl Drop for DbInner {
-//     fn drop(&mut self) {
-//         if let Err(e) = self.meta.try_mutate(self.file.file(), |meta| {
-//             meta.set_open(false);
-//         }) {
-//             eprintln!("Failed to set close flag: {}", e);
-//         }
-//     }
-// }
 
 pub(crate) async fn init_db_root(meta: &MetaHandler, fio: &Fio) -> Result<()> {
     let front_idx = 2;
@@ -194,6 +186,26 @@ pub struct Txn<'txn> {
 }
 
 impl<'txn> Txn<'txn> {
+    pub(crate) async fn create_root_dirty_entry(&self) -> Result<DirtyEntry> {
+        self.create_dirty_entry(key_path![], self.db.meta.root1(), self.db.meta.root2())
+            .await
+    }
+
+    pub(crate) async fn create_dirty_entry(
+        &self,
+        key: &KeyPath,
+        pg_idx_1: PgIdx,
+        pg_idx_2: PgIdx,
+    ) -> Result<DirtyEntry> {
+        let (pg_idx_1, pg1, pg_idx_2, _pg2) =
+            read_root_w_retry(self.db, key, pg_idx_1, pg_idx_2, Duration::from_secs(1)).await?;
+        let root = from_bytes::<BTreeRootHeader>(pg1.as_ref());
+        Ok(DirtyEntry::new(
+            FrontBack::new(pg_idx_1, pg_idx_2),
+            root.arena.to_mem(),
+        ))
+    }
+
     pub async fn read(&self, _path: &KeyPath) -> Result<&[u8]> {
         self.ops
             .validate_read(_path)

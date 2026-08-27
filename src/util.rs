@@ -12,7 +12,7 @@ use anyhow::{Result, anyhow, bail};
 
 use crate::{
     btree::BTreeRootHeader,
-    db::Db,
+    db::DbInner,
     fio::{Fio, PageBuf},
     key::{KeyPath, KeyPathBuf},
     key_path,
@@ -118,7 +118,7 @@ pub(crate) fn btree_header_version(pg: &PageBuf) -> u64 {
 }
 
 pub(crate) async fn read_root_w_retry(
-    db: &Db,
+    db: &DbInner,
     key: &KeyPath,
     pg_idx1: PgIdx,
     pg_idx2: PgIdx,
@@ -126,17 +126,17 @@ pub(crate) async fn read_root_w_retry(
 ) -> Result<(PgIdx, PageBuf, PgIdx, PageBuf)> {
     let start = Instant::now();
     while Instant::now().duration_since(start) < timeout {
-        let pg1 = db.inner.fio.read_unchecked(pg_idx1).await?;
-        let pg2 = db.inner.fio.read_unchecked(pg_idx2).await?;
+        let pg1 = db.fio.read_unchecked(pg_idx1).await?;
+        let pg2 = db.fio.read_unchecked(pg_idx2).await?;
         if let Ok(ret) = order_front_back(pg_idx1, pg1, pg_idx2, pg2, btree_header_version) {
             return Ok(ret);
         }
     }
 
-    let carc = db.inner.write_locks.get(key.to_owned());
+    let carc = db.write_locks.get(key.to_owned());
     let _gaurd = carc.lock().await;
-    let pg1 = db.inner.fio.read_unchecked(pg_idx1).await?;
-    let pg2 = db.inner.fio.read_unchecked(pg_idx2).await?;
+    let pg1 = db.fio.read_unchecked(pg_idx1).await?;
+    let pg2 = db.fio.read_unchecked(pg_idx2).await?;
     order_front_back(pg_idx1, pg1, pg_idx2, pg2, btree_header_version)
 }
 
@@ -345,7 +345,7 @@ mod tests {
         let db2 = db.clone();
         let task: JoinHandle<Result<()>> = tokio::spawn(async move {
             let (pg1, _, pg2, _) =
-                read_root_w_retry(&db2, key_path![], 2, 3, Duration::from_secs(10)).await?;
+                read_root_w_retry(&db2.inner, key_path![], 2, 3, Duration::from_secs(10)).await?;
 
             assert_eq!(pg1, 3);
             assert_eq!(pg2, 2);
@@ -383,7 +383,8 @@ mod tests {
         let task: JoinHandle<Result<anyhow::Result<()>, Elapsed>> =
             spawn(timeout(Duration::from_secs(5), async move {
                 let (pg1, _, pg2, _) =
-                    read_root_w_retry(&db2, key_path![], 2, 3, Duration::from_secs(0)).await?;
+                    read_root_w_retry(&db2.inner, key_path![], 2, 3, Duration::from_secs(0))
+                        .await?;
 
                 assert_eq!(pg1, 2);
                 assert_eq!(pg2, 3);

@@ -39,7 +39,7 @@ impl Defer {
 pub(crate) struct DeferGaurd<'txn> {
     id: DeferId,
     freed: Vec<PgIdx>,
-    defer: &'txn Defer,
+    pub(crate) defer: &'txn Defer,
 }
 
 impl Defer {

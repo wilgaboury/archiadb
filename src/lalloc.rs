@@ -5,7 +5,7 @@ use anyhow::Result;
 use crate::{
     btree::BTreeRootHeader,
     db::{DirtyEntry, Txn},
-    defer::Defer,
+    defer::DeferGaurd,
     fio::Fio,
     galloc::{Galloc, galloc_w_lock},
     key::KeyPathBuf,
@@ -27,21 +27,21 @@ pub(crate) struct FreeListHeader {
     pub(crate) next: PgIdxDisk,
 }
 
-pub(crate) fn read_fl(buf: &[u8], idx: InPgIdx) -> PgIdx {
+pub(crate) fn read_fl_idx(buf: &[u8], idx: InPgIdx) -> PgIdx {
     from_bytes::<PgIdxDisk>(
         &buf[size_of::<FreeListHeader>() + (idx as usize * size_of::<PgIdxDisk>())..],
     )
     .get()
 }
 
-pub(crate) fn write_fl(buf: &mut [u8], idx: InPgIdx, pg_idx: PgIdx) {
+pub(crate) fn write_fl_idx(buf: &mut [u8], idx: InPgIdx, pg_idx: PgIdx) {
     from_bytes_mut::<PgIdxDisk>(
         &mut buf[size_of::<FreeListHeader>() + (idx as usize * size_of::<PgIdxDisk>())..],
     )
     .set(pg_idx)
 }
 
-pub(crate) fn cap_fl(buf: &mut [u8], idx: InPgIdx) {
+pub(crate) fn term_fl(buf: &mut [u8], idx: InPgIdx) {
     let idxs_per = idxs_per_fl_page(buf.len() as u64);
     if idx < idxs_per {
         from_bytes_mut::<PgIdxDisk>(
@@ -106,7 +106,7 @@ pub(crate) struct Lalloc {
 
     clean: Option<PgIdx>, // pointer to unmodified tail of free list
     free: Vec<PgIdx>,     // usable pointers
-    deferred: Vec<PgIdx>, // pgs that fail the deffered set check
+    deferred: Vec<PgIdx>, // freed pgs and ones that fail the deffered set check
 }
 
 impl Lalloc {
@@ -120,11 +120,6 @@ impl Lalloc {
             free: Vec::new(),
             deferred: Vec::new(),
         }
-    }
-
-    pub(crate) fn free(&mut self, txn: &mut Txn, pg_idx: PgIdx) {
-        self.deferred.push(pg_idx);
-        txn.defer_gaurd.free(pg_idx);
     }
 
     pub(crate) fn pages_to_fl_encode_arena(&self, pg_size: PgIdx) -> PgIdx {
@@ -148,24 +143,80 @@ impl Lalloc {
             root.free.get()
         }
     }
+
+    pub(crate) fn pop_deferred_then_free(&mut self) -> Option<PgIdx> {
+        self.deferred.pop().or_else(|| self.free.pop())
+    }
+}
+
+pub(crate) async fn write_fl(
+    galloc: &Galloc,
+    meta: &MetaHandler,
+    fio: &Fio,
+    dirty: &mut DirtyEntry,
+    root: &BTreeRootHeader,
+) -> Result<PgIdx> {
+    // TODO: this function could be more complicated and do proper ordering of deferred/free pg idxs for better effiecency
+
+    let mut next = dirty.lalloc.clean.unwrap_or(0);
+    loop {
+        let maybe_load = dirty.lalloc.pop_deferred_then_free();
+        let mut free_idx = if let Some(v) = maybe_load { v } else { break };
+
+        let n_pg_idx = lalloc_from_dirty_or_arena(galloc, meta, fio, dirty, root).await?;
+        let mut buf = fio.get_buf();
+        from_bytes_mut::<FreeListHeader>(buf.as_mut())
+            .next
+            .set(next);
+
+        let mut i = 0;
+        let idxs_per = idxs_per_fl_page(fio.page_size());
+        while i < idxs_per {
+            write_fl_idx(buf.as_mut(), i, free_idx);
+
+            i += 1;
+            let maybe_load = dirty.lalloc.pop_deferred_then_free();
+            free_idx = if let Some(v) = maybe_load { v } else { break };
+        }
+        if i < idxs_per {
+            term_fl(buf.as_mut(), i);
+        }
+
+        fio.write(n_pg_idx, buf).await?;
+        next = n_pg_idx;
+    }
+
+    Ok(next)
 }
 
 impl<'txn> Txn<'txn> {
-    pub(crate) async fn lalloc(&self, dirty: &mut DirtyEntry) -> Result<PgIdx> {
+    pub(crate) async fn lalloc(&mut self, dirty: &mut DirtyEntry) -> Result<PgIdx> {
         lalloc(
             &self.db.galloc,
-            &self.db.defer,
+            &mut self.defer_gaurd,
             &self.db.meta,
             &self.db.fio,
             dirty,
         )
         .await
     }
+
+    pub(crate) async fn write_fl(&mut self, dirty: &mut DirtyEntry) -> Result<PgIdx> {
+        let root_buf = self.db.fio.read(dirty.fb.front()).await?;
+        let root = from_bytes::<BTreeRootHeader>(root_buf.as_ref());
+
+        write_fl(&self.db.galloc, &self.db.meta, &self.db.fio, dirty, root).await
+    }
+}
+
+pub(crate) fn free_pg(lalloc: &mut Lalloc, defer_gaurd: &mut DeferGaurd, pg_idx: PgIdx) {
+    lalloc.deferred.push(pg_idx);
+    defer_gaurd.free(pg_idx);
 }
 
 pub(crate) async fn lalloc(
     galloc: &Galloc,
-    defer: &Defer,
+    defer_gaurd: &mut DeferGaurd<'_>,
     meta: &MetaHandler,
     fio: &Fio,
     dirty: &mut DirtyEntry,
@@ -181,29 +232,21 @@ pub(crate) async fn lalloc(
         return Ok(dirty.lalloc.arena.pop().unwrap());
     }
 
-    if let Some(free) = find_free_idx_in_fl(defer, fio, root, &mut dirty.lalloc).await? {
+    if let Some(free) =
+        find_free_idx_and_consume_fl(defer_gaurd, fio, root, &mut dirty.lalloc).await?
+    {
         return Ok(free);
     }
 
-    Ok(
-        if let Some(free) = dirty.lalloc.pop_arena_with_encode_reserve(fio.page_size()) {
-            free
-        } else {
-            encode_arena_and_commit(fio, dirty).await?;
-            let next_len = next_arena_len(root.arena.len.get());
-            dirty.lalloc.arena = galloc_w_lock(galloc, meta, fio, &mut dirty.fb, next_len).await?;
-            dirty.lalloc.orig_next = dirty.lalloc.arena.next;
-            dirty.lalloc.arena.pop().unwrap()
-        },
-    )
+    lalloc_from_arena_or_galloc(galloc, meta, fio, dirty, root).await
 }
 
 pub(crate) fn should_init_arena(root: &BTreeRootHeader) -> bool {
     root.free.get() == 0 && root.arena.is_valid()
 }
 
-pub(crate) async fn find_free_idx_in_fl(
-    defer: &Defer,
+pub(crate) async fn find_free_idx_and_consume_fl(
+    defer_gaurd: &mut DeferGaurd<'_>,
     fio: &Fio,
     root: &BTreeRootHeader,
     lalloc: &mut Lalloc,
@@ -218,7 +261,7 @@ pub(crate) async fn find_free_idx_in_fl(
             break;
         }
 
-        clean = load_fl_node(defer, fio, lalloc, clean).await?;
+        clean = load_fl_node(defer_gaurd, fio, lalloc, clean).await?;
         lalloc.clean = Some(clean);
     }
 
@@ -226,27 +269,61 @@ pub(crate) async fn find_free_idx_in_fl(
 }
 
 pub(crate) async fn load_fl_node(
-    defer: &Defer,
+    defer_gaurd: &mut DeferGaurd<'_>,
     fio: &Fio,
     lalloc: &mut Lalloc,
     fl_n_idx: PgIdx,
 ) -> Result<PgIdx> {
     let fl_pg = fio.read(fl_n_idx).await?;
+    free_pg(lalloc, defer_gaurd, fl_n_idx);
+
     let header = from_bytes::<FreeListHeader>(fl_pg.as_ref());
     let idxs_per = idxs_per_fl_page(fio.page_size());
     for i in 0..idxs_per {
-        let free_pg_idx = read_fl(fl_pg.as_ref(), i);
+        let free_pg_idx = read_fl_idx(fl_pg.as_ref(), i);
         if free_pg_idx == 0 {
             break;
         }
 
-        if defer.contains(free_pg_idx) {
+        if defer_gaurd.defer.contains(free_pg_idx) {
             lalloc.deferred.push(free_pg_idx);
         } else {
             lalloc.free.push(free_pg_idx);
         }
     }
     Ok(header.next.get())
+}
+
+pub(crate) async fn lalloc_from_dirty_or_arena(
+    galloc: &Galloc,
+    meta: &MetaHandler,
+    fio: &Fio,
+    dirty: &mut DirtyEntry,
+    root: &BTreeRootHeader,
+) -> Result<PgIdx> {
+    if let Some(free) = dirty.lalloc.free.pop() {
+        Ok(free)
+    } else {
+        lalloc_from_arena_or_galloc(galloc, meta, fio, dirty, root).await
+    }
+}
+
+pub(crate) async fn lalloc_from_arena_or_galloc(
+    galloc: &Galloc,
+    meta: &MetaHandler,
+    fio: &Fio,
+    dirty: &mut DirtyEntry,
+    root: &BTreeRootHeader,
+) -> Result<PgIdx> {
+    if let Some(free) = dirty.lalloc.pop_arena_with_encode_reserve(fio.page_size()) {
+        Ok(free)
+    } else {
+        encode_arena_and_commit(fio, dirty).await?;
+        let next_len = next_arena_len(root.arena.len.get());
+        dirty.lalloc.arena = galloc_w_lock(galloc, meta, fio, &mut dirty.fb, next_len).await?;
+        dirty.lalloc.orig_next = dirty.lalloc.arena.next;
+        Ok(dirty.lalloc.arena.pop().unwrap())
+    }
 }
 
 pub(crate) fn next_arena_len(prev: PgIdx) -> PgIdx {
@@ -280,10 +357,13 @@ pub(crate) async fn encode_arena_and_commit(fio: &Fio, dirty: &mut DirtyEntry) -
 
         let mut i = 0;
         while i < idxs_per && encode_idx < arena.next {
-            write_fl(fl_buf.as_mut(), i, arena.start + encode_idx);
+            write_fl_idx(fl_buf.as_mut(), i, arena.start + encode_idx);
 
             i += 1;
             encode_idx += 1;
+        }
+        if i < idxs_per {
+            term_fl(fl_buf.as_mut(), i);
         }
 
         next = arena.start + alloc_idx;
@@ -310,11 +390,10 @@ mod tests {
 
     use crate::{
         btree::BTreeRootHeader,
-        db::DirtyEntry,
         key_path,
-        lalloc::{Arena, FreeListHeader, INIT_ARENA_SIZE, read_fl},
+        lalloc::{FreeListHeader, INIT_ARENA_SIZE, read_fl_idx},
         test::TmpDir,
-        util::{FrontBack, from_bytes},
+        util::from_bytes,
     };
 
     #[named]
@@ -323,8 +402,8 @@ mod tests {
         let tmp = TmpDir::new(function_name!())?;
         let db = tmp.db().await?;
         let fio = &db.inner.fio;
-        let txn = db.txn().write(key_path![])?.begin().await;
-        let mut dirty = DirtyEntry::new(FrontBack::new(2, 3), Arena::new(0, 0));
+        let mut txn = db.txn().write(key_path![])?.begin().await;
+        let mut dirty = txn.create_root_dirty_entry().await?;
         assert_eq!(4, txn.lalloc(&mut dirty).await?);
 
         {
@@ -352,19 +431,37 @@ mod tests {
         assert_eq!(start_version + 2, root.version.get());
 
         let fl_buf = fio.read(root.free.get()).await?;
+        println!("free node idx: {}", root.free.get());
         assert_eq!(0, from_bytes::<FreeListHeader>(fl_buf.as_ref()).next.get());
-        assert_eq!(4, read_fl(fl_buf.as_ref(), 0));
-        assert_eq!(5, read_fl(fl_buf.as_ref(), 1));
-        assert_eq!(6, read_fl(fl_buf.as_ref(), 2));
-        assert_eq!(7, read_fl(fl_buf.as_ref(), 3));
-        assert_eq!(8, read_fl(fl_buf.as_ref(), 4));
-        assert_eq!(9, read_fl(fl_buf.as_ref(), 5));
-        assert_eq!(10, read_fl(fl_buf.as_ref(), 6));
-        assert_eq!(0, read_fl(fl_buf.as_ref(), 7));
+        assert_eq!(4, read_fl_idx(fl_buf.as_ref(), 0));
+        assert_eq!(5, read_fl_idx(fl_buf.as_ref(), 1));
+        assert_eq!(6, read_fl_idx(fl_buf.as_ref(), 2));
+        assert_eq!(7, read_fl_idx(fl_buf.as_ref(), 3));
+        assert_eq!(8, read_fl_idx(fl_buf.as_ref(), 4));
+        assert_eq!(9, read_fl_idx(fl_buf.as_ref(), 5));
+        assert_eq!(10, read_fl_idx(fl_buf.as_ref(), 6));
+        assert_eq!(0, read_fl_idx(fl_buf.as_ref(), 7)); // relies on fio get_buf test version to actually be useful
 
         assert_eq!(12, root.arena.start.get());
         assert_eq!(INIT_ARENA_SIZE * 2, root.arena.len.get());
         assert_eq!(0, root.arena.next.get());
+
+        Ok(())
+    }
+
+    #[named]
+    #[tokio::test]
+    async fn test_single_write_fl() -> Result<()> {
+        let tmp = TmpDir::new(function_name!())?;
+        let db = tmp.db().await?;
+        let mut txn = db.txn().write(key_path![])?.begin().await;
+        let mut dirty = txn.create_root_dirty_entry().await?;
+
+        txn.lalloc(&mut dirty).await?;
+        txn.lalloc(&mut dirty).await?;
+        txn.write_fl(&mut dirty).await?;
+
+        // TODO: need to actually test resulting behavior
 
         Ok(())
     }

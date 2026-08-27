@@ -386,8 +386,17 @@ impl Fio {
         self.inner.page_size
     }
 
+    #[cfg(not(test))]
     pub fn get_buf(&self) -> PageBuf {
         get_buf(&self.inner)
+    }
+
+    // for messing with tests
+    #[cfg(test)]
+    pub fn get_buf(&self) -> PageBuf {
+        let mut buf = get_buf(&self.inner);
+        buf.as_mut().fill(0xff);
+        buf
     }
 
     pub async fn get_pool_buf(&self) -> PageBuf {
