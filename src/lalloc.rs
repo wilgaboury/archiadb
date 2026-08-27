@@ -391,7 +391,7 @@ mod tests {
     use crate::{
         btree::BTreeRootHeader,
         key_path,
-        lalloc::{FreeListHeader, INIT_ARENA_SIZE, read_fl_idx},
+        lalloc::{FreeListHeader, INIT_ARENA_SIZE, free_pg, read_fl_idx},
         test::TmpDir,
         util::from_bytes,
     };
@@ -431,7 +431,6 @@ mod tests {
         assert_eq!(start_version + 2, root.version.get());
 
         let fl_buf = fio.read(root.free.get()).await?;
-        println!("free node idx: {}", root.free.get());
         assert_eq!(0, from_bytes::<FreeListHeader>(fl_buf.as_ref()).next.get());
         assert_eq!(4, read_fl_idx(fl_buf.as_ref(), 0));
         assert_eq!(5, read_fl_idx(fl_buf.as_ref(), 1));
@@ -451,17 +450,30 @@ mod tests {
 
     #[named]
     #[tokio::test]
-    async fn test_single_write_fl() -> Result<()> {
+    async fn test_single_node_write_fl() -> Result<()> {
         let tmp = TmpDir::new(function_name!())?;
         let db = tmp.db().await?;
+        let fio = &db.inner.fio;
         let mut txn = db.txn().write(key_path![])?.begin().await;
         let mut dirty = txn.create_root_dirty_entry().await?;
 
-        txn.lalloc(&mut dirty).await?;
-        txn.lalloc(&mut dirty).await?;
-        txn.write_fl(&mut dirty).await?;
+        let free = txn.write_fl(&mut dirty).await?;
+        assert_eq!(0, free);
 
-        // TODO: need to actually test resulting behavior
+        assert_eq!(4, txn.lalloc(&mut dirty).await?);
+        assert_eq!(5, txn.lalloc(&mut dirty).await?);
+        free_pg(&mut dirty.lalloc, &mut txn.defer_gaurd, 4);
+        free_pg(&mut dirty.lalloc, &mut txn.defer_gaurd, 5);
+
+        let free = txn.write_fl(&mut dirty).await?;
+        assert_eq!(6, free);
+        fio.commit().await?;
+
+        let fl_buf = fio.read(free).await?;
+        assert_eq!(0, from_bytes::<FreeListHeader>(fl_buf.as_ref()).next.get());
+        assert_eq!(5, read_fl_idx(fl_buf.as_ref(), 0));
+        assert_eq!(4, read_fl_idx(fl_buf.as_ref(), 1));
+        assert_eq!(0, read_fl_idx(fl_buf.as_ref(), 2));
 
         Ok(())
     }
