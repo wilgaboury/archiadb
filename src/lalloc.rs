@@ -122,6 +122,10 @@ impl Lalloc {
         }
     }
 
+    pub(crate) fn add_free(&mut self, pg_idx: PgIdx) {
+        self.free.push(pg_idx);
+    }
+
     pub(crate) fn pages_to_fl_encode_arena(&self, pg_size: PgIdx) -> PgIdx {
         let idxs_per = idxs_per_fl_page(pg_size);
         let idxs = self.arena.len - self.orig_next;

@@ -4,7 +4,7 @@ use anyhow::{Result, bail};
 
 use crate::{
     const_assert,
-    db::Txn,
+    db::{DirtyEntry, Txn},
     fio::MIN_PAGE_SIZE,
     flux::FluxBuf,
     lalloc::Arena,
@@ -687,20 +687,20 @@ enum InsertResult {
 
 impl<'a> Txn<'a> {
     async fn btree_get(&mut self, key: &[u8], node: FluxBuf) -> Result<Option<BtreeGetResult>> {
-        match node.get().header().kind {
+        match node.as_ref().header().kind {
             BTreeNodeKind::Leaf => {
-                let search = search_leaf(node.get(), key);
+                let search = search_leaf(node.as_ref(), key);
                 if let SearchResult::Exact(idx) = search {
-                    let value = get_value_leaf(node.get(), idx);
+                    let value = get_value_leaf(node.as_ref(), idx);
                     Ok(Some(value.with_page(node)))
                 } else {
                     Ok(None)
                 }
             }
             BTreeNodeKind::Root | BTreeNodeKind::Inner => {
-                let search = search_inner(node.get(), key);
-                let child_pg_idx = if node.get().header().len() > 0 {
-                    get_page_ptr(node.get(), search.idx())
+                let search = search_inner(node.as_ref(), key);
+                let child_pg_idx = if node.as_ref().header().len() > 0 {
+                    get_page_ptr(node.as_ref(), search.idx())
                 } else {
                     bail!("empty inner node")
                 };
@@ -710,22 +710,28 @@ impl<'a> Txn<'a> {
         }
     }
 
-    async fn btree_upsert(&mut self, key: &[u8], value: &[u8], root: FluxBuf) -> Result<FluxBuf> {
+    async fn btree_upsert(
+        &mut self,
+        dirty: &mut DirtyEntry,
+        key: &[u8],
+        value: &[u8],
+        root: FluxBuf,
+    ) -> Result<FluxBuf> {
         match self
-            .btree_upsert_inner(key, LeafValue::Value(value), root)
+            .btree_upsert_inner(dirty, key, LeafValue::Value(value), root)
             .await?
         {
             InsertResult::Single(mut page_buf) => {
-                let header = page_buf.get_mut().root_header_mut();
+                let header = page_buf.as_mut().root_header_mut();
                 header.version.set(header.version.get() + 1);
                 Ok(page_buf)
             }
             InsertResult::Split(left, split, right) => {
                 let mut pg_buf = self.flux_buf();
-                let header = pg_buf.get_mut().root_header_mut();
+                let header = pg_buf.as_mut().root_header_mut();
                 header.init();
                 header.version.set(header.version.get() + 1);
-                insert_at_inner(pg_buf.get_mut(), 0, left, &split, right);
+                insert_at_inner(pg_buf.as_mut(), 0, left, &split, right);
 
                 Ok(pg_buf)
             }
@@ -734,45 +740,46 @@ impl<'a> Txn<'a> {
 
     async fn btree_upsert_inner(
         &mut self,
+        dirty: &mut DirtyEntry,
         key: &[u8],
         value: LeafValue<'_>,
         mut pg: FluxBuf,
     ) -> Result<InsertResult> {
-        let header = from_bytes::<BTreeHeader>(pg.get());
+        let header = from_bytes::<BTreeHeader>(pg.as_ref());
         if header.kind == BTreeNodeKind::Leaf {
-            self.btree_upsert_leaf(key, value, pg).await
+            self.btree_upsert_leaf(dirty, key, value, pg).await
         } else {
-            let search = search_inner(pg.get(), key).idx();
-            let child_pg = if pg.get().header().len() > 0 {
-                let child_pg_idx = get_page_ptr(pg.get(), search);
+            let search = search_inner(pg.as_ref(), key).idx();
+            let child_pg = if pg.as_ref().header().len() > 0 {
+                let child_pg_idx = get_page_ptr(pg.as_ref(), search);
                 self.free.push(child_pg_idx);
                 self.flux_read(child_pg_idx).await?
             } else {
                 let mut child_pg = self.flux_buf();
-                child_pg.get_mut().header_mut().init(BTreeNodeKind::Leaf);
+                child_pg.as_mut().header_mut().init(BTreeNodeKind::Leaf);
                 child_pg
             };
-            let insert = Box::pin(self.btree_upsert_inner(key, value, child_pg)).await?;
+            let insert = Box::pin(self.btree_upsert_inner(dirty, key, value, child_pg)).await?;
 
             match insert {
                 InsertResult::Single(child_pg) => {
-                    let child_pg_idx = self.flux_write(child_pg).await?;
+                    let child_pg_idx = self.flux_write(dirty, child_pg).await?;
 
-                    write_page_ptr(pg.get_mut(), search, child_pg_idx);
+                    write_page_ptr(pg.as_mut(), search, child_pg_idx);
                     Ok(InsertResult::Single(pg))
                 }
                 InsertResult::Split(left, split, right) => {
-                    if pg.get().header().kind == BTreeNodeKind::Root {
-                        pg.get_mut().root_to_inner();
+                    if pg.as_ref().header().kind == BTreeNodeKind::Root {
+                        pg.as_mut().root_to_inner();
                     }
 
-                    let can_insert = pg.get().remaining()
+                    let can_insert = pg.as_ref().remaining()
                         > size_of::<PgIdxDisk>() + split.len() + size_of::<SlotDisk>();
                     if can_insert {
-                        insert_at_inner(pg.get_mut(), search, left, &split, right);
+                        insert_at_inner(pg.as_mut(), search, left, &split, right);
                         Ok(InsertResult::Single(pg))
                     } else {
-                        self.btree_split_inner(left, split, right, pg).await
+                        self.btree_split_inner(dirty, left, split, right, pg).await
                     }
                 }
             }
@@ -781,6 +788,7 @@ impl<'a> Txn<'a> {
 
     async fn btree_split_inner(
         &mut self,
+        dirty: &mut DirtyEntry,
         left_idx: u64,
         split: Box<[u8]>,
         right_idx: u64,
@@ -789,43 +797,44 @@ impl<'a> Txn<'a> {
         let mut left = pg;
         let mut right = self.flux_buf();
 
-        right.get_mut().header_mut().init(BTreeNodeKind::Leaf);
+        right.as_mut().header_mut().init(BTreeNodeKind::Leaf);
 
-        let len = left.get().len();
+        let len = left.as_ref().len();
         let start = len / 2;
         for idx in start..len {
-            let key = left.get().get_key_leaf(idx);
-            let value = left.get().get_value_leaf(idx).encode(left.get());
-            insert_at_leaf(right.get_mut(), idx - start, key, &value);
+            let key = left.as_ref().get_key_leaf(idx);
+            let value = left.as_ref().get_value_leaf(idx).encode(left.as_ref());
+            insert_at_leaf(right.as_mut(), idx - start, key, &value);
         }
-        left.get_mut().header_mut().set_len(start as u64);
+        left.as_mut().header_mut().set_len(start as u64);
 
         {
-            let insert = if split.as_ref().cmp(right.get().get_key_inner(0)) == Ordering::Less {
+            let insert = if split.as_ref().cmp(right.as_ref().get_key_inner(0)) == Ordering::Less {
                 &mut left
             } else {
                 &mut right
             };
 
-            let search = search_inner(insert.get(), &split);
+            let search = search_inner(insert.as_ref(), &split);
             match search {
                 SearchResult::Exact(_) => bail!("exact match value should never be promoted"),
                 SearchResult::Insert(idx) => {
-                    insert_at_inner(insert.get_mut(), idx, left_idx, &split, right_idx);
+                    insert_at_inner(insert.as_mut(), idx, left_idx, &split, right_idx);
                 }
             }
         }
 
-        let key = right.get().get_key_leaf(0).to_vec().into_boxed_slice();
+        let key = right.as_ref().get_key_leaf(0).to_vec().into_boxed_slice();
 
-        let ret_left_idx = self.flux_write(left).await?;
-        let ret_right_idx = self.flux_write(right).await?;
+        let ret_left_idx = self.flux_write(dirty, left).await?;
+        let ret_right_idx = self.flux_write(dirty, right).await?;
 
         Ok(InsertResult::Split(ret_left_idx, key, ret_right_idx))
     }
 
     async fn btree_upsert_leaf(
         &mut self,
+        dirty: &mut DirtyEntry,
         key: &[u8],
         value: LeafValue<'_>,
         mut pg: FluxBuf,
@@ -833,49 +842,49 @@ impl<'a> Txn<'a> {
         let encoded_value = value.encode(self).await?;
 
         let can_insert =
-            pg.get().remaining() > key.len() + encoded_value.len() + size_of::<SlotDisk>();
+            pg.as_ref().remaining() > key.len() + encoded_value.len() + size_of::<SlotDisk>();
         if can_insert {
-            let search = search_leaf(pg.get(), key);
+            let search = search_leaf(pg.as_ref(), key);
             if let SearchResult::Exact(idx) = search
-                && pg.get().header().len() > 0
+                && pg.as_ref().header().len() > 0
             {
-                remove_at_leaf(pg.get_mut(), idx);
+                remove_at_leaf(pg.as_mut(), idx);
             }
-            insert_at_leaf(pg.get_mut(), search.idx(), key, &encoded_value);
+            insert_at_leaf(pg.as_mut(), search.idx(), key, &encoded_value);
             Ok(InsertResult::Single(pg))
         } else {
             let mut left = pg;
             let mut right = self.flux_buf();
 
-            right.get_mut().header_mut().init(BTreeNodeKind::Leaf);
+            right.as_mut().header_mut().init(BTreeNodeKind::Leaf);
 
-            let len = left.get().len();
+            let len = left.as_ref().len();
             let start = len / 2;
             for idx in start..len {
-                let key = left.get().get_key_leaf(idx);
-                let value = left.get().get_value_leaf(idx).encode(left.get());
-                insert_at_leaf(right.get_mut(), idx - start, key, &value);
+                let key = left.as_ref().get_key_leaf(idx);
+                let value = left.as_ref().get_value_leaf(idx).encode(left.as_ref());
+                insert_at_leaf(right.as_mut(), idx - start, key, &value);
             }
-            left.get_mut().header_mut().set_len(start as u64);
+            left.as_mut().header_mut().set_len(start as u64);
 
             {
-                let insert = if key.cmp(right.get().get_key_leaf(0)) == Ordering::Less {
+                let insert = if key.cmp(right.as_ref().get_key_leaf(0)) == Ordering::Less {
                     &mut left
                 } else {
                     &mut right
                 };
 
-                let search = search_leaf(insert.get(), key);
+                let search = search_leaf(insert.as_ref(), key);
                 if let SearchResult::Exact(idx) = search {
-                    remove_at_leaf(insert.get_mut(), idx);
+                    remove_at_leaf(insert.as_mut(), idx);
                 }
-                insert_at_leaf(insert.get_mut(), search.idx(), key, &encoded_value);
+                insert_at_leaf(insert.as_mut(), search.idx(), key, &encoded_value);
             }
 
-            let key = right.get().get_key_leaf(0).to_vec().into_boxed_slice();
+            let key = right.as_ref().get_key_leaf(0).to_vec().into_boxed_slice();
 
-            let left_idx = self.flux_write(left).await?;
-            let right_idx = self.flux_write(right).await?;
+            let left_idx = self.flux_write(dirty, left).await?;
+            let right_idx = self.flux_write(dirty, right).await?;
 
             Ok(InsertResult::Split(left_idx, key, right_idx))
         }
@@ -1297,9 +1306,10 @@ mod tests {
         {
             let mut txn = db.txn().write(key_path![])?.begin().await;
             let mut page = txn.flux_buf();
-            page.get_mut().root_header_mut().init();
-            let page = txn.btree_upsert(b"key", b"value", page).await?;
-            let _page = txn.btree_upsert(b"key", b"value", page).await?;
+            page.as_mut().root_header_mut().init();
+            let mut dirty = txn.create_root_dirty_entry().await?;
+            let page = txn.btree_upsert(&mut dirty, b"key", b"value", page).await?;
+            let _page = txn.btree_upsert(&mut dirty, b"key", b"value", page).await?;
         }
 
         Ok(())
