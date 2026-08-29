@@ -20,6 +20,8 @@ type LinkedListLenDisk = PgIdxDisk;
 
 const MAX_KEY_SIZE: usize = 256;
 
+// TODO: this whole file should use platform independant index types
+
 /// Inner node layout:
 /// - header
 /// - slots:[u24; max(0,len-1)], key_len is derivable, pointer to beginning of key
@@ -848,6 +850,9 @@ impl<'a> Txn<'a> {
             if let SearchResult::Exact(idx) = search
                 && pg.as_ref().header().len() > 0
             {
+                // ignoring underflow during upsert because it's less complicated
+
+                // TODO: just straight up leaking lists and trees
                 remove_at_leaf(pg.as_mut(), idx);
             }
             insert_at_leaf(pg.as_mut(), search.idx(), key, &encoded_value);
@@ -876,7 +881,10 @@ impl<'a> Txn<'a> {
 
                 let search = search_leaf(insert.as_ref(), key);
                 if let SearchResult::Exact(idx) = search {
-                    remove_at_leaf(insert.as_mut(), idx);
+                    // ignoring underflow during upsert because it's less complicated
+
+                    // TODO: just straight up leaking lists and trees
+                    self.btree_leaf_remove_at(dirty, insert.as_mut(), idx);
                 }
                 insert_at_leaf(insert.as_mut(), search.idx(), key, &encoded_value);
             }
@@ -888,6 +896,40 @@ impl<'a> Txn<'a> {
 
             Ok(InsertResult::Split(left_idx, key, right_idx))
         }
+    }
+
+    async fn btree_leaf_remove_at(
+        &mut self,
+        dirty: &mut DirtyEntry,
+        buf: &mut [u8],
+        idx: usize,
+    ) -> Result<()> {
+        let value = get_value_leaf(buf, idx);
+        match value {
+            LeafValueGetResult::Btree {
+                pg_idx_1: _,
+                pg_idx_2: _,
+            } => {
+                todo!("this is going to suck to implement")
+            }
+            LeafValueGetResult::ValueEmbedded { loc: _, len: _ } => {
+                // no-op
+            }
+            LeafValueGetResult::ValueLinkedList { mut pg_idx, len } => loop {
+                self.flux_free(dirty, pg_idx);
+
+                if len < self.db.meta.page_size() {
+                    break;
+                }
+
+                let pg = self.db.fio.read(pg_idx).await?;
+                let next_idx =
+                    pg.as_ref().len() - size_of::<PgIdxDisk>() - size_of::<ChecksumDisk>();
+                pg_idx = from_bytes::<PgIdxDisk>(&pg.as_ref()[next_idx..]).get();
+            },
+        }
+        remove_at_leaf(buf, idx);
+        Ok(())
     }
 
     async fn create_value_linked_list(&mut self, value: &[u8]) -> Result<u64> {
@@ -1310,6 +1352,9 @@ mod tests {
             let mut dirty = txn.create_root_dirty_entry().await?;
             let page = txn.btree_upsert(&mut dirty, b"key", b"value", page).await?;
             let _page = txn.btree_upsert(&mut dirty, b"key", b"value", page).await?;
+
+            // TODO: this doesn't work :P
+            // txn.btree_get(b"key", page).await?;
         }
 
         Ok(())

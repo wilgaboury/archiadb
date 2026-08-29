@@ -122,7 +122,7 @@ impl Lalloc {
         }
     }
 
-    pub(crate) fn add_free(&mut self, pg_idx: PgIdx) {
+    pub(crate) fn free_in_mem_page(&mut self, pg_idx: PgIdx) {
         self.free.push(pg_idx);
     }
 
@@ -213,7 +213,7 @@ impl<'txn> Txn<'txn> {
     }
 }
 
-pub(crate) fn free_pg(lalloc: &mut Lalloc, defer_gaurd: &mut DeferGaurd, pg_idx: PgIdx) {
+pub(crate) fn free_on_disk_pg(lalloc: &mut Lalloc, defer_gaurd: &mut DeferGaurd, pg_idx: PgIdx) {
     lalloc.deferred.push(pg_idx);
     defer_gaurd.free(pg_idx);
 }
@@ -280,7 +280,7 @@ pub(crate) async fn load_fl_node(
     fl_n_idx: PgIdx,
 ) -> Result<PgIdx> {
     let fl_pg = fio.read(fl_n_idx).await?;
-    free_pg(lalloc, defer_gaurd, fl_n_idx);
+    free_on_disk_pg(lalloc, defer_gaurd, fl_n_idx);
 
     let header = from_bytes::<FreeListHeader>(fl_pg.as_ref());
     let idxs_per = idxs_per_fl_page(fio.page_size());
@@ -396,7 +396,7 @@ mod tests {
     use crate::{
         btree::BTreeRootHeader,
         key_path,
-        lalloc::{FreeListHeader, INIT_ARENA_SIZE, free_pg, read_fl_idx},
+        lalloc::{FreeListHeader, INIT_ARENA_SIZE, free_on_disk_pg, read_fl_idx},
         test::TmpDir,
         util::from_bytes,
     };
@@ -467,8 +467,8 @@ mod tests {
 
         assert_eq!(4, txn.lalloc(&mut dirty).await?);
         assert_eq!(5, txn.lalloc(&mut dirty).await?);
-        free_pg(&mut dirty.lalloc, &mut txn.defer_gaurd, 4);
-        free_pg(&mut dirty.lalloc, &mut txn.defer_gaurd, 5);
+        free_on_disk_pg(&mut dirty.lalloc, &mut txn.defer_gaurd, 4);
+        free_on_disk_pg(&mut dirty.lalloc, &mut txn.defer_gaurd, 5);
 
         let free = txn.write_fl(&mut dirty).await?;
         assert_eq!(6, free);

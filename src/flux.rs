@@ -5,13 +5,14 @@ use anyhow::Result;
 use crate::{
     db::{DirtyEntry, Txn},
     fio::PageBuf,
+    lalloc::free_on_disk_pg,
     uint::PgIdx,
 };
 
 /// Stores "in-flux" transaction pages in memory. That way non-persisted pages are not
 /// copied on write multiple times.
 pub(crate) struct Flux {
-    map: HashMap<PgIdx, Option<PageBuf>>,
+    pub(crate) map: HashMap<PgIdx, Option<PageBuf>>,
 }
 
 impl Flux {
@@ -52,6 +53,20 @@ impl AsMut<[u8]> for FluxBuf {
     }
 }
 
+impl FluxBuf {
+    fn extract(self) -> (Option<PgIdx>, PageBuf) {
+        match self {
+            FluxBuf::Unalloc(buf) => (None, buf),
+            FluxBuf::Alloc(data) => {
+                let idx = data.idx;
+                let buf = unsafe { ptr::read(&data.buf) };
+                std::mem::forget(data);
+                (Some(idx), buf)
+            }
+        }
+    }
+}
+
 impl<'a> Txn<'a> {
     pub(crate) fn flux_buf(&mut self) -> FluxBuf {
         FluxBuf::Unalloc(self.db.fio.get_buf())
@@ -74,25 +89,21 @@ impl<'a> Txn<'a> {
         dirty: &mut DirtyEntry,
         buf: FluxBuf,
     ) -> Result<PgIdx> {
-        match buf {
-            FluxBuf::Unalloc(buf) => {
-                let idx = self.lalloc(dirty).await?;
-                self.flux.map.insert(idx, Some(buf));
-                Ok(idx)
-            }
-            FluxBuf::Alloc(data) => {
-                let idx = data.idx;
-                let buf = unsafe { ptr::read(&data.buf) };
-                std::mem::forget(data);
-                self.flux.map.insert(idx, Some(buf));
-                Ok(idx)
-            }
-        }
+        let (maybe_idx, buf) = buf.extract();
+        let idx = if let Some(idx) = maybe_idx {
+            idx
+        } else {
+            self.lalloc(dirty).await?
+        };
+        self.flux.map.insert(idx, Some(buf));
+        Ok(idx)
     }
 
     pub(crate) fn flux_free(&mut self, dirty: &mut DirtyEntry, idx: u64) {
         if self.flux.map.remove(&idx).is_some() {
-            dirty.lalloc.add_free(idx);
+            dirty.lalloc.free_in_mem_page(idx);
+        } else {
+            free_on_disk_pg(&mut dirty.lalloc, &mut self.defer_gaurd, idx);
         }
     }
 }

@@ -241,10 +241,14 @@ impl<'txn> Txn<'txn> {
     // 2. fsync
     // 3. swap buf root
     // 4. fysnc
-    pub async fn commit(&mut self) {
-        // acquire all write locks
-
+    pub async fn commit(&mut self) -> Result<()> {
         let lca = lca(self.writes.keys().map(|k| k.as_ref()));
+
+        // TODO: update intermediary roots in btrees (make sure they are in flux)
+
+        self.flux_drain().await?;
+        self.db.fio.commit().await?;
+
         let mut wlock_keys =
             collect_intermediary_decendants(lca.as_ref(), self.writes.keys().map(|k| k.as_ref()));
         wlock_keys.reverse(); // aquired in bottom-up order
@@ -258,10 +262,28 @@ impl<'txn> Txn<'txn> {
             wgaurds.0.push(wlock.lock().await);
         }
 
-        // TODO: implement intermediary btree writes
+        // TODO: implement btree root writes
 
         // free page in-mem bookkeeping
         self.defer_gaurd.flush();
+
+        Ok(())
+    }
+
+    async fn upsert_dirty_entries_to_lca(&mut self, _lca: &KeyPath) -> Result<()> {
+        Ok(())
+    }
+
+    async fn flux_drain(&mut self) -> Result<()> {
+        let mut flux_writes: Vec<_> = Vec::with_capacity(self.flux.map.len());
+        for (idx, buf) in self.flux.map.drain() {
+            let buf = buf.unwrap(); // critical logic failure if any of these are none
+            flux_writes.push(self.db.fio.write(idx, buf));
+        }
+        for flux_write in flux_writes {
+            flux_write.await?;
+        }
+        Ok(())
     }
 }
 
