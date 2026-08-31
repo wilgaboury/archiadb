@@ -24,13 +24,14 @@ parking_lot = "0.12.5"
 tokio = { version = "1", features = ["sync"] }
 thiserror = "2.0.19"
 derive_more = { version = "2.1.1", features = ["full"] }
-# flume = { version = "0.12", default-features = false, features = ["async"] }
 rapidhash = "4.5.1"
 
 [dev-dependencies]
+winit = { version = "0.30", features = ["x11", "wayland"] }
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 rand = "0.8"
+eframe = "0.36.1"
 
 [features]
 manual = []

@@ -851,9 +851,7 @@ impl<'a> Txn<'a> {
                 && pg.as_ref().header().len() > 0
             {
                 // ignoring underflow during upsert because it's less complicated
-
-                // TODO: just straight up leaking lists and trees
-                remove_at_leaf(pg.as_mut(), idx);
+                self.btree_leaf_remove_at(dirty, pg.as_mut(), idx).await?;
             }
             insert_at_leaf(pg.as_mut(), search.idx(), key, &encoded_value);
             Ok(InsertResult::Single(pg))
@@ -882,9 +880,8 @@ impl<'a> Txn<'a> {
                 let search = search_leaf(insert.as_ref(), key);
                 if let SearchResult::Exact(idx) = search {
                     // ignoring underflow during upsert because it's less complicated
-
-                    // TODO: just straight up leaking lists and trees
-                    self.btree_leaf_remove_at(dirty, insert.as_mut(), idx);
+                    self.btree_leaf_remove_at(dirty, insert.as_mut(), idx)
+                        .await?;
                 }
                 insert_at_leaf(insert.as_mut(), search.idx(), key, &encoded_value);
             }
@@ -984,8 +981,11 @@ fn test_access() {
 #[coverage(off)]
 #[cfg(test)]
 mod tests {
-    use anyhow::Result;
+    use std::thread;
+
+    use anyhow::{Result, anyhow};
     use function_name::named;
+    use tokio::runtime::Builder;
 
     use crate::{
         btree::{
@@ -994,6 +994,7 @@ mod tests {
             insert_init_inner, remove_at_leaf,
         },
         db::Db,
+        inspect::{inspect_main, inspect_main_done},
         key_path,
         test::TmpDir,
         util::from_bytes_mut,
@@ -1009,45 +1010,16 @@ mod tests {
 
         insert_init_inner(&mut node, 1);
 
-        // assert_eq!(
-        //     node,
-        //     [
-        //         /* kind */ 1u8, /* len */ 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        //         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        //         0, 0, 0, /* ptr 0 */ 1, 0, 0, 0, 0, 0, 0, 0, /* checksum */ 0, 0, 0, 0,
-        //         0, 0, 0, 0
-        //     ]
-        // );
         assert_eq!(1, get_page_ptr(&node, 0));
 
         insert_at_inner(&mut node, 0, 2, b"a", 3);
 
-        // assert_eq!(
-        //     node,
-        //     [
-        //         /* kind */ 1u8, /* len */ 2, 0, 0, 0, /* slot 0 */ 47, 0, 0, 0, 0,
-        //         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        //         0, /* ptr 1 */ 3, 0, 0, 0, 0, 0, 0, 0, /* key 0 */ b'a',
-        //         /* ptr 0 */ 2, 0, 0, 0, 0, 0, 0, 0, /* checksum */ 0, 0, 0, 0, 0, 0, 0,
-        //         0
-        //     ]
-        // );
         assert_eq!(2, get_page_ptr(&node, 0));
         assert_eq!(b"a", get_key_inner(&node, 0));
         assert_eq!(3, get_page_ptr(&node, 1));
 
         insert_at_inner(&mut node, 0, 4, b"b", 5);
 
-        // assert_eq!(
-        //     node,
-        //     [
-        //         /* kind */ 1u8, /* len */ 3, 0, 0, 0, /* slot 0 */ 47, 0, 0, 0,
-        //         /* slot 1 */ 38, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        //         /* ptr 2 */ 3, 0, 0, 0, 0, 0, 0, 0, /* key 1 */ b'a', /* ptr 1 */ 5,
-        //         0, 0, 0, 0, 0, 0, 0, /* key 0 */ b'b', /* ptr 0 */ 4, 0, 0, 0, 0, 0, 0,
-        //         0, /* checksum */ 0, 0, 0, 0, 0, 0, 0, 0
-        //     ]
-        // );
         assert_eq!(4, node.get_page_ptr(0));
         assert_eq!(b"b", node.get_key_inner(0));
         assert_eq!(5, node.get_page_ptr(1));
@@ -1065,47 +1037,15 @@ mod tests {
 
         insert_init_inner(&mut node, 1);
 
-        // assert_eq!(
-        //     node,
-        //     [
-        //         /* kind */ 1u8, /* len */ 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        //         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        //         0, 0, 0, /* ptr 0 */ 1, 0, 0, 0, 0, 0, 0, 0, /* checksum */ 0, 0, 0, 0,
-        //         0, 0, 0, 0
-        //     ]
-        // );
-
         assert_eq!(1, get_page_ptr(&node, 0));
 
         insert_at_inner(&mut node, 0, 2, b"a", 3);
-
-        // assert_eq!(
-        //     node,
-        //     [
-        //         /* kind */ 1u8, /* len */ 2, 0, 0, 0, /* slot 0 */ 47, 0, 0, 0, 0,
-        //         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        //         0, /* ptr 1 */ 3, 0, 0, 0, 0, 0, 0, 0, /* key 0 */ b'a',
-        //         /* ptr 0 */ 2, 0, 0, 0, 0, 0, 0, 0, /* checksum */ 0, 0, 0, 0, 0, 0, 0,
-        //         0
-        //     ]
-        // );
 
         assert_eq!(2, get_page_ptr(&node, 0));
         assert_eq!(b"a", get_key_inner(&node, 0));
         assert_eq!(3, get_page_ptr(&node, 1));
 
         insert_at_inner(&mut node, 1, 4, b"b", 5);
-
-        // assert_eq!(
-        //     node,
-        //     [
-        //         /* kind */ 1u8, /* len */ 3, 0, 0, 0, /* slot 0 */ 47, 0, 0, 0,
-        //         /* slot 1 */ 38, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        //         /* ptr 2 */ 5, 0, 0, 0, 0, 0, 0, 0, /* key 1 */ b'b', /* ptr 1 */ 4,
-        //         0, 0, 0, 0, 0, 0, 0, /* key 0 */ b'a', /* ptr 0 */ 2, 0, 0, 0, 0, 0, 0,
-        //         0, /* checksum */ 0, 0, 0, 0, 0, 0, 0, 0
-        //     ]
-        // );
 
         assert_eq!(2, get_page_ptr(&node, 0));
         assert_eq!(b"a", get_key_inner(&node, 0));
@@ -1341,21 +1281,37 @@ mod tests {
     }
 
     #[named]
-    #[tokio::test]
-    async fn test_upsert() -> Result<()> {
-        let dir = TmpDir::new(function_name!()).unwrap();
-        let db = Db::builder().path(dir.root().join("file")).build().await?;
-        {
-            let mut txn = db.txn().write(key_path![])?.begin().await;
-            let mut page = txn.flux_buf();
-            page.as_mut().root_header_mut().init();
-            let mut dirty = txn.create_root_dirty_entry().await?;
-            let page = txn.btree_upsert(&mut dirty, b"key", b"value", page).await?;
-            let _page = txn.btree_upsert(&mut dirty, b"key", b"value", page).await?;
+    #[test]
+    fn test_upsert() -> Result<()> {
+        let handle = thread::spawn(move || {
+            let rt = Builder::new_current_thread().enable_all().build().unwrap();
+            let ret = rt.block_on(async {
+                let dir = TmpDir::new(function_name!()).unwrap();
+                let db = Db::builder().path(dir.root().join("file")).build().await?;
+                {
+                    let mut txn = db.txn().write(key_path![])?.begin().await;
+                    let mut page = txn.flux_buf();
+                    page.as_mut().root_header_mut().init();
+                    let mut dirty = txn.create_root_dirty_entry().await?;
+                    let page = txn.btree_upsert(&mut dirty, b"key", b"value", page).await?;
+                    let _page = txn.btree_upsert(&mut dirty, b"key", b"value", page).await?;
 
-            // TODO: this doesn't work :P
-            // txn.btree_get(b"key", page).await?;
-        }
+                    // inspect_page(db.clone(), page.as_ref(), InspectKind::BTree);
+
+                    // TODO: this doesn't work :P
+                    // txn.btree_get(b"key", page).await?;
+                }
+                anyhow::Ok(())
+            });
+            inspect_main_done();
+            ret
+        });
+
+        inspect_main();
+
+        handle
+            .join()
+            .map_err(|e| anyhow!("couldn't join async thread: {:?}", e))??;
 
         Ok(())
     }
