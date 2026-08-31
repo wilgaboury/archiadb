@@ -994,7 +994,7 @@ mod tests {
             insert_init_inner, remove_at_leaf,
         },
         db::Db,
-        inspect::{inspect_main, inspect_main_done},
+        inspect::{InspectKind, inspect_main, inspect_main_done, inspect_page},
         key_path,
         test::TmpDir,
         util::from_bytes_mut,
@@ -1294,7 +1294,7 @@ mod tests {
                     page.as_mut().root_header_mut().init();
                     let mut dirty = txn.create_root_dirty_entry().await?;
                     let page = txn.btree_upsert(&mut dirty, b"key", b"value", page).await?;
-                    let _page = txn.btree_upsert(&mut dirty, b"key", b"value", page).await?;
+                    let page = txn.btree_upsert(&mut dirty, b"key", b"value", page).await?;
 
                     // inspect_page(db.clone(), page.as_ref(), InspectKind::BTree);
 

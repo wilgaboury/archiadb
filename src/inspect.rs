@@ -172,10 +172,13 @@ impl eframe::App for InspectApp {
 
         ui.heading("Debug Data");
         ui.separator();
-        ui.label(format!("{:#?}", self.config.data)); // pretty‑printed debug output
-        ui.separator();
-        if ui.button("Close").clicked() {
-            self.should_close = true;
-        }
+        ui.with_layout(
+            egui::Layout::right_to_left(egui::Align::TOP).with_main_wrap(true),
+            |ui| {
+                for byte in self.config.data.iter() {
+                    ui.label(egui::RichText::new(format!("{:02x}", *byte).as_str()).monospace());
+                }
+            },
+        );
     }
 }
