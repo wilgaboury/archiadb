@@ -170,15 +170,38 @@ impl eframe::App for InspectApp {
             return;
         }
 
-        ui.heading("Debug Data");
-        ui.separator();
-        ui.with_layout(
-            egui::Layout::right_to_left(egui::Align::TOP).with_main_wrap(true),
-            |ui| {
-                for byte in self.config.data.iter() {
-                    ui.label(egui::RichText::new(format!("{:02x}", *byte).as_str()).monospace());
-                }
-            },
-        );
+        egui::Panel::right("right_panel")
+            .resizable(true) // movable vertical separator
+            .min_size(100.0) // minimum width
+            .show(ui, |ui| {
+                ui.heading("Static Section");
+                ui.label("Label A");
+                ui.label("Label B");
+                ui.label("Label C");
+                ui.label("Label D");
+            });
+
+        egui::CentralPanel::default().show(ui, |ui| {
+            ui.heading("Bytes");
+            egui::ScrollArea::vertical()
+                .auto_shrink([false; 2])
+                .show(ui, |ui| {
+                    egui::Frame::default()
+                        .inner_margin(egui::Margin::same(24))
+                        .show(ui, |ui| {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::TOP).with_main_wrap(true),
+                                |ui| {
+                                    for byte in self.config.data.iter() {
+                                        ui.label(
+                                            egui::RichText::new(format!("{:02x}", *byte).as_str())
+                                                .monospace(),
+                                        );
+                                    }
+                                },
+                            );
+                        });
+                });
+        });
     }
 }

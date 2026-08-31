@@ -1296,7 +1296,7 @@ mod tests {
                     let page = txn.btree_upsert(&mut dirty, b"key", b"value", page).await?;
                     let page = txn.btree_upsert(&mut dirty, b"key", b"value", page).await?;
 
-                    // inspect_page(db.clone(), page.as_ref(), InspectKind::BTree);
+                    inspect_page(db.clone(), page.as_ref(), InspectKind::BTree);
 
                     // TODO: this doesn't work :P
                     // txn.btree_get(b"key", page).await?;
