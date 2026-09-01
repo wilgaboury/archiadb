@@ -1,10 +1,22 @@
-use std::{mem::replace, sync::Arc};
+use std::{mem::replace, sync::Arc, thread};
 
-use eframe::{NativeOptions, egui};
+use eframe::{
+    NativeOptions,
+    egui::{self, accesskit::Role::Switch},
+};
 use parking_lot::{Condvar, Mutex};
-use winit::platform::wayland::EventLoopBuilderExtWayland;
+use tokio::task::block_in_place;
+use winit::platform::{wayland::EventLoopBuilderExtWayland, x11::EventLoopBuilderExtX11};
 
 use crate::db::Db;
+
+pub(crate) enum Platform {
+    Main,
+    X11,
+    Wayland,
+}
+
+const DEFAULT_PLATFORM: Platform = Platform::Wayland;
 
 pub(crate) enum InspectState {
     None,
@@ -16,6 +28,7 @@ pub(crate) struct InspectConfig {
     db: Db,
     data: Box<[u8]>,
     kind: InspectKind,
+    platform: Platform,
     wait: InspectWait,
 }
 
@@ -115,7 +128,7 @@ pub(crate) fn inspect_main() {
                     ..Default::default()
                 };
                 options.event_loop_builder = Some(Box::new(|builder| {
-                    builder.with_any_thread(true);
+                    EventLoopBuilderExtWayland::with_any_thread(builder, true);
                 }));
                 let _ = eframe::run_native("Debug UI", options, Box::new(|_cc| Ok(Box::new(app))));
             }
@@ -126,20 +139,60 @@ pub(crate) fn inspect_main() {
     }
 }
 
+pub(crate) fn inspect_launch_thread(config: InspectConfig) {
+    thread::scope(|s| {
+        s.spawn(|| {
+            inspect_launch(config);
+        });
+    });
+}
+
+pub(crate) fn inspect_launch(config: InspectConfig) {
+    let mut options = NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([400.0, 300.0])
+            .with_title("Debug UI"),
+        ..Default::default()
+    };
+    match config.platform {
+        Platform::Main => {
+            // no-op
+        }
+        Platform::X11 => {
+            options.event_loop_builder = Some(Box::new(|builder| {
+                EventLoopBuilderExtX11::with_any_thread(builder, true);
+            }));
+        }
+        Platform::Wayland => {
+            options.event_loop_builder = Some(Box::new(|builder| {
+                EventLoopBuilderExtWayland::with_any_thread(builder, true);
+            }));
+        }
+    }
+    let app = InspectApp {
+        config,
+        should_close: false,
+    };
+    let _ = eframe::run_native("Debug UI", options, Box::new(|_cc| Ok(Box::new(app))));
+}
+
 pub(crate) fn inspect_main_done() {
     INSPECT_CHAN.done();
 }
 
-pub(crate) fn inspect_page(db: Db, data: &[u8], kind: InspectKind) {
+pub(crate) async fn inspect_page(db: Db, data: &[u8], kind: InspectKind) {
     let wait = InspectWait::new();
     let data = data.to_vec().into_boxed_slice();
-    INSPECT_CHAN.publish(InspectConfig {
+    let config = InspectConfig {
         db,
         data,
         kind,
         wait: wait.clone(),
+        platform: DEFAULT_PLATFORM,
+    };
+    block_in_place(|| {
+        inspect_launch_thread(config);
     });
-    wait.wait();
 }
 
 pub(crate) enum InspectKind {
