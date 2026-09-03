@@ -6,6 +6,7 @@ use std::{
     os::fd::AsFd,
     panic,
     path::Path,
+    slice,
     time::{Duration, Instant},
 };
 
@@ -84,6 +85,10 @@ pub(crate) fn from_bytes_mut<T>(buf: &mut [u8]) -> &mut T {
         "buffer misaligned for type"
     );
     unsafe { &mut *(buf.as_mut_ptr() as *mut T) }
+}
+
+pub fn as_bytes<T>(p: &T) -> &[u8] {
+    unsafe { slice::from_raw_parts(p as *const T as *const u8, size_of::<T>()) }
 }
 
 pub(crate) fn order_front_back<V, B: AsRef<[u8]>, F: Fn(&B) -> u64>(

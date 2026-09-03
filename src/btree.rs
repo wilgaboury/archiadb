@@ -219,8 +219,8 @@ impl From<u8> for LeafValueKind {
 
 #[repr(C, packed)]
 pub(crate) struct BTreeHeader {
-    kind: BTreeNodeKind,
-    len: InPgIdxDisk,
+    pub(crate) kind: BTreeNodeKind,
+    pub(crate) len: InPgIdxDisk,
 }
 
 impl BTreeHeader {
@@ -981,11 +981,9 @@ fn test_access() {
 #[coverage(off)]
 #[cfg(test)]
 mod tests {
-    use std::thread;
 
-    use anyhow::{Result, anyhow};
+    use anyhow::Result;
     use function_name::named;
-    use tokio::runtime::Builder;
 
     use crate::{
         btree::{
@@ -994,7 +992,7 @@ mod tests {
             insert_init_inner, remove_at_leaf,
         },
         db::Db,
-        inspect::{InspectKind, inspect_main, inspect_main_done, inspect_page},
+        inspect::{InspectKind, inspect_page},
         key_path,
         test::TmpDir,
         util::from_bytes_mut,
@@ -1281,38 +1279,23 @@ mod tests {
     }
 
     #[named]
-    #[test]
-    fn test_upsert() -> Result<()> {
-        let handle = thread::spawn(move || {
-            let rt = Builder::new_current_thread().enable_all().build().unwrap();
-            let ret = rt.block_on(async {
-                let dir = TmpDir::new(function_name!()).unwrap();
-                let db = Db::builder().path(dir.root().join("file")).build().await?;
-                {
-                    let mut txn = db.txn().write(key_path![])?.begin().await;
-                    let mut page = txn.flux_buf();
-                    page.as_mut().root_header_mut().init();
-                    let mut dirty = txn.create_root_dirty_entry().await?;
-                    let page = txn.btree_upsert(&mut dirty, b"key", b"value", page).await?;
-                    let page = txn.btree_upsert(&mut dirty, b"key", b"value", page).await?;
+    #[tokio::test]
+    async fn test_upsert() -> Result<()> {
+        let dir = TmpDir::new(function_name!()).unwrap();
+        let db = Db::builder().path(dir.root().join("file")).build().await?;
+        {
+            let mut txn = db.txn().write(key_path![])?.begin().await;
+            let mut page = txn.flux_buf();
+            page.as_mut().root_header_mut().init();
+            let mut dirty = txn.create_root_dirty_entry().await?;
+            let page = txn.btree_upsert(&mut dirty, b"key", b"value", page).await?;
+            let page = txn.btree_upsert(&mut dirty, b"key", b"value", page).await?;
 
-                    inspect_page(db.clone(), page.as_ref(), InspectKind::BTree);
+            inspect_page(db.clone(), page.as_ref(), InspectKind::BTree);
 
-                    // TODO: this doesn't work :P
-                    // txn.btree_get(b"key", page).await?;
-                }
-                anyhow::Ok(())
-            });
-            inspect_main_done();
-            ret
-        });
-
-        inspect_main();
-
-        handle
-            .join()
-            .map_err(|e| anyhow!("couldn't join async thread: {:?}", e))??;
-
-        Ok(())
+            // TODO: this doesn't work :P
+            // txn.btree_get(b"key", page).await?;
+        }
+        anyhow::Ok(())
     }
 }
