@@ -13,7 +13,7 @@ use crate::{
 };
 
 type Slot = InPgIdx;
-type SlotDisk = InPgIdxDisk;
+pub(crate) type SlotDisk = InPgIdxDisk;
 
 type LinkedListLen = PgIdx;
 type LinkedListLenDisk = PgIdxDisk;
@@ -541,7 +541,7 @@ fn remove_at_leaf(buf: &mut [u8], idx: usize) {
     }
 }
 
-fn read_slot(buf: &[u8], idx: usize) -> usize {
+pub(crate) fn read_slot(buf: &[u8], idx: usize) -> usize {
     let header = from_bytes::<BTreeHeader>(buf);
     let slots_idx = header.kind.header_size();
     let start = slots_idx + size_of::<SlotDisk>() * idx;

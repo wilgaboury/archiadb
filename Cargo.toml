@@ -32,6 +32,7 @@ tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 rand = "0.8"
 eframe = "0.36.1"
+egui_extras = "0.36.1"
 
 [features]
 manual = []

@@ -1,10 +1,13 @@
-use std::thread;
+use std::{cmp, thread};
 
-use eframe::{NativeOptions, egui};
+use eframe::{
+    NativeOptions,
+    egui::{self, Grid},
+};
 use winit::platform::{wayland::EventLoopBuilderExtWayland, x11::EventLoopBuilderExtX11};
 
 use crate::{
-    btree::{BTreeHeader, BTreeRootHeader},
+    btree::{BTreeHeader, BTreeRootHeader, SlotDisk, read_slot},
     db::Db,
     util::{as_bytes, from_bytes},
 };
@@ -91,15 +94,23 @@ pub(crate) struct PageDisplay {
 pub(crate) struct PageDisplayChunk {
     data: Box<[u8]>,
     name: String,
-    value: String,
+    value: Option<String>,
 }
 
 impl PageDisplayChunk {
-    pub(crate) fn new(data: &[u8], name: &str, value: String) -> Self {
+    pub(crate) fn value(data: &[u8], name: &str, value: String) -> Self {
         Self {
             data: data.to_vec().into_boxed_slice(),
             name: name.to_string(),
-            value,
+            value: Some(value),
+        }
+    }
+
+    pub(crate) fn empty(data: &[u8], name: &str) -> Self {
+        Self {
+            data: data.to_vec().into_boxed_slice(),
+            name: name.to_string(),
+            value: None,
         }
     }
 }
@@ -109,52 +120,60 @@ impl PageDisplay {
         let mut chunks = Vec::new();
         match kind {
             InspectKind::Meta => {
-                chunks.push(PageDisplayChunk {
-                    data: data.to_vec().into_boxed_slice(),
-                    name: "Raw Bytes".to_string(),
-                    value: format!("{:?}", data),
-                });
+                chunks.push(PageDisplayChunk::value(
+                    data,
+                    "Raw Bytes",
+                    format!("{:?}", data),
+                ));
             }
             InspectKind::BTree => {
                 let header = from_bytes::<BTreeHeader>(data);
                 match header.kind() {
                     crate::btree::BTreeNodeKind::Root => {
                         let header = from_bytes::<BTreeRootHeader>(data);
-                        chunks.push(PageDisplayChunk::new(
+                        chunks.push(PageDisplayChunk::value(
                             as_bytes(&header.header.kind),
                             "Kind",
                             format!("{:?}, {}", header.header.kind, header.header.kind as u8),
                         ));
-                        chunks.push(PageDisplayChunk::new(
+                        chunks.push(PageDisplayChunk::value(
                             as_bytes(&header.header.len),
                             "Length",
                             format!("{}", header.header.len.get()),
                         ));
-                        chunks.push(PageDisplayChunk::new(
+                        chunks.push(PageDisplayChunk::value(
                             as_bytes(&header.version),
                             "Version",
                             format!("{}", header.version.get()),
                         ));
-                        chunks.push(PageDisplayChunk::new(
+                        chunks.push(PageDisplayChunk::value(
                             as_bytes(&header.free),
                             "Free",
                             format!("{}", header.free.get()),
                         ));
-                        chunks.push(PageDisplayChunk::new(
+                        chunks.push(PageDisplayChunk::value(
                             as_bytes(&header.arena.start),
                             "Arena Start",
                             format!("{}", header.arena.start.get()),
                         ));
-                        chunks.push(PageDisplayChunk::new(
+                        chunks.push(PageDisplayChunk::value(
                             as_bytes(&header.arena.len),
                             "Arena Length",
                             format!("{}", header.arena.len.get()),
                         ));
-                        chunks.push(PageDisplayChunk::new(
+                        chunks.push(PageDisplayChunk::value(
                             as_bytes(&header.arena.next),
                             "Arena Next",
                             format!("{}", header.arena.next.get()),
                         ));
+                        for i in 0..(cmp::max(1, header.arena.len.get()) - 1) {
+                            let slot_value = read_slot(data, i as usize);
+                            chunks.push(PageDisplayChunk::value(
+                                as_bytes(&SlotDisk::new(slot_value as u64)),
+                                &format!("Slot {}", i),
+                                format!("{}", slot_value),
+                            ));
+                        }
                     }
                     crate::btree::BTreeNodeKind::Inner => todo!(),
                     crate::btree::BTreeNodeKind::Leaf => todo!(),
@@ -191,12 +210,28 @@ impl eframe::App for InspectApp {
             .resizable(true) // movable vertical separator
             .min_size(100.0) // minimum width
             .show(ui, |ui| {
-                for chunk in self.display.chunks.iter() {
-                    ui.group(|ui| {
-                        ui.label(egui::RichText::new(chunk.name.as_str()).strong());
-                        ui.label(egui::RichText::new(chunk.value.as_str()).monospace());
-                    });
-                }
+                Grid::new("chunk_table")
+                    .num_columns(2) // name | value
+                    .striped(true) // optional: alternating row colors
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new("Name").heading());
+                        ui.label(egui::RichText::new("Value").heading());
+                        ui.end_row();
+
+                        for chunk in self.display.chunks.iter() {
+                            // Column 1: chunk name
+                            ui.label(egui::RichText::new(chunk.name.as_str()).strong());
+
+                            // Column 2: chunk value
+                            if let Some(value) = &chunk.value {
+                                ui.label(egui::RichText::new(value.as_str()).monospace());
+                            } else {
+                                ui.label(egui::RichText::new("No value").italics());
+                            }
+
+                            ui.end_row(); // important: marks the end of each row
+                        }
+                    })
             });
 
         egui::CentralPanel::default().show(ui, |ui| {
