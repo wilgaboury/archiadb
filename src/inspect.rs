@@ -1,9 +1,11 @@
-use std::{cmp, thread};
+use std::{cmp, f32::consts::GOLDEN_RATIO, thread};
 
 use eframe::{
     NativeOptions,
-    egui::{self, Grid},
+    egui::{self, Color32},
 };
+use egui_extras::{Column, TableBuilder};
+use palette::{FromColor, IntoColor, LinSrgba, Oklcha, Srgba, WithHue, rgb::PackedAbgr};
 use winit::platform::{wayland::EventLoopBuilderExtWayland, x11::EventLoopBuilderExtX11};
 
 use crate::{
@@ -24,6 +26,20 @@ pub(crate) struct InspectConfig {
     data: Box<[u8]>,
     kind: InspectKind,
     platform: Platform,
+}
+
+pub(crate) fn next_color(prev: u32) -> u32 {
+    let unpacked: Srgba<u8> = PackedAbgr::from(prev).into();
+    let linear: LinSrgba<f32> = unpacked.into_linear();
+    let oklcha: Oklcha = linear.into_color();
+    let ret: Oklcha = oklcha.with_hue(
+        (((oklcha.hue.into_positive_degrees() / 360.0) + (1.0 - (1.0 / GOLDEN_RATIO))) % 1.0)
+            * 360.0,
+    );
+    let linear_back: LinSrgba<f32> = ret.into_color();
+    let srgb_f32: Srgba<f32> = linear_back.into_color();
+    let srgb_u8: Srgba<u8> = Srgba::from_color(srgb_f32).into();
+    PackedAbgr::from(srgb_u8).color
 }
 
 pub(crate) fn inspect_launch_thread(config: InspectConfig) {
@@ -61,6 +77,7 @@ pub(crate) fn inspect_launch(config: InspectConfig) {
         config,
         display,
         should_close: false,
+        sel_chunk_idx: None,
     };
     let _ = eframe::run_native("Debug UI", options, Box::new(|_cc| Ok(Box::new(app))));
 }
@@ -85,6 +102,7 @@ pub(crate) struct InspectApp {
     config: InspectConfig,
     display: PageDisplay,
     should_close: bool,
+    sel_chunk_idx: Option<usize>,
 }
 
 pub(crate) struct PageDisplay {
@@ -186,8 +204,27 @@ impl PageDisplay {
 
 impl InspectApp {
     fn render_bytes(&mut self, ui: &mut egui::Ui) {
-        for byte in self.config.data.iter() {
-            ui.label(egui::RichText::new(format!("{:02x}", *byte).as_str()).monospace());
+        macro_rules! color_from_abgr {
+            ($val:expr) => {
+                egui::Color32::from_rgba_unmultiplied(
+                    ($val & 0xFF) as u8,
+                    (($val >> 8) & 0xFF) as u8,
+                    (($val >> 16) & 0xFF) as u8,
+                    (($val >> 24) & 0xFF) as u8,
+                )
+            };
+        }
+
+        let mut color = 0xFF6E6EFFu32;
+        for chunk in self.display.chunks.iter() {
+            for byte in chunk.data.iter() {
+                ui.label(
+                    egui::RichText::new(format!("{:02x}", *byte).as_str())
+                        .monospace()
+                        .color(color_from_abgr!(color)),
+                );
+            }
+            color = next_color(color);
         }
     }
 }
@@ -207,31 +244,54 @@ impl eframe::App for InspectApp {
         }
 
         egui::Panel::right("right_panel")
-            .resizable(true) // movable vertical separator
-            .min_size(100.0) // minimum width
+            .resizable(true)
+            .min_size(100.0)
             .show(ui, |ui| {
-                Grid::new("chunk_table")
-                    .num_columns(2) // name | value
-                    .striped(true) // optional: alternating row colors
-                    .show(ui, |ui| {
-                        ui.label(egui::RichText::new("Name").heading());
-                        ui.label(egui::RichText::new("Value").heading());
-                        ui.end_row();
-
-                        for chunk in self.display.chunks.iter() {
-                            // Column 1: chunk name
-                            ui.label(egui::RichText::new(chunk.name.as_str()).strong());
-
-                            // Column 2: chunk value
-                            if let Some(value) = &chunk.value {
-                                ui.label(egui::RichText::new(value.as_str()).monospace());
-                            } else {
-                                ui.label(egui::RichText::new("No value").italics());
-                            }
-
-                            ui.end_row(); // important: marks the end of each row
-                        }
+                TableBuilder::new(ui)
+                    .columns(Column::auto(), 2) // two auto-sized columns
+                    .striped(true) // alternating row background (optional)
+                    .header(20.0, |mut header| {
+                        header.col(|ui| {
+                            ui.label(egui::RichText::new("Name").heading());
+                        });
+                        header.col(|ui| {
+                            ui.label(egui::RichText::new("Value").heading());
+                        });
                     })
+                    .body(|mut body| {
+                        for (idx, chunk) in self.display.chunks.iter().enumerate() {
+                            body.row(20.0, |mut row| {
+                                // 1. Add the first column and capture its response
+                                let (_, response) = row.col(|ui| {
+                                    ui.label(egui::RichText::new(chunk.name.as_str()).strong());
+                                });
+
+                                // 2. Update selection state based on hover
+                                //    The response from the first cell represents the whole row's interaction
+                                if response.hovered() {
+                                    self.sel_chunk_idx = Some(idx);
+                                } else if self.sel_chunk_idx == Some(idx) {
+                                    // Only clear if this row was previously selected
+                                    self.sel_chunk_idx = None;
+                                }
+
+                                // 3. Apply selection highlight to the entire row
+                                //    set_selected applies to all cells added after this call
+                                if self.sel_chunk_idx == Some(idx) {
+                                    row.set_selected(true);
+                                }
+
+                                // 4. Add the second column (value)
+                                row.col(|ui| {
+                                    if let Some(value) = &chunk.value {
+                                        ui.label(egui::RichText::new(value.as_str()).monospace());
+                                    } else {
+                                        ui.label(egui::RichText::new("No value").italics());
+                                    }
+                                });
+                            });
+                        }
+                    });
             });
 
         egui::CentralPanel::default().show(ui, |ui| {
@@ -243,7 +303,7 @@ impl eframe::App for InspectApp {
                         .inner_margin(egui::Margin::same(24))
                         .show(ui, |ui| {
                             ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::TOP).with_main_wrap(true),
+                                egui::Layout::left_to_right(egui::Align::TOP).with_main_wrap(true),
                                 |ui| {
                                     self.render_bytes(ui);
                                 },

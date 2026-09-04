@@ -992,7 +992,7 @@ mod tests {
             insert_init_inner, remove_at_leaf,
         },
         db::Db,
-        inspect::{InspectKind, inspect_page},
+        inspect2::{InspectKind, inspect_page},
         key_path,
         test::TmpDir,
         util::from_bytes_mut,
@@ -1279,7 +1279,7 @@ mod tests {
     }
 
     #[named]
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_upsert() -> Result<()> {
         let dir = TmpDir::new(function_name!()).unwrap();
         let db = Db::builder().path(dir.root().join("file")).build().await?;
@@ -1291,7 +1291,7 @@ mod tests {
             let page = txn.btree_upsert(&mut dirty, b"key", b"value", page).await?;
             let page = txn.btree_upsert(&mut dirty, b"key", b"value", page).await?;
 
-            inspect_page(db.clone(), page.as_ref(), InspectKind::BTree);
+            inspect_page(page.as_ref(), InspectKind::BTree);
 
             // TODO: this doesn't work :P
             // txn.btree_get(b"key", page).await?;

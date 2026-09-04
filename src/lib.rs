@@ -23,4 +23,7 @@ pub mod util;
 mod inspect;
 #[coverage(off)]
 #[cfg(test)]
+mod inspect2;
+#[coverage(off)]
+#[cfg(test)]
 mod test;

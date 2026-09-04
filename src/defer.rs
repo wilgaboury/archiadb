@@ -137,7 +137,7 @@ mod tests {
 
         let snap = snapshot(&defer);
 
-        assert_eq!(*snap.get(&g1_id).unwrap(), vec![]);
+        assert_eq!(*snap.get(&g1_id).unwrap(), vec![] as Vec<u64>);
         assert_eq!(*snap.get(&g2_id).unwrap(), vec![1u64]);
 
         drop(g2);
@@ -162,7 +162,7 @@ mod tests {
 
         assert_eq!(*snap.get(&g1_id).unwrap(), vec![1u64]);
         assert!(snap.get(&g2_id).is_none());
-        assert_eq!(*snap.get(&g3_id).unwrap(), vec![]);
+        assert_eq!(*snap.get(&g3_id).unwrap(), vec![] as Vec<u64>);
         assert_eq!(*snap.get(&g4_id).unwrap(), vec![2u64, 3u64]);
 
         drop(g4);

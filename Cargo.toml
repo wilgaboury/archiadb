@@ -33,6 +33,9 @@ futures = "0.3"
 rand = "0.8"
 eframe = "0.36.1"
 egui_extras = "0.36.1"
+palette = "0.7.7"
+dioxus = { version = "0.7", features = ["desktop"] }
+dioxus-desktop = "0.7"
 
 [features]
 manual = []
