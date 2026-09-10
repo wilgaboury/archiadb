@@ -31,11 +31,6 @@ winit = { version = "0.30", features = ["x11", "wayland"] }
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 rand = "0.8"
-eframe = "0.36.1"
-egui_extras = "0.36.1"
-palette = "0.7.7"
-dioxus = { version = "0.7", features = ["desktop"] }
-dioxus-desktop = "0.7"
 
 [features]
 manual = []

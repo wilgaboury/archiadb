@@ -275,8 +275,8 @@ impl<'txn> Txn<'txn> {
     }
 
     async fn flux_drain(&mut self) -> Result<()> {
-        let mut flux_writes: Vec<_> = Vec::with_capacity(self.flux.map.len());
-        for (idx, buf) in self.flux.map.drain() {
+        let mut flux_writes: Vec<_> = Vec::with_capacity(self.flux.inner.map.borrow().len());
+        for (idx, buf) in self.flux.inner.map.borrow_mut().drain() {
             let buf = buf.unwrap(); // critical logic failure if any of these are none
             flux_writes.push(self.db.fio.write(idx, buf));
         }

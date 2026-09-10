@@ -20,10 +20,4 @@ pub mod util;
 
 #[coverage(off)]
 #[cfg(test)]
-mod inspect;
-#[coverage(off)]
-#[cfg(test)]
-mod inspect2;
-#[coverage(off)]
-#[cfg(test)]
 mod test;
