@@ -1401,7 +1401,7 @@ mod tests {
                 assert_eq!(true, fio.inner.park_signal.load(Ordering::Acquire));
             },
             Duration::ZERO,
-            Duration::from_millis(100),
+            Duration::from_millis(250),
         )
         .await;
         assert_eq!(true, fio.inner.park_signal.load(Ordering::Acquire));

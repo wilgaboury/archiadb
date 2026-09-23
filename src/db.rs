@@ -208,6 +208,26 @@ impl<'txn> Txn<'txn> {
         ))
     }
 
+    pub(crate) async fn traverse_to(&self, key: &KeyPath) -> Result<(PgIdx, PgIdx)> {
+        let mut stack = KeyPathBuf::new();
+        let mut cur = key.to_owned();
+        // let target = cur
+        //     .as_path()
+        //     .into_iter()
+        //     .last()
+        //     .ok_or_else(|| anyhow!("cannot read key of length zero"))?
+        //     .to_vec()
+        //     .into_boxed_slice();
+        // cur.pop();
+
+        while cur.len() > 0 && !self.writes.contains_key(cur.as_path()) {
+            stack.push(cur.as_path().into_iter().last().unwrap());
+            cur.pop();
+        }
+
+        todo!()
+    }
+
     pub async fn read(&self, _path: &KeyPath) -> Result<&[u8]> {
         self.ops
             .validate_read(_path)
@@ -216,9 +236,9 @@ impl<'txn> Txn<'txn> {
         todo!()
     }
 
-    pub async fn write(&mut self, _path: &KeyPath, _value: &[u8]) -> Result<()> {
+    pub async fn write(&mut self, path: &KeyPath, _value: &[u8]) -> Result<()> {
         self.ops
-            .validate_write(_path)
+            .validate_write(path)
             .context("write validation failed")?;
 
         todo!()
