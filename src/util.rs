@@ -15,7 +15,7 @@ use anyhow::{Result, anyhow, bail};
 use crate::{
     btree::BTreeRootHeader,
     db::DbInner,
-    fio::{Fio, PageBuf},
+    fio::{BlockIoUring, PageBuf},
     key::{KeyPath, KeyPathBuf},
     key_path,
     uint::{InPgIdx, PgIdx, U64},
@@ -161,7 +161,7 @@ impl FrontBack {
     }
 
     pub(crate) async fn from_roots(
-        fio: &Fio,
+        fio: &BlockIoUring,
         pg_idx_1: PgIdx,
         pg_idx_2: PgIdx,
     ) -> Result<(FrontBack, PageBuf)> {

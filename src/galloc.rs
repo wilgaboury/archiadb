@@ -4,7 +4,7 @@ use tokio::sync::Mutex;
 use crate::{
     btree::BTreeRootHeader,
     db::DbInner,
-    fio::Fio,
+    fio::BlockIoUring,
     lalloc::Arena,
     meta::MetaHandler,
     uint::PgIdx,
@@ -33,7 +33,7 @@ impl DbInner {
 pub(crate) async fn galloc_w_lock(
     lock: &Galloc,
     meta: &MetaHandler,
-    fio: &Fio,
+    fio: &BlockIoUring,
     fb: &mut FrontBack,
     len: PgIdx,
 ) -> Result<Arena> {
@@ -43,7 +43,7 @@ pub(crate) async fn galloc_w_lock(
 
 pub(crate) async fn galloc_io_proc(
     meta: &MetaHandler,
-    fio: &Fio,
+    fio: &BlockIoUring,
     fb: &mut FrontBack,
     len: PgIdx,
 ) -> Result<Arena> {
@@ -80,7 +80,7 @@ pub(crate) async fn galloc_io_proc(
     Ok(Arena::new(start, len))
 }
 
-pub(crate) async fn galloc_recover(meta: &MetaHandler, fio: &Fio) -> Result<()> {
+pub(crate) async fn galloc_recover(meta: &MetaHandler, fio: &BlockIoUring) -> Result<()> {
     let (front_idx, back_idx, alen) = meta
         .access_async(|meta| {
             (

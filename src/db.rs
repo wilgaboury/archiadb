@@ -8,7 +8,7 @@ use crate::{
     btree::BTreeRootHeader,
     defer::{Defer, DeferGaurd},
     file::DbFile,
-    fio::{DEFAULT_CQ_SIZE, DEFAULT_SQ_SIZE, Fio},
+    fio::{BlockIoUring, DEFAULT_CQ_SIZE, DEFAULT_SQ_SIZE},
     flux::Flux,
     galloc::{Galloc, galloc_recover},
     karc::Karc,
@@ -34,7 +34,7 @@ pub struct Db {
 pub(crate) struct DbInner {
     pub(crate) file: Arc<DbFile>,
     pub(crate) meta: MetaHandler,
-    pub(crate) fio: Fio,
+    pub(crate) fio: BlockIoUring,
     pub(crate) galloc: Galloc,
     pub(crate) defer: Defer,
     pub(crate) read_locks: Karc<KeyPathBuf, Lock>,
@@ -53,7 +53,7 @@ impl Db {
     ) -> Result<Self> {
         let file = Arc::new(DbFile::open(path)?);
         let meta = MetaHandler::new(&file.file())?;
-        let fio = Fio::new(
+        let fio = BlockIoUring::new(
             file.clone(),
             meta.page_size(),
             sq,
@@ -99,7 +99,7 @@ impl Db {
     }
 }
 
-pub(crate) async fn init_db_root(meta: &MetaHandler, fio: &Fio) -> Result<()> {
+pub(crate) async fn init_db_root(meta: &MetaHandler, fio: &BlockIoUring) -> Result<()> {
     let front_idx = 2;
     let back_idx = 3;
     fio.alloc(4).await?;

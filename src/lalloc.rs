@@ -6,7 +6,7 @@ use crate::{
     btree::BTreeRootHeader,
     db::{DirtyEntry, Txn},
     defer::DeferGaurd,
-    fio::Fio,
+    fio::BlockIoUring,
     galloc::{Galloc, galloc_w_lock},
     key::KeyPathBuf,
     meta::MetaHandler,
@@ -156,7 +156,7 @@ impl Lalloc {
 pub(crate) async fn write_fl(
     galloc: &Galloc,
     meta: &MetaHandler,
-    fio: &Fio,
+    fio: &BlockIoUring,
     dirty: &mut DirtyEntry,
     root: &BTreeRootHeader,
 ) -> Result<PgIdx> {
@@ -222,7 +222,7 @@ pub(crate) async fn lalloc(
     galloc: &Galloc,
     defer_gaurd: &mut DeferGaurd<'_>,
     meta: &MetaHandler,
-    fio: &Fio,
+    fio: &BlockIoUring,
     dirty: &mut DirtyEntry,
 ) -> Result<PgIdx> {
     let root_buf = fio.read(dirty.fb.front()).await?;
@@ -251,7 +251,7 @@ pub(crate) fn should_init_arena(root: &BTreeRootHeader) -> bool {
 
 pub(crate) async fn find_free_idx_and_consume_fl(
     defer_gaurd: &mut DeferGaurd<'_>,
-    fio: &Fio,
+    fio: &BlockIoUring,
     root: &BTreeRootHeader,
     lalloc: &mut Lalloc,
 ) -> Result<Option<PgIdx>> {
@@ -275,7 +275,7 @@ pub(crate) async fn find_free_idx_and_consume_fl(
 // TODO: need test with long fl to test this
 pub(crate) async fn load_fl_node(
     defer_gaurd: &mut DeferGaurd<'_>,
-    fio: &Fio,
+    fio: &BlockIoUring,
     lalloc: &mut Lalloc,
     fl_n_idx: PgIdx,
 ) -> Result<PgIdx> {
@@ -302,7 +302,7 @@ pub(crate) async fn load_fl_node(
 pub(crate) async fn lalloc_from_dirty_or_arena(
     galloc: &Galloc,
     meta: &MetaHandler,
-    fio: &Fio,
+    fio: &BlockIoUring,
     dirty: &mut DirtyEntry,
     root: &BTreeRootHeader,
 ) -> Result<PgIdx> {
@@ -316,7 +316,7 @@ pub(crate) async fn lalloc_from_dirty_or_arena(
 pub(crate) async fn lalloc_from_arena_or_galloc(
     galloc: &Galloc,
     meta: &MetaHandler,
-    fio: &Fio,
+    fio: &BlockIoUring,
     dirty: &mut DirtyEntry,
     root: &BTreeRootHeader,
 ) -> Result<PgIdx> {
@@ -340,7 +340,10 @@ pub(crate) fn next_arena_len(prev: PgIdx) -> PgIdx {
 }
 
 // for simplity this makes no attempt to compact the previous head node
-pub(crate) async fn encode_arena_and_commit(fio: &Fio, dirty: &mut DirtyEntry) -> Result<()> {
+pub(crate) async fn encode_arena_and_commit(
+    fio: &BlockIoUring,
+    dirty: &mut DirtyEntry,
+) -> Result<()> {
     let to_encode = dirty.lalloc.pages_to_fl_encode_arena(fio.page_size());
     let left = dirty.lalloc.arena.len - dirty.lalloc.arena.next;
     assert!(left == to_encode);

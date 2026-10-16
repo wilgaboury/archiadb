@@ -136,7 +136,7 @@ pub struct IoLoopHandle {
 }
 
 #[derive(Clone, Debug)]
-pub struct Fio {
+pub struct BlockIoUring {
     inner: Arc<Inner>,
     join: Arc<IoLoopHandle>,
 }
@@ -278,7 +278,7 @@ pub(crate) fn get_sys_mem_page_size() -> InPgIdx {
 }
 
 #[bon]
-impl Fio {
+impl BlockIoUring {
     #[builder]
     pub(crate) fn builder(
         file: Arc<DbFile>,
@@ -427,7 +427,7 @@ impl Fio {
 
     pub(crate) async fn read_unchecked(&self, pg_idx: u64) -> Result<PageBuf> {
         struct ReadFuture<'a> {
-            fio: &'a Fio,
+            fio: &'a BlockIoUring,
             idx: u64,
             state: Arc<Mutex<ReadState>>,
         }
@@ -488,7 +488,7 @@ impl Fio {
         buf: PageBuf,
     ) -> impl Future<Output = Result<()>> {
         struct WriteFuture<'a> {
-            fio: &'a Fio,
+            fio: &'a BlockIoUring,
             pg_idx: u64,
             state: Arc<Mutex<WriteState>>,
         }
@@ -542,7 +542,7 @@ impl Fio {
 
     pub(crate) async fn commit(&self) -> Result<()> {
         struct CommitFuture<'a> {
-            fio: &'a Fio,
+            fio: &'a BlockIoUring,
             state: GenericOpStateRef,
         }
 
@@ -583,7 +583,7 @@ impl Fio {
 
     pub async fn commit_flush(&self) -> Result<()> {
         pub struct CommitFuture<'a> {
-            fio: &'a Fio,
+            fio: &'a BlockIoUring,
             state: GenericOpStateRef,
         }
 
@@ -624,7 +624,7 @@ impl Fio {
 
     pub async fn alloc(&self, len: PgIdx) -> Result<()> {
         pub struct AllocFuture<'a> {
-            fio: &'a Fio,
+            fio: &'a BlockIoUring,
             len: u64,
             state: GenericOpStateRef,
         }
@@ -1226,7 +1226,7 @@ mod tests {
         let file = Arc::new(tmp.file()?);
         let meta = tmp.meta()?;
 
-        let fio = Fio::builder()
+        let fio = BlockIoUring::builder()
             .file(file)
             .page_size(meta.page_size())
             .sq(2)
@@ -1280,7 +1280,7 @@ mod tests {
         let file = Arc::new(tmp.file()?);
         let meta = tmp.meta()?;
 
-        let fio = Fio::builder()
+        let fio = BlockIoUring::builder()
             .file(file.clone())
             .page_size(meta.page_size())
             .sq(2)
@@ -1336,7 +1336,7 @@ mod tests {
         let file = Arc::new(tmp.file()?);
         let meta = tmp.meta()?;
 
-        let fio = Fio::builder()
+        let fio = BlockIoUring::builder()
             .file(file.clone())
             .page_size(meta.page_size())
             .sq(2)
@@ -1455,7 +1455,7 @@ mod tests {
         let tmp = TmpDir::new(function_name!())?;
         let file = Arc::new(tmp.file_at(LOC)?);
         let mut rng = thread_rng();
-        let fio = Fio::builder()
+        let fio = BlockIoUring::builder()
             .file(file.clone())
             .page_size(fs_block_size(file.path())?)
             .build()?;

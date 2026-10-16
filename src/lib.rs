@@ -1,6 +1,7 @@
 #![feature(coverage_attribute)]
 #![allow(dead_code)]
 
+pub mod block;
 pub mod btree;
 pub mod db;
 pub mod defer;

@@ -11,7 +11,7 @@ use anyhow::Result;
 use crate::{
     db::Db,
     file::DbFile,
-    fio::Fio,
+    fio::BlockIoUring,
     meta::MetaHandler,
     util::{ChecksumDisk, from_bytes_mut},
 };
@@ -118,14 +118,14 @@ impl TmpDir {
         MetaHandler::new(&file)
     }
 
-    pub fn fio(&self) -> Result<Fio> {
+    pub fn fio(&self) -> Result<BlockIoUring> {
         self.fio_at(DEFAULT_FILE_PATH)
     }
 
-    pub fn fio_at<P: AsRef<Path>>(&self, path: P) -> Result<Fio> {
+    pub fn fio_at<P: AsRef<Path>>(&self, path: P) -> Result<BlockIoUring> {
         let file = self.file_at(path)?;
         let meta = MetaHandler::new(file.file())?;
-        Ok(Fio::builder()
+        Ok(BlockIoUring::builder()
             .file(Arc::new(file))
             .page_size(meta.page_size())
             .sq(2)
@@ -134,15 +134,15 @@ impl TmpDir {
             .build()?)
     }
 
-    pub fn fio_and_meta(&self) -> Result<(Fio, MetaHandler)> {
+    pub fn fio_and_meta(&self) -> Result<(BlockIoUring, MetaHandler)> {
         self.fio_and_meta_at(DEFAULT_FILE_PATH)
     }
 
-    pub fn fio_and_meta_at<P: AsRef<Path>>(&self, path: P) -> Result<(Fio, MetaHandler)> {
+    pub fn fio_and_meta_at<P: AsRef<Path>>(&self, path: P) -> Result<(BlockIoUring, MetaHandler)> {
         let file = self.file_at(path)?;
         let meta = MetaHandler::new(file.file())?;
         Ok((
-            Fio::builder()
+            BlockIoUring::builder()
                 .file(Arc::new(file))
                 .page_size(meta.page_size())
                 .sq(2)

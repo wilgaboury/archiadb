@@ -9,7 +9,7 @@ use tokio::sync::Mutex;
 
 use crate::{
     const_assert,
-    fio::{Fio, MAX_PAGE_SIZE, MIN_PAGE_SIZE, choose_page_size},
+    fio::{BlockIoUring, MAX_PAGE_SIZE, MIN_PAGE_SIZE, choose_page_size},
     uint::{InPgIdxDisk, PgIdx, PgIdxDisk, U16, U64, U128},
     util::{Checksum, from_bytes, from_bytes_mut, order_front_back, update_checksum},
 };
@@ -254,7 +254,7 @@ impl MetaHandler {
         Ok(())
     }
 
-    pub(crate) async fn mutate_async(&self, fio: &Fio, f: impl FnOnce(&mut Meta)) -> Result<()> {
+    pub(crate) async fn mutate_async(&self, fio: &BlockIoUring, f: impl FnOnce(&mut Meta)) -> Result<()> {
         let mut inner_guard = self.inner.lock().await;
         let inner = &mut *inner_guard;
         let len = {

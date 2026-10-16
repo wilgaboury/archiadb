@@ -389,9 +389,10 @@ impl BTreeNodeBuf for [u8] {
 
     fn root_to_inner(&mut self) {
         let slots_start = size_of::<BTreeRootHeader>();
-        let slots_end = slots_start + self.header().len() as usize * size_of::<SlotDisk>();
+        let slots_end = slots_start + self.slots_len() * size_of::<SlotDisk>();
         let dest = size_of::<BTreeHeader>();
         self.copy_within(slots_start..slots_end, dest);
+        self.header_mut().set_kind(BTreeNodeKind::Inner);
     }
 }
 
@@ -578,7 +579,9 @@ fn get_key_inner(buf: &[u8], idx: usize) -> &[u8] {
     let key_len = if idx == 0 {
         (buf.len() - size_of::<PgIdxDisk>() - size_of::<ChecksumDisk>()) - key_idx
     } else {
-        (read_slot(buf, idx - 1) - size_of::<PgIdxDisk>()) - key_idx
+        let _test = read_slot(buf, idx - 1);
+        let test2 = (read_slot(buf, idx - 1) - size_of::<PgIdxDisk>()) - key_idx;
+        test2
     } as usize;
     &buf[key_idx..(key_idx + key_len)]
 }
@@ -789,16 +792,15 @@ impl<'a> Txn<'a> {
                     Ok(InsertResult::Single(pg))
                 }
                 InsertResult::Split(left, split, right) => {
-                    if pg.as_ref().header().kind == BTreeNodeKind::Root {
-                        pg.as_mut().root_to_inner();
-                    }
-
                     let can_insert = pg.as_ref().remaining()
                         > size_of::<PgIdxDisk>() + split.len() + size_of::<SlotDisk>();
                     if can_insert {
                         insert_at_inner(pg.as_mut(), search, left, &split, right);
                         Ok(InsertResult::Single(pg))
                     } else {
+                        if pg.as_ref().header().kind == BTreeNodeKind::Root {
+                            pg.as_mut().root_to_inner();
+                        }
                         self.btree_split_inner(dirty, left, split, right, pg).await
                     }
                 }
@@ -817,16 +819,18 @@ impl<'a> Txn<'a> {
         let mut left = pg;
         let mut right = self.flux_buf();
 
-        right.as_mut().header_mut().init(BTreeNodeKind::Leaf);
+        right.as_mut().header_mut().init(BTreeNodeKind::Inner);
 
-        let len = left.as_ref().len();
-        let start = len / 2;
-        for idx in start..len {
-            let key = left.as_ref().get_key_leaf(idx);
-            let value = left.as_ref().get_value_leaf(idx).encode(left.as_ref());
-            insert_at_leaf(right.as_mut(), idx - start, key, &value);
+        let len = left.as_ref().header().len() as usize; // children
+        let mid = len / 2;
+        // move slots [mid .. len-1] and their [ptr|key] blobs to right
+        for idx in mid..len {
+            let key = left.as_ref().get_key_inner(idx);
+            let left_ptr = left.as_ref().get_page_ptr(idx);
+            let right_ptr = left.as_ref().get_page_ptr(idx + 1);
+            insert_at_inner(right.as_mut(), idx - mid, left_ptr, key, right_ptr);
         }
-        left.as_mut().header_mut().set_len(start as u64);
+        left.as_mut().header_mut().set_len(mid as u64);
 
         {
             let insert = if split.as_ref().cmp(right.as_ref().get_key_inner(0)) == Ordering::Less {
@@ -879,7 +883,7 @@ impl<'a> Txn<'a> {
 
             right.as_mut().header_mut().init(BTreeNodeKind::Leaf);
 
-            let len = left.as_ref().len();
+            let len = left.as_ref().header().len() as usize;
             let start = len / 2;
             for idx in start..len {
                 let key = left.as_ref().get_key_leaf(idx);
@@ -1002,13 +1006,14 @@ mod tests {
 
     use anyhow::Result;
     use function_name::named;
+    use rand::{SeedableRng, rngs::StdRng};
 
     use crate::{
         btree::{
             BTreeHeader, BTreeNodeBuf, BTreeNodeKind, BTreeRootHeader, BtreeGetResult,
-            LeafValueEncoded, LeafValueGetResult, SearchResult, get_key_inner, get_key_leaf,
-            get_page_ptr, get_value_leaf, insert_at_inner, insert_at_leaf, insert_init_inner,
-            remove_at_leaf, search_leaf,
+            LeafValueEncoded, LeafValueGetResult, SearchResult, SlotDisk, get_key_inner,
+            get_key_leaf, get_page_ptr, get_value_leaf, insert_at_inner, insert_at_leaf,
+            insert_init_inner, remove_at_leaf, search_leaf,
         },
         db::Db,
         key_path,
@@ -1395,6 +1400,63 @@ mod tests {
                     assert_eq!(&buf.as_ref()[loc..loc + len], b"value3")
                 }
                 _ => panic!("expected embedded value"),
+            }
+        }
+        anyhow::Ok(())
+    }
+
+    #[named]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_upsert_many_rand() -> Result<()> {
+        use rand::{Rng, distributions::Alphanumeric};
+        use std::collections::HashMap;
+
+        let dir = TmpDir::new(function_name!()).unwrap();
+        let db = Db::builder().path(dir.root().join("file")).build().await?;
+        {
+            let mut txn = db.txn().write(key_path![])?.begin().await;
+            let mut page = txn.flux_buf();
+            page.as_mut().root_header_mut().init();
+            let mut dirty = txn.create_root_dirty_entry().await?;
+
+            let mut rng = StdRng::seed_from_u64(111);
+            let mut expected: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+
+            for _i in 0..10_000 {
+                let klen = rng.gen_range(1..=16);
+                let vlen = rng.gen_range(1..=16);
+                let key: Vec<u8> = (0..klen).map(|_| rng.sample(Alphanumeric)).collect();
+                let value: Vec<u8> = (0..vlen).map(|_| rng.sample(Alphanumeric)).collect();
+
+                page = txn.btree_upsert(&mut dirty, &key, &value, page).await?;
+
+                let res = txn.btree_get(&key, &page).await?;
+                if res.is_none() {
+                    println!("key not found: {:?}", key);
+                }
+                match res.unwrap() {
+                    BtreeGetResult::ValueEmbedded { buf, loc, len } => {
+                        assert_eq!(&buf.as_ref()[loc..loc + len], &value)
+                    }
+                    _ => panic!("expected embedded value"),
+                }
+
+                expected.insert(key, value);
+            }
+
+            for (key, value) in expected.iter() {
+                let res = txn.btree_get(key, &page).await?;
+                match res.unwrap() {
+                    BtreeGetResult::ValueEmbedded { buf, loc, len } => {
+                        assert_eq!(
+                            &buf.as_ref()[loc..loc + len],
+                            value.as_slice(),
+                            "mismatch for key {:?}",
+                            key
+                        );
+                    }
+                    _ => panic!("expected embedded value for key {:?}", key),
+                }
             }
         }
         anyhow::Ok(())
