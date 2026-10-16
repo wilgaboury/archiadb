@@ -9,6 +9,7 @@ use std::{
 use anyhow::Result;
 
 use crate::{
+    block::{BlockIoCheckedRapidHash, BlockIoDefault},
     db::Db,
     file::DbFile,
     fio::BlockIoUring,
@@ -118,30 +119,14 @@ impl TmpDir {
         MetaHandler::new(&file)
     }
 
-    pub fn fio(&self) -> Result<BlockIoUring> {
+    pub fn fio(&self) -> Result<BlockIoDefault> {
         self.fio_at(DEFAULT_FILE_PATH)
     }
 
-    pub fn fio_at<P: AsRef<Path>>(&self, path: P) -> Result<BlockIoUring> {
+    pub fn fio_at<P: AsRef<Path>>(&self, path: P) -> Result<BlockIoDefault> {
         let file = self.file_at(path)?;
         let meta = MetaHandler::new(file.file())?;
-        Ok(BlockIoUring::builder()
-            .file(Arc::new(file))
-            .page_size(meta.page_size())
-            .sq(2)
-            .cq(4)
-            .page_buf_pool(2)
-            .build()?)
-    }
-
-    pub fn fio_and_meta(&self) -> Result<(BlockIoUring, MetaHandler)> {
-        self.fio_and_meta_at(DEFAULT_FILE_PATH)
-    }
-
-    pub fn fio_and_meta_at<P: AsRef<Path>>(&self, path: P) -> Result<(BlockIoUring, MetaHandler)> {
-        let file = self.file_at(path)?;
-        let meta = MetaHandler::new(file.file())?;
-        Ok((
+        Ok(BlockIoCheckedRapidHash::new(
             BlockIoUring::builder()
                 .file(Arc::new(file))
                 .page_size(meta.page_size())
@@ -149,6 +134,29 @@ impl TmpDir {
                 .cq(4)
                 .page_buf_pool(2)
                 .build()?,
+        ))
+    }
+
+    pub fn fio_and_meta(&self) -> Result<(BlockIoDefault, MetaHandler)> {
+        self.bio_and_meta_at(DEFAULT_FILE_PATH)
+    }
+
+    pub fn bio_and_meta_at<P: AsRef<Path>>(
+        &self,
+        path: P,
+    ) -> Result<(BlockIoDefault, MetaHandler)> {
+        let file = self.file_at(path)?;
+        let meta = MetaHandler::new(file.file())?;
+        Ok((
+            BlockIoCheckedRapidHash::new(
+                BlockIoUring::builder()
+                    .file(Arc::new(file))
+                    .page_size(meta.page_size())
+                    .sq(2)
+                    .cq(4)
+                    .page_buf_pool(2)
+                    .build()?,
+            ),
             meta,
         ))
     }

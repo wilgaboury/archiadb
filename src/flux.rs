@@ -3,6 +3,7 @@ use std::{cell::RefCell, collections::HashMap, ptr, rc::Rc};
 use anyhow::Result;
 
 use crate::{
+    block::BlockIo,
     db::{DirtyEntry, Txn},
     fio::PageBuf,
     lalloc::free_on_disk_pg,
@@ -77,7 +78,7 @@ impl FluxBuf {
 
 impl<'a> Txn<'a> {
     pub(crate) fn flux_buf(&mut self) -> FluxBuf {
-        FluxBuf::Unalloc(self.db.fio.get_buf())
+        FluxBuf::Unalloc(self.db.fio.buf())
     }
 
     pub(crate) async fn flux_read(&mut self, pg_idx: u64) -> Result<FluxBuf> {

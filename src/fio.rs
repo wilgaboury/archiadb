@@ -34,9 +34,10 @@ use rustix::fs::fstatvfs;
 use thiserror::Error;
 
 use crate::{
+    block::BlockIo,
     file::DbFile,
     uint::{InPgIdx, PgIdx},
-    util::{catch_unwind_anyhow, fs_block_size, has_valid_checksum, update_checksum},
+    util::{catch_unwind_anyhow, fs_block_size},
 };
 
 pub const MIN_PAGE_SIZE: u64 = 4096; // smallest supported page size and most common filesystem block size
@@ -64,9 +65,8 @@ enum FioOp {
     Read(ReadData),
     ReadFinish(Waker),
     Write(WriteData),
-    Commit(CommitData),
-    CommitFlush(CommitData),
-    CommitBatch,
+    Sync(CommitData),
+    SyncBatch,
     Alloc(AllocData),
 }
 
@@ -378,54 +378,40 @@ impl BlockIoUring {
         })
     }
 
-    pub fn file(&self) -> &Arc<DbFile> {
+    fn file(&self) -> &Arc<DbFile> {
         &self.inner.file
     }
 
-    pub fn page_size(&self) -> InPgIdx {
-        self.inner.page_size
-    }
-
-    #[cfg(not(test))]
-    pub fn get_buf(&self) -> PageBuf {
-        get_buf(&self.inner)
-    }
-
-    // for messing with tests
-    #[cfg(test)]
-    pub fn get_buf(&self) -> PageBuf {
-        let mut buf = get_buf(&self.inner);
-        buf.as_mut().fill(0xff);
-        buf
-    }
-
-    pub async fn get_pool_buf(&self) -> PageBuf {
-        let idx = self.inner.free_bufs.pop().unwrap();
-        PageBuf::Pool(PoolBuf {
-            idx,
-            fio: self.inner.clone(),
-        })
-    }
-
-    pub fn get_dyn_buf(&self) -> PageBuf {
+    fn get_dyn_buf(&self) -> PageBuf {
         get_dyn_buf(&self.inner)
     }
 
     fn join(&self) -> &JoinHandle<()> {
         self.join.as_ref().join.as_ref().unwrap()
     }
+}
 
-    pub(crate) async fn read(&self, pg_idx: u64) -> std::result::Result<PageBuf, ReadError> {
-        let pg = self.read_unchecked(pg_idx).await?;
+impl BlockIo for BlockIoUring {
+    type Buf = PageBuf;
 
-        if !has_valid_checksum(pg.as_ref()) {
-            return Err(ReadError::BadChecksum);
-        }
-
-        std::result::Result::Ok(pg)
+    fn page_size(&self) -> InPgIdx {
+        self.inner.page_size
     }
 
-    pub(crate) async fn read_unchecked(&self, pg_idx: u64) -> Result<PageBuf> {
+    #[cfg(not(test))]
+    fn buf(&self) -> PageBuf {
+        buf_helper(&self.inner)
+    }
+
+    // for messing with tests
+    #[cfg(test)]
+    fn buf(&self) -> PageBuf {
+        let mut buf = buf_helper(&self.inner);
+        buf.as_mut().fill(0xff);
+        buf
+    }
+
+    async fn read(&self, pg_idx: u64) -> Result<PageBuf> {
         struct ReadFuture<'a> {
             fio: &'a BlockIoUring,
             idx: u64,
@@ -443,7 +429,7 @@ impl BlockIoUring {
                         let op = FioOp::Read(ReadData {
                             pgidx: self.idx,
                             waker: cx.waker().clone(),
-                            buf: self.fio.get_buf(),
+                            buf: self.fio.buf(),
                             state: self.state.clone(),
                         });
                         self.fio.inner.queue.push(op);
@@ -477,16 +463,7 @@ impl BlockIoUring {
         .await
     }
 
-    pub(crate) fn write(&self, pg_idx: u64, mut buf: PageBuf) -> impl Future<Output = Result<()>> {
-        update_checksum(buf.as_mut());
-        self.write_unchecked(pg_idx, buf)
-    }
-
-    pub(crate) fn write_unchecked(
-        &self,
-        pg_idx: u64,
-        buf: PageBuf,
-    ) -> impl Future<Output = Result<()>> {
+    fn write(&self, pg_idx: u64, buf: PageBuf) -> impl Future<Output = Result<()>> {
         struct WriteFuture<'a> {
             fio: &'a BlockIoUring,
             pg_idx: u64,
@@ -540,89 +517,7 @@ impl BlockIoUring {
         }
     }
 
-    pub(crate) async fn commit(&self) -> Result<()> {
-        struct CommitFuture<'a> {
-            fio: &'a BlockIoUring,
-            state: GenericOpStateRef,
-        }
-
-        impl<'a> Future for CommitFuture<'a> {
-            type Output = Result<()>;
-
-            fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
-                let state = self.state.get().load(Ordering::Acquire).try_into().unwrap();
-                match state {
-                    GenericOpState::Init => {
-                        self.state
-                            .get()
-                            .store(GenericOpState::Pending as u32, Ordering::Release);
-
-                        let op = FioOp::Commit(CommitData {
-                            state: self.state.clone(),
-                            waker: cx.waker().clone(),
-                        });
-                        self.fio.inner.queue.push(op);
-                        self.fio.join().thread().unpark();
-                        Poll::Pending
-                    }
-                    GenericOpState::Pending => Poll::Pending,
-                    GenericOpState::Ready => Poll::Ready(Ok(())),
-                    GenericOpState::Err => {
-                        Poll::Ready(Err(anyhow!("Failed to perform disk commit")))
-                    }
-                }
-            }
-        }
-
-        CommitFuture {
-            fio: self,
-            state: get_generic_op_state(&self.inner),
-        }
-        .await
-    }
-
-    pub async fn commit_flush(&self) -> Result<()> {
-        pub struct CommitFuture<'a> {
-            fio: &'a BlockIoUring,
-            state: GenericOpStateRef,
-        }
-
-        impl<'a> Future for CommitFuture<'a> {
-            type Output = Result<()>;
-
-            fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
-                let state = self.state.get().load(Ordering::Acquire).try_into().unwrap();
-                match state {
-                    GenericOpState::Init => {
-                        self.state
-                            .get()
-                            .store(GenericOpState::Pending as u32, Ordering::Release);
-
-                        let op = FioOp::CommitFlush(CommitData {
-                            state: self.state.clone(),
-                            waker: cx.waker().clone(),
-                        });
-                        self.fio.inner.queue.push(op);
-                        self.fio.join().thread().unpark();
-                        Poll::Pending
-                    }
-                    GenericOpState::Pending => Poll::Pending,
-                    GenericOpState::Ready => Poll::Ready(Ok(())),
-                    GenericOpState::Err => {
-                        Poll::Ready(Err(anyhow!("Failed to perform disk commit")))
-                    }
-                }
-            }
-        }
-
-        CommitFuture {
-            fio: self,
-            state: get_generic_op_state(&self.inner),
-        }
-        .await
-    }
-
-    pub async fn alloc(&self, len: PgIdx) -> Result<()> {
+    async fn alloc(&self, len: PgIdx) -> Result<()> {
         pub struct AllocFuture<'a> {
             fio: &'a BlockIoUring,
             len: u64,
@@ -665,9 +560,50 @@ impl BlockIoUring {
         }
         .await
     }
+
+    async fn sync(&self) -> Result<()> {
+        struct SyncFuture<'a> {
+            fio: &'a BlockIoUring,
+            state: GenericOpStateRef,
+        }
+
+        impl<'a> Future for SyncFuture<'a> {
+            type Output = Result<()>;
+
+            fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
+                let state = self.state.get().load(Ordering::Acquire).try_into().unwrap();
+                match state {
+                    GenericOpState::Init => {
+                        self.state
+                            .get()
+                            .store(GenericOpState::Pending as u32, Ordering::Release);
+
+                        let op = FioOp::Sync(CommitData {
+                            state: self.state.clone(),
+                            waker: cx.waker().clone(),
+                        });
+                        self.fio.inner.queue.push(op);
+                        self.fio.join().thread().unpark();
+                        Poll::Pending
+                    }
+                    GenericOpState::Pending => Poll::Pending,
+                    GenericOpState::Ready => Poll::Ready(Ok(())),
+                    GenericOpState::Err => {
+                        Poll::Ready(Err(anyhow!("Failed to perform disk commit")))
+                    }
+                }
+            }
+        }
+
+        SyncFuture {
+            fio: self,
+            state: get_generic_op_state(&self.inner),
+        }
+        .await
+    }
 }
 
-fn get_buf(inner: &Arc<Inner>) -> PageBuf {
+fn buf_helper(inner: &Arc<Inner>) -> PageBuf {
     inner
         .free_bufs
         .pop()
@@ -807,14 +743,13 @@ impl IoLoop {
                     waker.wake();
                 }
             }
-            FioOp::Commit(CommitData { waker, state, .. })
-            | FioOp::CommitFlush(CommitData { waker, state, .. }) => {
+            FioOp::Sync(CommitData { waker, state, .. }) => {
                 state
                     .get()
                     .store(GenericOpState::Err as u32, Ordering::Release);
                 waker.wake();
             }
-            FioOp::CommitBatch => {
+            FioOp::SyncBatch => {
                 for CommitData { waker, state, .. } in self.fsync_front.drain(..) {
                     state
                         .get()
@@ -1015,30 +950,14 @@ impl IoLoop {
                         }
                         self.ops[id] = Some(FioOp::Write(data));
                     }
-                    FioOp::Commit(data) => {
+                    FioOp::Sync(data) => {
                         if self.fsync_front.is_empty() && self.fsync_back.is_empty() {
                             submitted += 1;
                         }
                         self.fsync_back.push(data);
                     }
-                    FioOp::CommitFlush(data) => {
-                        submitted += 1;
-
-                        let id = ids.pop_front().unwrap();
-                        let fsync = io_uring::opcode::Fsync::new(io_uring::types::Fd(self.fd))
-                            .build()
-                            .user_data(id as u64)
-                            .flags(io_uring::squeue::Flags::IO_DRAIN); // wait for all pending operations
-                        unsafe {
-                            self.ring
-                                .submission()
-                                .push(&fsync)
-                                .context("Failed to push fsync entry onto submission queue")?;
-                        }
-                        self.ops[id] = Some(FioOp::Commit(data));
-                    }
-                    FioOp::CommitBatch => {
-                        eprintln!("CommitBatch should never be submitted to queue directly");
+                    FioOp::SyncBatch => {
+                        eprintln!("SyncBatch should never be submitted to queue directly");
                     }
                     FioOp::Alloc(data) => {
                         submitted += 1;
@@ -1074,7 +993,7 @@ impl IoLoop {
                         .push(&fsync)
                         .context("Failed to push fsync entry onto submission queue")?;
                 }
-                self.ops[id] = Some(FioOp::CommitBatch);
+                self.ops[id] = Some(FioOp::SyncBatch);
             }
 
             if !self.ring.submission().is_empty() {
@@ -1113,21 +1032,10 @@ impl IoLoop {
                             }
                         }
                     }
-                    FioOp::Commit(CommitData { state, waker })
-                    | FioOp::CommitFlush(CommitData { state, waker }) => {
-                        if cqe_res >= 0 {
-                            state
-                                .get()
-                                .store(GenericOpState::Ready as u32, Ordering::Release);
-                        } else {
-                            eprintln!("Commit failed with error: {}", cqe_res);
-                            state
-                                .get()
-                                .store(GenericOpState::Err as u32, Ordering::Release);
-                        }
-                        waker.wake();
+                    FioOp::Sync(CommitData { .. }) => {
+                        // no-op, handled in SyncBatch
                     }
-                    FioOp::CommitBatch => {
+                    FioOp::SyncBatch => {
                         for CommitData { state, waker } in self.fsync_front.drain(..) {
                             if cqe_res >= 0 {
                                 state
@@ -1206,8 +1114,10 @@ mod tests {
     use tokio::{spawn, time::sleep};
 
     use crate::{
+        block::BlockIoChecked,
         meta::NUM_HEADER_PAGES,
         test::{TmpDir, retry_until_success_tokio},
+        util::update_checksum,
     };
 
     use super::*;
@@ -1233,7 +1143,7 @@ mod tests {
             .cq(4)
             .page_buf_pool(2)
             .build()?;
-        let mut buf = fio.get_buf();
+        let mut buf = fio.buf();
         assert!(matches!(buf, PageBuf::Pool(_)));
 
         buf.as_mut()[0] = 1;
@@ -1250,7 +1160,7 @@ mod tests {
         let mut file = OpenOptions::new()
             .write(true)
             .append(true)
-            .open(fio.file().path())?;
+            .open(fio.inner.file().path())?;
 
         let mut test_buf = vec![1u8; fio.page_size() as usize];
         update_checksum(&mut test_buf);
@@ -1310,15 +1220,15 @@ mod tests {
         let dir = TmpDir::new(function_name!())?;
         let fio = dir.fio()?;
 
-        let mut buf = fio.get_buf();
+        let mut buf = fio.buf();
         buf.as_mut()[0..].fill(1u8);
         fio.write(0, buf).await?;
-        fio.commit().await?;
+        fio.sync().await?;
 
         let mut file = OpenOptions::new()
             .read(true)
             .append(true)
-            .open(fio.file().path())?;
+            .open(fio.inner.file().path())?;
         let mut buf = vec![0u8; fio.page_size() as usize];
         file.read_exact(&mut buf)?;
 
@@ -1343,10 +1253,10 @@ mod tests {
             .cq(4)
             .page_buf_pool(0)
             .build()?;
-        let mut buf = fio.get_buf();
+        let mut buf = fio.buf();
         buf.as_mut()[0..].fill(1u8);
         fio.write(0, buf).await?;
-        fio.commit_flush().await?;
+        fio.sync().await?;
 
         let mut file = OpenOptions::new()
             .read(true)
@@ -1366,26 +1276,26 @@ mod tests {
     #[tokio::test]
     async fn test_simple_alloc() -> Result<()> {
         let temp_dir = TmpDir::new(function_name!())?;
-        let (fio, meta) = temp_dir.fio_and_meta_at("db")?;
+        let (bio, meta) = temp_dir.bio_and_meta_at("db")?;
         assert_eq!(NUM_HEADER_PAGES, meta.len());
 
-        fio.alloc(NUM_HEADER_PAGES + 1).await?;
-        assert!(NUM_HEADER_PAGES + 1 <= fs::metadata(fio.file().path())?.len());
+        bio.alloc(NUM_HEADER_PAGES + 1).await?;
+        assert!(NUM_HEADER_PAGES + 1 <= fs::metadata(bio.inner.file().path())?.len());
         assert_eq!(
-            fio.page_size() * (NUM_HEADER_PAGES + 1),
-            fs::metadata(fio.file().path())?.len()
+            bio.page_size() * (NUM_HEADER_PAGES + 1),
+            fs::metadata(bio.inner.file().path())?.len()
         );
 
-        let _read_test = fio.read_unchecked(0).await?;
+        let _read_test = bio.read_unchecked(0).await?;
 
-        fio.alloc(1000).await?;
-        assert!(1000 <= fs::metadata(fio.file().path())?.len());
+        bio.alloc(1000).await?;
+        assert!(1000 <= fs::metadata(bio.inner.file().path())?.len());
         assert_eq!(
-            1000 * fio.page_size(),
-            fs::metadata(fio.file().path())?.len()
+            1000 * bio.page_size(),
+            fs::metadata(bio.inner.file().path())?.len()
         );
 
-        let _read_test = fio.read_unchecked(5).await?;
+        let _read_test = bio.read_unchecked(5).await?;
 
         Ok(())
     }
@@ -1398,13 +1308,13 @@ mod tests {
 
         retry_until_success_tokio(
             || {
-                assert_eq!(true, fio.inner.park_signal.load(Ordering::Acquire));
+                assert_eq!(true, fio.inner.inner.park_signal.load(Ordering::Acquire));
             },
             Duration::ZERO,
             Duration::from_millis(250),
         )
         .await;
-        assert_eq!(true, fio.inner.park_signal.load(Ordering::Acquire));
+        assert_eq!(true, fio.inner.inner.park_signal.load(Ordering::Acquire));
 
         let run = Arc::new(AtomicBool::new(true));
 
@@ -1413,7 +1323,7 @@ mod tests {
             let fio = fio.clone();
             spawn(async move {
                 while run.load(Ordering::Acquire) {
-                    let mut buf = fio.get_buf();
+                    let mut buf = fio.buf();
                     buf.as_mut().fill(0xFF);
                     fio.write(0, buf).await?;
                 }
@@ -1423,7 +1333,7 @@ mod tests {
 
         retry_until_success_tokio(
             || {
-                assert_eq!(false, fio.inner.park_signal.load(Ordering::Acquire));
+                assert_eq!(false, fio.inner.inner.park_signal.load(Ordering::Acquire));
             },
             Duration::ZERO,
             Duration::from_millis(100),
@@ -1435,13 +1345,13 @@ mod tests {
 
         retry_until_success_tokio(
             || {
-                assert_eq!(true, fio.inner.park_signal.load(Ordering::Acquire));
+                assert_eq!(true, fio.inner.inner.park_signal.load(Ordering::Acquire));
             },
             Duration::ZERO,
             Duration::from_millis(100),
         )
         .await;
-        assert_eq!(true, fio.inner.park_signal.load(Ordering::Acquire));
+        assert_eq!(true, fio.inner.inner.park_signal.load(Ordering::Acquire));
 
         Ok(())
     }
@@ -1465,9 +1375,9 @@ mod tests {
         {
             let mut writes = Vec::with_capacity(PGS as usize);
             for i in 0..PGS {
-                let mut buf = fio.get_buf();
+                let mut buf = fio.buf();
                 buf.as_mut().fill(0xFF);
-                writes.push(fio.write_unchecked(i, buf));
+                writes.push(fio.write(i, buf));
             }
 
             let results = join_all(writes).await;
@@ -1475,13 +1385,13 @@ mod tests {
                 result?;
             }
 
-            fio.commit().await?;
+            fio.sync().await?;
         }
 
         let start = Instant::now();
         let mut writes = Vec::with_capacity(PGS as usize);
         for _ in 0..PGS {
-            let mut buf = fio.get_buf();
+            let mut buf = fio.buf();
             buf.as_mut().fill(0xAA);
             buf.as_mut()[0] = random();
             writes.push(fio.write(rng.gen_range(0..PGS), buf));
@@ -1509,7 +1419,7 @@ mod tests {
         );
         println!("pauses: {}", PAUSES.load(Ordering::Acquire));
 
-        fio.commit().await?;
+        fio.sync().await?;
 
         Ok(())
     }
@@ -1522,16 +1432,16 @@ mod tests {
 
         let _ = fio.read(0).await?;
 
-        fio.inner.fail.store(true, Ordering::Release);
-        fio.join().thread().unpark();
+        fio.inner.inner.fail.store(true, Ordering::Release);
+        fio.inner.join().thread().unpark();
 
         sleep(Duration::from_millis(100)).await;
 
-        let buf = fio.get_dyn_buf();
+        let buf = fio.inner.get_dyn_buf();
         assert!(fio.write(0, buf).await.is_err());
         assert!(fio.alloc(3).await.is_err());
         assert!(fio.read(0).await.is_err());
-        assert!(fio.commit().await.is_err());
+        assert!(fio.sync().await.is_err());
 
         Ok(())
     }

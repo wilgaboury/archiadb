@@ -2,9 +2,9 @@ use anyhow::Result;
 use tokio::sync::Mutex;
 
 use crate::{
+    block::{BlockIo, BlockIoDefault},
     btree::BTreeRootHeader,
     db::DbInner,
-    fio::BlockIoUring,
     lalloc::Arena,
     meta::MetaHandler,
     uint::PgIdx,
@@ -33,7 +33,7 @@ impl DbInner {
 pub(crate) async fn galloc_w_lock(
     lock: &Galloc,
     meta: &MetaHandler,
-    fio: &BlockIoUring,
+    fio: &BlockIoDefault,
     fb: &mut FrontBack,
     len: PgIdx,
 ) -> Result<Arena> {
@@ -43,7 +43,7 @@ pub(crate) async fn galloc_w_lock(
 
 pub(crate) async fn galloc_io_proc(
     meta: &MetaHandler,
-    fio: &BlockIoUring,
+    fio: &BlockIoDefault,
     fb: &mut FrontBack,
     len: PgIdx,
 ) -> Result<Arena> {
@@ -66,7 +66,7 @@ pub(crate) async fn galloc_io_proc(
     btree.arena.len.set(len);
     btree.arena.next.set(0);
     fio.write(fb.back(), root).await?;
-    fio.commit().await?;
+    fio.sync().await?;
     fb.flip();
 
     meta.mutate_async(&fio, |meta| {
@@ -80,7 +80,7 @@ pub(crate) async fn galloc_io_proc(
     Ok(Arena::new(start, len))
 }
 
-pub(crate) async fn galloc_recover(meta: &MetaHandler, fio: &BlockIoUring) -> Result<()> {
+pub(crate) async fn galloc_recover(meta: &MetaHandler, fio: &BlockIoDefault) -> Result<()> {
     let (front_idx, back_idx, alen) = meta
         .access_async(|meta| {
             (
@@ -147,7 +147,7 @@ mod tests {
             meta.len.set(4);
             fio.write(0, buf).await?;
 
-            fio.commit().await?;
+            fio.sync().await?;
         }
 
         let db = tmp.db().await?;

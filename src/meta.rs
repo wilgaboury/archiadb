@@ -8,8 +8,9 @@ use anyhow::{Result, anyhow, bail};
 use tokio::sync::Mutex;
 
 use crate::{
+    block::{BlockIo, BlockIoDefault},
     const_assert,
-    fio::{BlockIoUring, MAX_PAGE_SIZE, MIN_PAGE_SIZE, choose_page_size},
+    fio::{MAX_PAGE_SIZE, MIN_PAGE_SIZE, choose_page_size},
     uint::{InPgIdxDisk, PgIdx, PgIdxDisk, U16, U64, U128},
     util::{Checksum, from_bytes, from_bytes_mut, order_front_back, update_checksum},
 };
@@ -254,7 +255,11 @@ impl MetaHandler {
         Ok(())
     }
 
-    pub(crate) async fn mutate_async(&self, fio: &BlockIoUring, f: impl FnOnce(&mut Meta)) -> Result<()> {
+    pub(crate) async fn mutate_async(
+        &self,
+        fio: &BlockIoDefault,
+        f: impl FnOnce(&mut Meta),
+    ) -> Result<()> {
         let mut inner_guard = self.inner.lock().await;
         let inner = &mut *inner_guard;
         let len = {
@@ -267,10 +272,10 @@ impl MetaHandler {
 
             let pg_idx = if inner.is_first { 1 } else { 0 };
             {
-                let mut buf = fio.get_buf();
+                let mut buf = fio.buf();
                 buf.as_mut().copy_from_slice(&inner.back);
                 fio.write(pg_idx, buf).await?;
-                fio.commit().await?;
+                fio.sync().await?;
             }
 
             std::mem::swap(&mut inner.front, &mut inner.back);
@@ -329,6 +334,7 @@ mod tests {
     use anyhow::Result;
     use function_name::named;
 
+    use crate::block::BlockIo;
     use crate::meta::{CUR_FMT_VER, MAGIC, Meta};
     use crate::test::TmpDir;
     use crate::util::{from_bytes, from_bytes_mut, update_checksum};
@@ -366,7 +372,7 @@ mod tests {
     fn test_mutate_async() -> Result<()> {
         let temp_dir = TmpDir::new(function_name!())?;
 
-        let (fio, meta_hand) = temp_dir.fio_and_meta_at("sync.db")?;
+        let (fio, meta_hand) = temp_dir.bio_and_meta_at("sync.db")?;
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()

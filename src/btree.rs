@@ -3,6 +3,7 @@ use std::cmp::Ordering;
 use anyhow::{Result, bail};
 
 use crate::{
+    block::BlockIo,
     const_assert,
     db::{DirtyEntry, Txn},
     fio::MIN_PAGE_SIZE,
@@ -957,7 +958,7 @@ impl<'a> Txn<'a> {
         let mut prev_pg_idx: PgIdx = 0;
         for chunk in value.chunks(chunk_size).rev() {
             let pg_idx = self.alloc().await?;
-            let mut buf = self.db.fio.get_buf();
+            let mut buf = self.db.fio.buf();
             let mbuf = buf.as_mut();
             let len = chunk.len();
             mbuf[..len].copy_from_slice(chunk);
@@ -1011,9 +1012,9 @@ mod tests {
     use crate::{
         btree::{
             BTreeHeader, BTreeNodeBuf, BTreeNodeKind, BTreeRootHeader, BtreeGetResult,
-            LeafValueEncoded, LeafValueGetResult, SearchResult, SlotDisk, get_key_inner,
-            get_key_leaf, get_page_ptr, get_value_leaf, insert_at_inner, insert_at_leaf,
-            insert_init_inner, remove_at_leaf, search_leaf,
+            LeafValueEncoded, LeafValueGetResult, SearchResult, get_key_inner, get_key_leaf,
+            get_page_ptr, get_value_leaf, insert_at_inner, insert_at_leaf, insert_init_inner,
+            remove_at_leaf, search_leaf,
         },
         db::Db,
         key_path,

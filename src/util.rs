@@ -13,9 +13,10 @@ use std::{
 use anyhow::{Result, anyhow, bail};
 
 use crate::{
+    block::{BlockIo, BlockIoChecked, BlockIoDefault},
     btree::BTreeRootHeader,
     db::DbInner,
-    fio::{BlockIoUring, PageBuf},
+    fio::PageBuf,
     key::{KeyPath, KeyPathBuf},
     key_path,
     uint::{InPgIdx, PgIdx, U64},
@@ -161,7 +162,7 @@ impl FrontBack {
     }
 
     pub(crate) async fn from_roots(
-        fio: &BlockIoUring,
+        fio: &BlockIoDefault,
         pg_idx_1: PgIdx,
         pg_idx_2: PgIdx,
     ) -> Result<(FrontBack, PageBuf)> {
@@ -277,6 +278,7 @@ mod tests {
     };
 
     use crate::{
+        block::BlockIo,
         key_path,
         test::{TmpDir, corrupt_checksum},
     };
@@ -377,7 +379,7 @@ mod tests {
         let mut buf: PageBuf = db.inner.fio.read(3).await?;
         corrupt_checksum(buf.as_mut());
         db.inner.fio.write_unchecked(3, buf).await?;
-        db.inner.fio.commit().await?;
+        db.inner.fio.sync().await?;
 
         let db2 = db.clone();
         let task: JoinHandle<Result<()>> = tokio::spawn(async move {
@@ -411,7 +413,7 @@ mod tests {
         let mut buf: PageBuf = db.inner.fio.read(3).await?;
         corrupt_checksum(buf.as_mut());
         db.inner.fio.write_unchecked(3, buf).await?;
-        db.inner.fio.commit().await?;
+        db.inner.fio.sync().await?;
 
         let carc = db.inner.write_locks.get(key_path![].to_owned());
         let gaurd = carc.lock().await;
@@ -481,8 +483,8 @@ mod tests {
     #[tokio::test]
     async fn check_header_version_getter() -> Result<()> {
         let tmp = TmpDir::new(function_name!())?;
-        let (fio, _meta) = tmp.fio_and_meta_at("db")?;
-        let mut pg = fio.get_dyn_buf();
+        let (fio, _meta) = tmp.bio_and_meta_at("db")?;
+        let mut pg = fio.buf();
         {
             let meta = from_bytes_mut::<BTreeRootHeader>(pg.as_mut());
             meta.init();

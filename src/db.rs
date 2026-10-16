@@ -5,6 +5,7 @@ use bon::bon;
 use tokio::sync::Mutex;
 
 use crate::{
+    block::{BlockIo, BlockIoCheckedRapidHash, BlockIoDefault},
     btree::BTreeRootHeader,
     defer::{Defer, DeferGaurd},
     file::DbFile,
@@ -34,7 +35,7 @@ pub struct Db {
 pub(crate) struct DbInner {
     pub(crate) file: Arc<DbFile>,
     pub(crate) meta: MetaHandler,
-    pub(crate) fio: BlockIoUring,
+    pub(crate) fio: BlockIoDefault,
     pub(crate) galloc: Galloc,
     pub(crate) defer: Defer,
     pub(crate) read_locks: Karc<KeyPathBuf, Lock>,
@@ -53,14 +54,14 @@ impl Db {
     ) -> Result<Self> {
         let file = Arc::new(DbFile::open(path)?);
         let meta = MetaHandler::new(&file.file())?;
-        let fio = BlockIoUring::new(
+        let fio = BlockIoCheckedRapidHash::new(BlockIoUring::new(
             file.clone(),
             meta.page_size(),
             sq,
             cq,
             page_buf_pool,
             generic_op_state_pool,
-        )?;
+        )?);
 
         galloc_recover(&meta, &fio).await?;
 
@@ -99,19 +100,19 @@ impl Db {
     }
 }
 
-pub(crate) async fn init_db_root(meta: &MetaHandler, fio: &BlockIoUring) -> Result<()> {
+pub(crate) async fn init_db_root(meta: &MetaHandler, fio: &BlockIoDefault) -> Result<()> {
     let front_idx = 2;
     let back_idx = 3;
     fio.alloc(4).await?;
 
-    let mut front = fio.get_buf();
-    let mut back = fio.get_buf();
+    let mut front = fio.buf();
+    let mut back = fio.buf();
     from_bytes_mut::<BTreeRootHeader>(front.as_mut()).init();
     from_bytes_mut::<BTreeRootHeader>(back.as_mut()).init();
     fio.write(front_idx, front).await?;
     fio.write(back_idx, back).await?;
 
-    fio.commit().await?;
+    fio.sync().await?;
 
     meta.mutate_async(&fio, |meta| {
         meta.set_len(4);
@@ -267,7 +268,7 @@ impl<'txn> Txn<'txn> {
         // TODO: update intermediary roots in btrees (make sure they are in flux)
 
         self.flux_drain().await?;
-        self.db.fio.commit().await?;
+        self.db.fio.sync().await?;
 
         let mut wlock_keys =
             collect_intermediary_decendants(lca.as_ref(), self.writes.keys().map(|k| k.as_ref()));
@@ -351,6 +352,7 @@ mod tests {
         corrput_magic(page_size, &tmp.file_raw()?, 1)?;
 
         let err = tmp.db().await.unwrap_err();
+
         assert!(
             err.to_string()
                 .contains("file is not an archia db file or magic number is corrupted")
