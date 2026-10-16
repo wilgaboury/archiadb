@@ -7,9 +7,9 @@ use crate::{
     util::{has_valid_checksum, update_checksum},
 };
 
-pub type BlockIoDefault = BlockIoCheckedRapidHash<BlockIoUring>;
+pub(crate) type BlockIoDefault = BlockIoCheckedRapidHash<BlockIoUring>;
 
-pub trait BlockIo {
+pub(crate) trait BlockIo {
     type Buf: AsMut<[u8]> + AsRef<[u8]> + Send + Sync;
 
     fn page_size(&self) -> InPgIdx;
@@ -20,12 +20,12 @@ pub trait BlockIo {
     async fn sync(&self) -> Result<()>;
 }
 
-pub trait BlockIoChecked: BlockIo {
+pub(crate) trait BlockIoChecked: BlockIo {
     async fn read_unchecked(&self, addr: PgIdx) -> Result<Self::Buf>;
     async fn write_unchecked(&self, addr: PgIdx, buf: Self::Buf) -> Result<()>;
 }
 
-pub struct BlockIoMemory {
+pub(crate) struct BlockIoMemory {
     data: Mutex<Vec<u8>>,
     page_size: InPgIdx,
 }
@@ -85,7 +85,7 @@ impl BlockIo for BlockIoMemory {
 }
 
 #[derive(Debug)]
-pub struct BlockIoCheckedRapidHash<T: BlockIo> {
+pub(crate) struct BlockIoCheckedRapidHash<T: BlockIo> {
     pub inner: T,
 }
 
