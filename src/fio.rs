@@ -1114,7 +1114,6 @@ mod tests {
     use tokio::{spawn, time::sleep};
 
     use crate::{
-        block::BlockIoChecked,
         meta::NUM_HEADER_PAGES,
         test::{TmpDir, retry_until_success_tokio},
         util::update_checksum,

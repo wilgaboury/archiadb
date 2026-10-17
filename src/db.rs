@@ -5,7 +5,7 @@ use bon::bon;
 use tokio::sync::Mutex;
 
 use crate::{
-    block::{BlockIo, BlockIoCheckedRapidHash, BlockIoDefault},
+    block::{BlockIo, BlockIoDefault, BlockIoRapidHash},
     btree::BTreeRootHeader,
     defer::{Defer, DeferGaurd},
     file::DbFile,
@@ -54,7 +54,7 @@ impl Db {
     ) -> Result<Self> {
         let file = Arc::new(DbFile::open(path)?);
         let meta = MetaHandler::new(&file.file())?;
-        let fio = BlockIoCheckedRapidHash::new(BlockIoUring::new(
+        let fio = BlockIoRapidHash::new(BlockIoUring::new(
             file.clone(),
             meta.page_size(),
             sq,

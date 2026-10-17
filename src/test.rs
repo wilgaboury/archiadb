@@ -9,7 +9,7 @@ use std::{
 use anyhow::Result;
 
 use crate::{
-    block::{BlockIoCheckedRapidHash, BlockIoDefault},
+    block::{BlockIoDefault, BlockIoRapidHash},
     db::Db,
     file::DbFile,
     fio::BlockIoUring,
@@ -126,7 +126,7 @@ impl TmpDir {
     pub fn fio_at<P: AsRef<Path>>(&self, path: P) -> Result<BlockIoDefault> {
         let file = self.file_at(path)?;
         let meta = MetaHandler::new(file.file())?;
-        Ok(BlockIoCheckedRapidHash::new(
+        Ok(BlockIoRapidHash::new(
             BlockIoUring::builder()
                 .file(Arc::new(file))
                 .page_size(meta.page_size())
@@ -148,7 +148,7 @@ impl TmpDir {
         let file = self.file_at(path)?;
         let meta = MetaHandler::new(file.file())?;
         Ok((
-            BlockIoCheckedRapidHash::new(
+            BlockIoRapidHash::new(
                 BlockIoUring::builder()
                     .file(Arc::new(file))
                     .page_size(meta.page_size())

@@ -13,7 +13,7 @@ use std::{
 use anyhow::{Result, anyhow, bail};
 
 use crate::{
-    block::{BlockIo, BlockIoChecked, BlockIoDefault},
+    block::{BlockIo, BlockIoDefault},
     btree::BTreeRootHeader,
     db::DbInner,
     fio::PageBuf,
