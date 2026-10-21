@@ -100,6 +100,7 @@ pub(crate) struct LallocMap {
     map: HashMap<KeyPathBuf, Lalloc>,
 }
 
+// TODO: add allocated field (tracks all allocations in a given txn), replaces flux free conditional
 pub(crate) struct Lalloc {
     arena: Arena,
     orig_next: PgIdx,
@@ -246,7 +247,7 @@ pub(crate) async fn lalloc(
 }
 
 pub(crate) fn should_init_arena(root: &BTreeRootHeader) -> bool {
-    root.free.get() == 0 && root.arena.is_valid()
+    root.free.get() == 0 && root.arena.is_init()
 }
 
 pub(crate) async fn find_free_idx_and_consume_fl(

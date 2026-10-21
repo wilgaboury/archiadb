@@ -8,6 +8,7 @@ pub mod defer;
 pub mod file;
 pub mod fio;
 pub mod flux;
+pub mod flux2;
 pub mod galloc;
 pub mod intrusive;
 pub mod karc;

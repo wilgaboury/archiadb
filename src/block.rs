@@ -233,7 +233,7 @@ impl<B: BlockIo> BlockIo for BlockIoCached<B> {
         for (pg_idx, buf) in map.drain() {
             self.bio.write(pg_idx, buf).await?;
         }
-        self.bio.sync().await;
+        self.bio.sync().await?;
         Ok(())
     }
 }

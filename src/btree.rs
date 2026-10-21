@@ -265,7 +265,7 @@ impl ArenaDisk {
         self.start.set(0);
     }
 
-    pub(crate) fn is_valid(&self) -> bool {
+    pub(crate) fn is_init(&self) -> bool {
         self.start.get() == 0
     }
 
