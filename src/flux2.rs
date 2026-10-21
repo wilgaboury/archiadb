@@ -4,33 +4,43 @@ use anyhow::Result;
 
 use crate::{block::BlockIo, uint::PgIdx};
 
-/// Stores "in-flux" transaction pages in memory, so non-persisted pages are not copied on write multiple times.
+/// Answers this question: was a given page allocated during the current transaction?
+///
+/// This is important for page writes and creates a conditional that should be encapsulated/reused:
+/// 1. if yes, it can be safely written to it's current index.
+/// 2. if no, it must allocate an index for COW.
+///
+/// Another way of describing the purpose is to dedup COW allocations during
+/// a transaction, which may edit the same page multiple times.
+///
+/// These allocations/pages are "in flux" because they are not yet persisted to disk.
 pub(crate) struct Flux<B, U>
 where
     B: BlockIo<Buf = U>,
     U: AsMut<[u8]> + AsRef<[u8]> + Send,
 {
-    pub(crate) inner: FluxInner<U>,
+    pub(crate) inner: FluxInnerRef<U>,
     pub(crate) bio: B,
 }
+
+#[derive(Debug)]
+pub(crate) enum FluxMapValue<U>
+where
+    U: AsMut<[u8]> + AsRef<[u8]> + Send,
+{
+    Flushed,
+    Borrowed,
+    Owned(U),
+}
+
+type FluxInnerRef<U> = Rc<RefCell<FluxInner<U>>>;
 
 #[derive(Debug)]
 pub(crate) struct FluxInner<U>
 where
     U: AsMut<[u8]> + AsRef<[u8]> + Send,
 {
-    pub(crate) map: Rc<RefCell<HashMap<PgIdx, Option<U>>>>,
-}
-
-impl<U> Clone for FluxInner<U>
-where
-    U: AsMut<[u8]> + AsRef<[u8]> + Send,
-{
-    fn clone(&self) -> Self {
-        Self {
-            map: self.map.clone(),
-        }
-    }
+    pub(crate) map: HashMap<PgIdx, FluxMapValue<U>>,
 }
 
 impl<B, U> Flux<B, U>
@@ -40,9 +50,9 @@ where
 {
     pub(crate) fn new(bio: B) -> Self {
         Flux {
-            inner: FluxInner {
-                map: Rc::new(RefCell::new(HashMap::new())),
-            },
+            inner: Rc::new(RefCell::new(FluxInner {
+                map: HashMap::new(),
+            })),
             bio,
         }
     }
@@ -52,16 +62,36 @@ where
     }
 
     pub(crate) async fn read(&mut self, pg_idx: u64) -> Result<FluxBuf<U>> {
-        if let Some(buf) = self.inner.map.borrow_mut().get_mut(&pg_idx) {
-            if buf.is_none() {
-                panic!("cannot read already owned page")
+        if let Some(val) = self.inner.borrow_mut().map.get_mut(&pg_idx) {
+            match val {
+                FluxMapValue::Flushed => {
+                    *val = FluxMapValue::Borrowed;
+                    Ok(FluxBuf::Alloc(FluxBufAlloc {
+                        idx: pg_idx,
+                        buf: Some(self.bio.read(pg_idx).await?),
+                        inner: self.inner.clone(),
+                    }))
+                }
+                FluxMapValue::Borrowed => {
+                    panic!("cannot read already borrowed page")
+                }
+                FluxMapValue::Owned(_) => {
+                    let value = self
+                        .inner
+                        .borrow_mut()
+                        .map
+                        .insert(pg_idx, FluxMapValue::Borrowed)
+                        .unwrap();
+                    match value {
+                        FluxMapValue::Owned(buf) => Ok(FluxBuf::Alloc(FluxBufAlloc {
+                            idx: pg_idx,
+                            buf: Some(buf),
+                            inner: self.inner.clone(),
+                        })),
+                        _ => panic!("unexpected value in flux map"),
+                    }
+                }
             }
-            let buf = std::mem::replace(buf, None).unwrap();
-            Ok(FluxBuf::Alloc(FluxBufAlloc {
-                idx: pg_idx,
-                buf: Some(buf),
-                inner: self.inner.clone(),
-            }))
         } else {
             Ok(FluxBuf::Unalloc(self.bio.read(pg_idx).await?))
         }
@@ -78,22 +108,34 @@ where
         } else {
             alloc().await?
         };
-        self.inner.map.borrow_mut().insert(idx, Some(buf));
+        self.inner
+            .borrow_mut()
+            .map
+            .insert(idx, FluxMapValue::Owned(buf));
         Ok(idx)
     }
 
+    pub(crate) fn free(&mut self, idx: PgIdx) {
+        self.inner.borrow_mut().map.remove(&idx);
+    }
+
     pub(crate) async fn flush(&mut self) -> Result<()> {
-        let mut map = self.inner.map.borrow_mut();
+        let map = &mut self.inner.borrow_mut().map;
         let mut futs = Vec::with_capacity(map.len());
-        for (pg_idx, buf) in map.drain() {
-            if let Some(buf) = buf {
-                futs.push(self.bio.write(pg_idx, buf));
+        for (pg_idx, buf) in map.iter_mut() {
+            if let FluxMapValue::Owned(buf) = std::mem::replace(buf, FluxMapValue::Flushed) {
+                futs.push(self.bio.write(*pg_idx, buf));
             }
         }
         for fut in futs {
             fut.await?;
         }
         Ok(())
+    }
+
+    /// intended to be called on transaction commit
+    pub(crate) fn clear(&mut self) {
+        self.inner.borrow_mut().map.clear();
     }
 }
 
@@ -113,7 +155,7 @@ where
 {
     idx: u64,
     buf: Option<U>,
-    inner: FluxInner<U>,
+    inner: FluxInnerRef<U>,
 }
 
 impl<U> AsRef<[u8]> for FluxBuf<U>
@@ -162,9 +204,12 @@ where
     U: AsMut<[u8]> + AsRef<[u8]> + Send,
 {
     fn drop(&mut self) {
-        let mut map = self.inner.map.borrow_mut();
+        let map = &mut self.inner.borrow_mut().map;
         if map.get(&self.idx).is_some() {
-            map.insert(self.idx, std::mem::take(&mut self.buf));
+            map.insert(
+                self.idx,
+                FluxMapValue::Owned(std::mem::take(&mut self.buf).unwrap()),
+            );
         }
     }
 }
