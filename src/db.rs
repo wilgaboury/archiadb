@@ -6,11 +6,11 @@ use tokio::sync::Mutex;
 
 use crate::{
     block::{BlockIo, BlockIoDefault, BlockIoRapidHash},
-    btree::BTreeRootHeader,
+    bnode::BTreeRootHeader,
     defer::{Defer, DeferGaurd},
     file::DbFile,
     fio::{BlockIoUring, DEFAULT_CQ_SIZE, DEFAULT_SQ_SIZE},
-    flux::Flux,
+    flux_old::FluxOld,
     galloc::{Galloc, galloc_recover},
     karc::Karc,
     key::{KeyPath, KeyPathBuf},
@@ -158,7 +158,7 @@ impl<'txn> TxnBuilder<'txn> {
             guards,
             free: Vec::new(),
             ops: self.ops,
-            flux: Flux::new(),
+            flux: FluxOld::new(),
             writes: HashMap::new(),
         }
     }
@@ -184,7 +184,7 @@ pub struct Txn<'txn> {
     pub(crate) guards: LockVec<LockGuard>,
     pub(crate) free: Vec<u64>,
     pub(crate) ops: KeyTrie<LockType>,
-    pub(crate) flux: Flux,
+    pub(crate) flux: FluxOld,
     pub(crate) writes: HashMap<KeyPathBuf, DirtyEntry>,
 }
 

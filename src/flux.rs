@@ -2,49 +2,166 @@ use std::{cell::RefCell, collections::HashMap, ptr, rc::Rc};
 
 use anyhow::Result;
 
-use crate::{
-    block::BlockIo,
-    db::{DirtyEntry, Txn},
-    fio::PageBuf,
-    lalloc::free_on_disk_pg,
-    uint::PgIdx,
-};
+use crate::{block::BlockIo, uint::PgIdx};
 
-/// Stores "in-flux" transaction pages in memory. That way non-persisted pages are not
-/// copied on write multiple times.
-pub(crate) struct Flux {
-    pub(crate) inner: FluxInner,
+/// Answers this question: was a given page allocated during the current transaction?
+///
+/// This is important for page writes and creates a conditional that should be encapsulated/reused:
+/// 1. if yes, it can be safely written to it's current index.
+/// 2. if no, it must allocate an index for COW.
+///
+/// Another way of describing the purpose is to dedup COW allocations during
+/// a transaction, which may edit the same page multiple times.
+///
+/// These allocations/pages are "in flux" because they are not yet persisted to disk.
+pub(crate) struct Flux<B, U>
+where
+    B: BlockIo<Buf = U>,
+    U: AsMut<[u8]> + AsRef<[u8]> + Send,
+{
+    pub(crate) inner: FluxInnerRef<U>,
+    pub(crate) bio: B,
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct FluxInner {
-    pub(crate) map: Rc<RefCell<HashMap<PgIdx, Option<PageBuf>>>>,
+#[derive(Debug)]
+pub(crate) enum FluxMapValue<U>
+where
+    U: AsMut<[u8]> + AsRef<[u8]> + Send,
+{
+    Flushed,
+    Borrowed,
+    Owned(U),
 }
 
-impl Flux {
-    pub(crate) fn new() -> Self {
+type FluxInnerRef<U> = Rc<RefCell<FluxInner<U>>>;
+
+#[derive(Debug)]
+pub(crate) struct FluxInner<U>
+where
+    U: AsMut<[u8]> + AsRef<[u8]> + Send,
+{
+    pub(crate) map: HashMap<PgIdx, FluxMapValue<U>>,
+}
+
+impl<B, U> Flux<B, U>
+where
+    B: BlockIo<Buf = U>,
+    U: AsMut<[u8]> + AsRef<[u8]> + Send,
+{
+    pub(crate) fn new(bio: B) -> Self {
         Flux {
-            inner: FluxInner {
-                map: Rc::new(RefCell::new(HashMap::new())),
-            },
+            inner: Rc::new(RefCell::new(FluxInner {
+                map: HashMap::new(),
+            })),
+            bio,
         }
+    }
+
+    pub(crate) fn buf(&mut self) -> FluxBuf<U> {
+        FluxBuf::Unalloc(self.bio.buf())
+    }
+
+    pub(crate) async fn read(&mut self, pg_idx: u64) -> Result<FluxBuf<U>> {
+        if let Some(val) = self.inner.borrow_mut().map.get_mut(&pg_idx) {
+            match val {
+                FluxMapValue::Flushed => {
+                    *val = FluxMapValue::Borrowed;
+                    Ok(FluxBuf::Alloc(FluxBufAlloc {
+                        idx: pg_idx,
+                        buf: Some(self.bio.read(pg_idx).await?),
+                        inner: self.inner.clone(),
+                    }))
+                }
+                FluxMapValue::Borrowed => {
+                    panic!("cannot read already borrowed page")
+                }
+                FluxMapValue::Owned(_) => {
+                    let value = self
+                        .inner
+                        .borrow_mut()
+                        .map
+                        .insert(pg_idx, FluxMapValue::Borrowed)
+                        .unwrap();
+                    match value {
+                        FluxMapValue::Owned(buf) => Ok(FluxBuf::Alloc(FluxBufAlloc {
+                            idx: pg_idx,
+                            buf: Some(buf),
+                            inner: self.inner.clone(),
+                        })),
+                        _ => panic!("unexpected value in flux map"),
+                    }
+                }
+            }
+        } else {
+            Ok(FluxBuf::Unalloc(self.bio.read(pg_idx).await?))
+        }
+    }
+
+    pub(crate) async fn write<F, Fut>(&mut self, buf: FluxBuf<U>, alloc: F) -> Result<PgIdx>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<PgIdx>>,
+    {
+        let (maybe_idx, buf) = buf.extract();
+        let idx = if let Some(idx) = maybe_idx {
+            idx
+        } else {
+            alloc().await?
+        };
+        self.inner
+            .borrow_mut()
+            .map
+            .insert(idx, FluxMapValue::Owned(buf));
+        Ok(idx)
+    }
+
+    pub(crate) fn free(&mut self, idx: PgIdx) {
+        self.inner.borrow_mut().map.remove(&idx);
+    }
+
+    pub(crate) async fn flush(&mut self) -> Result<()> {
+        let map = &mut self.inner.borrow_mut().map;
+        let mut futs = Vec::with_capacity(map.len());
+        for (pg_idx, buf) in map.iter_mut() {
+            if let FluxMapValue::Owned(buf) = std::mem::replace(buf, FluxMapValue::Flushed) {
+                futs.push(self.bio.write(*pg_idx, buf));
+            }
+        }
+        for fut in futs {
+            fut.await?;
+        }
+        Ok(())
+    }
+
+    /// intended to be called on transaction commit
+    pub(crate) fn clear(&mut self) {
+        self.inner.borrow_mut().map.clear();
     }
 }
 
 #[derive(Debug)]
-pub enum FluxBuf {
-    Unalloc(PageBuf),
-    Alloc(FluxBufAlloc),
+pub enum FluxBuf<U>
+where
+    U: AsMut<[u8]> + AsRef<[u8]> + Send,
+{
+    Unalloc(U),
+    Alloc(FluxBufAlloc<U>),
 }
 
 #[derive(Debug)]
-pub struct FluxBufAlloc {
+pub struct FluxBufAlloc<U>
+where
+    U: AsMut<[u8]> + AsRef<[u8]> + Send,
+{
     idx: u64,
-    buf: Option<PageBuf>,
-    inner: FluxInner,
+    buf: Option<U>,
+    inner: FluxInnerRef<U>,
 }
 
-impl AsRef<[u8]> for FluxBuf {
+impl<U> AsRef<[u8]> for FluxBuf<U>
+where
+    U: AsMut<[u8]> + AsRef<[u8]> + Send,
+{
     fn as_ref(&self) -> &[u8] {
         match self {
             FluxBuf::Unalloc(buf) => buf.as_ref(),
@@ -53,7 +170,10 @@ impl AsRef<[u8]> for FluxBuf {
     }
 }
 
-impl AsMut<[u8]> for FluxBuf {
+impl<U> AsMut<[u8]> for FluxBuf<U>
+where
+    U: AsMut<[u8]> + AsRef<[u8]> + Send,
+{
     fn as_mut(&mut self) -> &mut [u8] {
         match self {
             FluxBuf::Unalloc(buf) => buf.as_mut(),
@@ -62,8 +182,11 @@ impl AsMut<[u8]> for FluxBuf {
     }
 }
 
-impl FluxBuf {
-    fn extract(self) -> (Option<PgIdx>, PageBuf) {
+impl<U> FluxBuf<U>
+where
+    U: AsMut<[u8]> + AsRef<[u8]> + Send,
+{
+    fn extract(self) -> (Option<PgIdx>, U) {
         match self {
             FluxBuf::Unalloc(buf) => (None, buf),
             FluxBuf::Alloc(data) => {
@@ -76,56 +199,17 @@ impl FluxBuf {
     }
 }
 
-impl<'a> Txn<'a> {
-    pub(crate) fn flux_buf(&mut self) -> FluxBuf {
-        FluxBuf::Unalloc(self.db.fio.buf())
-    }
-
-    pub(crate) async fn flux_read(&mut self, pg_idx: u64) -> Result<FluxBuf> {
-        if let Some(buf) = self.flux.inner.map.borrow_mut().get_mut(&pg_idx) {
-            if buf.is_none() {
-                panic!("cannot read already owned page")
-            }
-            let buf = std::mem::replace(buf, None).unwrap();
-            Ok(FluxBuf::Alloc(FluxBufAlloc {
-                idx: pg_idx,
-                buf: Some(buf),
-                inner: self.flux.inner.clone(),
-            }))
-        } else {
-            Ok(FluxBuf::Unalloc(self.db.fio.read(pg_idx).await?))
-        }
-    }
-
-    pub(crate) async fn flux_write(
-        &mut self,
-        dirty: &mut DirtyEntry,
-        buf: FluxBuf,
-    ) -> Result<PgIdx> {
-        let (maybe_idx, buf) = buf.extract();
-        let idx = if let Some(idx) = maybe_idx {
-            idx
-        } else {
-            self.lalloc(dirty).await?
-        };
-        self.flux.inner.map.borrow_mut().insert(idx, Some(buf));
-        Ok(idx)
-    }
-
-    pub(crate) fn flux_free(&mut self, dirty: &mut DirtyEntry, idx: u64) {
-        if self.flux.inner.map.borrow_mut().remove(&idx).is_some() {
-            dirty.lalloc.free_in_mem_page(idx);
-        } else {
-            free_on_disk_pg(&mut dirty.lalloc, &mut self.defer_gaurd, idx);
-        }
-    }
-}
-
-impl Drop for FluxBufAlloc {
+impl<U> Drop for FluxBufAlloc<U>
+where
+    U: AsMut<[u8]> + AsRef<[u8]> + Send,
+{
     fn drop(&mut self) {
-        self.inner
-            .map
-            .borrow_mut()
-            .insert(self.idx, std::mem::take(&mut self.buf));
+        let map = &mut self.inner.borrow_mut().map;
+        if map.get(&self.idx).is_some() {
+            map.insert(
+                self.idx,
+                FluxMapValue::Owned(std::mem::take(&mut self.buf).unwrap()),
+            );
+        }
     }
 }

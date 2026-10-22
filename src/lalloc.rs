@@ -4,7 +4,7 @@ use anyhow::Result;
 
 use crate::{
     block::{BlockIo, BlockIoDefault},
-    btree::BTreeRootHeader,
+    bnode::BTreeRootHeader,
     db::{DirtyEntry, Txn},
     defer::DeferGaurd,
     galloc::{Galloc, galloc_w_lock},
@@ -399,7 +399,7 @@ mod tests {
 
     use crate::{
         block::BlockIo,
-        btree::BTreeRootHeader,
+        bnode::BTreeRootHeader,
         key_path,
         lalloc::{FreeListHeader, INIT_ARENA_SIZE, free_on_disk_pg, read_fl_idx},
         test::TmpDir,

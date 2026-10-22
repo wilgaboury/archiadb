@@ -14,7 +14,7 @@ use anyhow::{Result, anyhow, bail};
 
 use crate::{
     block::{BlockIo, BlockIoDefault},
-    btree::BTreeRootHeader,
+    bnode::BTreeRootHeader,
     db::DbInner,
     fio::PageBuf,
     key::{KeyPath, KeyPathBuf},
