@@ -3,7 +3,7 @@ use tokio::sync::Mutex;
 
 use crate::{
     block::{BlockIo, BlockIoDefault},
-    bnode::BTreeRootHeader,
+    bnode::BNodeRootHeader,
     db::DbInner,
     lalloc::Arena,
     meta::MetaHandler,
@@ -48,7 +48,7 @@ pub(crate) async fn galloc_io_proc(
     len: PgIdx,
 ) -> Result<Arena> {
     let mut root = fio.read(fb.front()).await?;
-    let btree = from_bytes_mut::<BTreeRootHeader>(root.as_mut());
+    let btree = from_bytes_mut::<BNodeRootHeader>(root.as_mut());
     let start = meta.len();
     let flen = meta.len() + len;
 
@@ -119,7 +119,7 @@ mod tests {
         assert_eq!(8, db.inner.meta.len());
 
         let buf = db.inner.fio.read(3).await?;
-        let root = from_bytes::<BTreeRootHeader>(&buf.as_ref());
+        let root = from_bytes::<BNodeRootHeader>(&buf.as_ref());
         assert_eq!(4, root.arena.start.get());
         assert_eq!(4, root.arena.len.get());
         assert_eq!(0, root.arena.next.get());
@@ -152,7 +152,7 @@ mod tests {
 
         let db = tmp.db().await?;
         let buf = db.inner.fio.read(3).await?;
-        let root = from_bytes::<BTreeRootHeader>(buf.as_ref());
+        let root = from_bytes::<BNodeRootHeader>(buf.as_ref());
         assert_eq!(4, root.arena.start.get());
         assert_eq!(4, root.arena.len.get());
         assert_eq!(0, root.arena.next.get());

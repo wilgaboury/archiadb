@@ -4,7 +4,7 @@ use anyhow::Result;
 
 use crate::{
     block::{BlockIo, BlockIoDefault},
-    bnode::BTreeRootHeader,
+    bnode::BNodeRootHeader,
     db::{DirtyEntry, Txn},
     defer::DeferGaurd,
     galloc::{Galloc, galloc_w_lock},
@@ -141,7 +141,7 @@ impl Lalloc {
         self.arena.pop_w_reserve(reserve)
     }
 
-    pub(crate) fn clean_or(&self, root: &BTreeRootHeader) -> PgIdx {
+    pub(crate) fn clean_or(&self, root: &BNodeRootHeader) -> PgIdx {
         if let Some(clean) = self.clean.as_ref() {
             *clean
         } else {
@@ -159,7 +159,7 @@ pub(crate) async fn write_fl(
     meta: &MetaHandler,
     fio: &BlockIoDefault,
     dirty: &mut DirtyEntry,
-    root: &BTreeRootHeader,
+    root: &BNodeRootHeader,
 ) -> Result<PgIdx> {
     // TODO: this function could be more complicated and do proper ordering of deferred/free pg idxs for better effiecency
 
@@ -208,7 +208,7 @@ impl<'txn> Txn<'txn> {
 
     pub(crate) async fn write_fl(&mut self, dirty: &mut DirtyEntry) -> Result<PgIdx> {
         let root_buf = self.db.fio.read(dirty.fb.front()).await?;
-        let root = from_bytes::<BTreeRootHeader>(root_buf.as_ref());
+        let root = from_bytes::<BNodeRootHeader>(root_buf.as_ref());
 
         write_fl(&self.db.galloc, &self.db.meta, &self.db.fio, dirty, root).await
     }
@@ -227,7 +227,7 @@ pub(crate) async fn lalloc(
     dirty: &mut DirtyEntry,
 ) -> Result<PgIdx> {
     let root_buf = fio.read(dirty.fb.front()).await?;
-    let root = from_bytes::<BTreeRootHeader>(root_buf.as_ref());
+    let root = from_bytes::<BNodeRootHeader>(root_buf.as_ref());
 
     if should_init_arena(root) {
         // unlikely case, but post arena encode crash + fl depletion could leave inlavid arena with large len. use that len for galloc not init.
@@ -246,14 +246,14 @@ pub(crate) async fn lalloc(
     lalloc_from_arena_or_galloc(galloc, meta, fio, dirty, root).await
 }
 
-pub(crate) fn should_init_arena(root: &BTreeRootHeader) -> bool {
+pub(crate) fn should_init_arena(root: &BNodeRootHeader) -> bool {
     root.free.get() == 0 && root.arena.is_init()
 }
 
 pub(crate) async fn find_free_idx_and_consume_fl(
     defer_gaurd: &mut DeferGaurd<'_>,
     fio: &BlockIoDefault,
-    root: &BTreeRootHeader,
+    root: &BNodeRootHeader,
     lalloc: &mut Lalloc,
 ) -> Result<Option<PgIdx>> {
     let mut clean = lalloc.clean_or(root);
@@ -305,7 +305,7 @@ pub(crate) async fn lalloc_from_dirty_or_arena(
     meta: &MetaHandler,
     fio: &BlockIoDefault,
     dirty: &mut DirtyEntry,
-    root: &BTreeRootHeader,
+    root: &BNodeRootHeader,
 ) -> Result<PgIdx> {
     if let Some(free) = dirty.lalloc.free.pop() {
         Ok(free)
@@ -319,7 +319,7 @@ pub(crate) async fn lalloc_from_arena_or_galloc(
     meta: &MetaHandler,
     fio: &BlockIoDefault,
     dirty: &mut DirtyEntry,
-    root: &BTreeRootHeader,
+    root: &BNodeRootHeader,
 ) -> Result<PgIdx> {
     if let Some(free) = dirty.lalloc.pop_arena_with_encode_reserve(fio.page_size()) {
         Ok(free)
@@ -351,7 +351,7 @@ pub(crate) async fn encode_arena_and_commit(
 
     let idxs_per = idxs_per_fl_page(fio.page_size());
     let mut root_buf = fio.read(dirty.fb.front()).await?;
-    let root = from_bytes_mut::<BTreeRootHeader>(root_buf.as_mut());
+    let root = from_bytes_mut::<BNodeRootHeader>(root_buf.as_mut());
 
     let arena = &dirty.lalloc.arena;
     let mut encode_idx = dirty.lalloc.orig_next;
@@ -399,7 +399,7 @@ mod tests {
 
     use crate::{
         block::BlockIo,
-        bnode::BTreeRootHeader,
+        bnode::BNodeRootHeader,
         key_path,
         lalloc::{FreeListHeader, INIT_ARENA_SIZE, free_on_disk_pg, read_fl_idx},
         test::TmpDir,
@@ -429,14 +429,14 @@ mod tests {
         assert_eq!(10, txn.lalloc(&mut dirty).await?);
 
         let root_buf = fio.read(dirty.fb.front()).await?;
-        let root = from_bytes::<BTreeRootHeader>(root_buf.as_ref());
+        let root = from_bytes::<BNodeRootHeader>(root_buf.as_ref());
         let start_version = root.version.get();
         assert_eq!(12, txn.lalloc(&mut dirty).await?);
 
         assert_eq!(3, dirty.fb.front());
         assert_eq!(2, dirty.fb.back());
         let root_buf = fio.read(dirty.fb.front()).await?;
-        let root = from_bytes::<BTreeRootHeader>(root_buf.as_ref());
+        let root = from_bytes::<BNodeRootHeader>(root_buf.as_ref());
         assert_eq!(11, root.free.get());
         assert_eq!(start_version + 2, root.version.get());
 

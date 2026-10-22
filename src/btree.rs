@@ -5,13 +5,14 @@ use anyhow::{Result, bail};
 use crate::{
     block::BlockIo,
     bnode::{
-        BTreeHeader, BTreeNodeBuf, BTreeNodeKind, LeafValue, LeafValueGetResult, SearchResult,
-        SlotDisk, get_page_ptr, get_value_leaf, insert_at_inner, insert_at_leaf, remove_at_leaf,
+        BNodeBuf, BNodeHeader, BNodeKind, LeafValue, LeafValueGetResult, SearchResult, SlotDisk,
+        get_key_inner, get_key_leaf, get_page_ptr, get_value_leaf, in_pg_len, in_pg_size_of,
+        insert_at_inner, insert_at_leaf, remaining_bytes, remove_at_leaf, root_to_inner,
         search_inner, search_leaf, write_page_ptr,
     },
     db::{DirtyEntry, Txn},
     flux_old::FluxBuf,
-    uint::{PgIdx, PgIdxDisk},
+    uint::{InPgIdx, PgIdx, PgIdxDisk},
     util::{ChecksumDisk, from_bytes, from_bytes_mut},
 };
 
@@ -39,7 +40,7 @@ pub(crate) enum BtreeGetResult {
 
 impl<'a> Txn<'a> {
     async fn btree_get(&mut self, key: &[u8], node: &FluxBuf) -> Result<Option<BtreeGetResult>> {
-        assert!(node.as_ref().header().kind == BTreeNodeKind::Root);
+        assert!(node.as_ref().header().kind == BNodeKind::Root);
 
         let search = search_inner(node.as_ref(), key);
         let child_pg_idx = if node.as_ref().header().len() > 0 {
@@ -57,7 +58,7 @@ impl<'a> Txn<'a> {
         node: FluxBuf,
     ) -> Result<Option<BtreeGetResult>> {
         match node.as_ref().header().kind {
-            BTreeNodeKind::Leaf => {
+            BNodeKind::Leaf => {
                 let search = search_leaf(node.as_ref(), key);
                 if let SearchResult::Exact(idx) = search {
                     let value = get_value_leaf(node.as_ref(), idx);
@@ -66,7 +67,7 @@ impl<'a> Txn<'a> {
                     Ok(None)
                 }
             }
-            BTreeNodeKind::Root | BTreeNodeKind::Inner => {
+            BNodeKind::Root | BNodeKind::Inner => {
                 let search = search_inner(node.as_ref(), key);
                 let child_pg_idx = if node.as_ref().header().len() > 0 {
                     get_page_ptr(node.as_ref(), search.idx())
@@ -115,8 +116,8 @@ impl<'a> Txn<'a> {
         value: LeafValue<'_>,
         mut pg: FluxBuf,
     ) -> Result<InsertResult> {
-        let header = from_bytes::<BTreeHeader>(pg.as_ref());
-        if header.kind == BTreeNodeKind::Leaf {
+        let header = from_bytes::<BNodeHeader>(pg.as_ref());
+        if header.kind == BNodeKind::Leaf {
             self.btree_upsert_leaf(dirty, key, value, pg).await
         } else {
             let search = search_inner(pg.as_ref(), key).idx();
@@ -127,7 +128,7 @@ impl<'a> Txn<'a> {
             } else {
                 pg.as_mut().header_mut().set_len(1);
                 let mut child_pg = self.flux_buf();
-                child_pg.as_mut().header_mut().init(BTreeNodeKind::Leaf);
+                child_pg.as_mut().header_mut().init(BNodeKind::Leaf);
                 child_pg
             };
             let insert = Box::pin(self.btree_upsert_inner(dirty, key, value, child_pg)).await?;
@@ -139,14 +140,16 @@ impl<'a> Txn<'a> {
                     Ok(InsertResult::Single(pg))
                 }
                 InsertResult::Split(left, split, right) => {
-                    let can_insert = pg.as_ref().remaining()
-                        > size_of::<PgIdxDisk>() + split.len() + size_of::<SlotDisk>();
+                    let can_insert = remaining_bytes(pg.as_ref())
+                        > in_pg_size_of::<PgIdxDisk>()
+                            + in_pg_len(&split)
+                            + in_pg_size_of::<SlotDisk>();
                     if can_insert {
                         insert_at_inner(pg.as_mut(), search, left, &split, right);
                         Ok(InsertResult::Single(pg))
                     } else {
-                        if pg.as_ref().header().kind == BTreeNodeKind::Root {
-                            pg.as_mut().root_to_inner();
+                        if pg.as_ref().header().kind == BNodeKind::Root {
+                            root_to_inner(pg.as_mut());
                         }
                         self.btree_split_inner(dirty, left, split, right, pg).await
                     }
@@ -166,21 +169,21 @@ impl<'a> Txn<'a> {
         let mut left = pg;
         let mut right = self.flux_buf();
 
-        right.as_mut().header_mut().init(BTreeNodeKind::Inner);
+        right.as_mut().header_mut().init(BNodeKind::Inner);
 
-        let len = left.as_ref().header().len() as usize; // children
+        let len = left.as_ref().header().len(); // children
         let mid = len / 2;
         // move slots [mid .. len-1] and their [ptr|key] blobs to right
         for idx in mid..len {
-            let key = left.as_ref().get_key_inner(idx);
-            let left_ptr = left.as_ref().get_page_ptr(idx);
-            let right_ptr = left.as_ref().get_page_ptr(idx + 1);
+            let key = get_key_inner(left.as_ref(), idx);
+            let left_ptr = get_page_ptr(left.as_ref(), idx);
+            let right_ptr = get_page_ptr(left.as_ref(), idx + 1);
             insert_at_inner(right.as_mut(), idx - mid, left_ptr, key, right_ptr);
         }
         left.as_mut().header_mut().set_len(mid as u64);
 
         {
-            let insert = if split.as_ref().cmp(right.as_ref().get_key_inner(0)) == Ordering::Less {
+            let insert = if split.as_ref().cmp(get_key_inner(right.as_ref(), 0)) == Ordering::Less {
                 &mut left
             } else {
                 &mut right
@@ -195,7 +198,7 @@ impl<'a> Txn<'a> {
             }
         }
 
-        let key = right.as_ref().get_key_leaf(0).to_vec().into_boxed_slice();
+        let key = get_key_leaf(right.as_ref(), 0).to_vec().into_boxed_slice();
 
         let ret_left_idx = self.flux_write(dirty, left).await?;
         let ret_right_idx = self.flux_write(dirty, right).await?;
@@ -212,8 +215,8 @@ impl<'a> Txn<'a> {
     ) -> Result<InsertResult> {
         let encoded_value = value.encode(self).await?;
 
-        let can_insert =
-            pg.as_ref().remaining() > key.len() + encoded_value.len() + size_of::<SlotDisk>();
+        let can_insert = remaining_bytes(pg.as_ref())
+            > in_pg_len(key) + encoded_value.len() + in_pg_size_of::<SlotDisk>();
         if can_insert {
             let search = search_leaf(pg.as_ref(), key);
             if let SearchResult::Exact(idx) = search
@@ -228,19 +231,19 @@ impl<'a> Txn<'a> {
             let mut left = pg;
             let mut right = self.flux_buf();
 
-            right.as_mut().header_mut().init(BTreeNodeKind::Leaf);
+            right.as_mut().header_mut().init(BNodeKind::Leaf);
 
-            let len = left.as_ref().header().len() as usize;
+            let len = left.as_ref().header().len();
             let start = len / 2;
             for idx in start..len {
-                let key = left.as_ref().get_key_leaf(idx);
-                let value = left.as_ref().get_value_leaf(idx).encode(left.as_ref());
+                let key = get_key_leaf(left.as_ref(), idx);
+                let value = get_value_leaf(left.as_ref(), idx).encode(left.as_ref());
                 insert_at_leaf(right.as_mut(), idx - start, key, &value);
             }
             left.as_mut().header_mut().set_len(start as u64);
 
             {
-                let insert = if key.cmp(right.as_ref().get_key_leaf(0)) == Ordering::Less {
+                let insert = if key.cmp(get_key_leaf(right.as_ref(), 0)) == Ordering::Less {
                     &mut left
                 } else {
                     &mut right
@@ -255,7 +258,7 @@ impl<'a> Txn<'a> {
                 insert_at_leaf(insert.as_mut(), search.idx(), key, &encoded_value);
             }
 
-            let key = right.as_ref().get_key_leaf(0).to_vec().into_boxed_slice();
+            let key = get_key_leaf(right.as_ref(), 0).to_vec().into_boxed_slice();
 
             let left_idx = self.flux_write(dirty, left).await?;
             let right_idx = self.flux_write(dirty, right).await?;
@@ -268,7 +271,7 @@ impl<'a> Txn<'a> {
         &mut self,
         dirty: &mut DirtyEntry,
         buf: &mut [u8],
-        idx: usize,
+        idx: InPgIdx,
     ) -> Result<()> {
         let value = get_value_leaf(buf, idx);
         match value {
@@ -351,8 +354,8 @@ mod tests {
 
     use crate::{
         bnode::{
-            BTreeHeader, BTreeNodeBuf, BTreeNodeKind, BTreeRootHeader, LeafValueGetResult,
-            SearchResult, get_key_leaf, get_page_ptr, get_value_leaf, search_leaf,
+            BNodeBuf, BNodeHeader, BNodeKind, BNodeRootHeader, LeafValueGetResult, SearchResult,
+            get_key_leaf, get_page_ptr, get_value_leaf, search_leaf,
         },
         btree::BtreeGetResult,
         db::Db,
@@ -374,15 +377,15 @@ mod tests {
             let page = txn.btree_upsert(&mut dirty, b"key", b"value", page).await?;
 
             {
-                let header = from_bytes::<BTreeRootHeader>(page.as_ref());
-                assert_eq!(header.header.kind, BTreeNodeKind::Root);
+                let header = from_bytes::<BNodeRootHeader>(page.as_ref());
+                assert_eq!(header.header.kind, BNodeKind::Root);
                 assert_eq!(header.header.len.get(), 1);
 
                 let pg = get_page_ptr(page.as_ref(), 0);
                 let child_pg = txn.flux_read(pg).await?;
                 {
-                    let header = from_bytes::<BTreeHeader>(child_pg.as_ref());
-                    assert_eq!(header.kind, BTreeNodeKind::Leaf);
+                    let header = from_bytes::<BNodeHeader>(child_pg.as_ref());
+                    assert_eq!(header.kind, BNodeKind::Leaf);
                     assert_eq!(header.len.get(), 1);
 
                     let search = search_leaf(child_pg.as_ref(), b"key");

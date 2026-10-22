@@ -14,7 +14,7 @@ use anyhow::{Result, anyhow, bail};
 
 use crate::{
     block::{BlockIo, BlockIoDefault},
-    bnode::BTreeRootHeader,
+    bnode::BNodeRootHeader,
     db::DbInner,
     fio::PageBuf,
     key::{KeyPath, KeyPathBuf},
@@ -120,7 +120,7 @@ pub(crate) fn order_front_back<V, B: AsRef<[u8]>, F: Fn(&B) -> u64>(
 }
 
 pub(crate) fn btree_header_version(pg: &PageBuf) -> u64 {
-    let root = from_bytes::<BTreeRootHeader>(&pg.as_ref());
+    let root = from_bytes::<BNodeRootHeader>(&pg.as_ref());
     root.version.get()
 }
 
@@ -486,7 +486,7 @@ mod tests {
         let (fio, _meta) = tmp.bio_and_meta_at("db")?;
         let mut pg = fio.buf();
         {
-            let meta = from_bytes_mut::<BTreeRootHeader>(pg.as_mut());
+            let meta = from_bytes_mut::<BNodeRootHeader>(pg.as_mut());
             meta.init();
             meta.version.set(0x1122334455);
         }

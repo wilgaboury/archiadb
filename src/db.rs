@@ -6,7 +6,7 @@ use tokio::sync::Mutex;
 
 use crate::{
     block::{BlockIo, BlockIoDefault, BlockIoRapidHash},
-    bnode::BTreeRootHeader,
+    bnode::BNodeRootHeader,
     defer::{Defer, DeferGaurd},
     file::DbFile,
     fio::{BlockIoUring, DEFAULT_CQ_SIZE, DEFAULT_SQ_SIZE},
@@ -107,8 +107,8 @@ pub(crate) async fn init_db_root(meta: &MetaHandler, fio: &BlockIoDefault) -> Re
 
     let mut front = fio.buf();
     let mut back = fio.buf();
-    from_bytes_mut::<BTreeRootHeader>(front.as_mut()).init();
-    from_bytes_mut::<BTreeRootHeader>(back.as_mut()).init();
+    from_bytes_mut::<BNodeRootHeader>(front.as_mut()).init();
+    from_bytes_mut::<BNodeRootHeader>(back.as_mut()).init();
     fio.write(front_idx, front).await?;
     fio.write(back_idx, back).await?;
 
@@ -202,7 +202,7 @@ impl<'txn> Txn<'txn> {
     ) -> Result<DirtyEntry> {
         let (pg_idx_1, pg1, pg_idx_2, _pg2) =
             read_root_w_retry(self.db, key, pg_idx_1, pg_idx_2, Duration::from_secs(1)).await?;
-        let root = from_bytes::<BTreeRootHeader>(pg1.as_ref());
+        let root = from_bytes::<BNodeRootHeader>(pg1.as_ref());
         Ok(DirtyEntry::new(
             FrontBack::new(pg_idx_1, pg_idx_2),
             root.arena.to_mem(),
