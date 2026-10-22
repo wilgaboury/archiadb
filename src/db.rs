@@ -5,11 +5,11 @@ use bon::bon;
 use tokio::sync::Mutex;
 
 use crate::{
+    bio::{BlockIoUring, DEFAULT_CQ_SIZE, DEFAULT_SQ_SIZE},
     block::{BlockIo, BlockIoDefault, BlockIoRapidHash},
     bnode::BNodeRootHeader,
     defer::{Defer, DeferGaurd},
     file::DbFile,
-    fio::{BlockIoUring, DEFAULT_CQ_SIZE, DEFAULT_SQ_SIZE},
     flux_old::FluxOld,
     galloc::{Galloc, galloc_recover},
     karc::Karc,

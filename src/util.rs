@@ -13,10 +13,10 @@ use std::{
 use anyhow::{Result, anyhow, bail};
 
 use crate::{
+    bio::PageBuf,
     block::{BlockIo, BlockIoDefault},
     bnode::BNodeRootHeader,
     db::DbInner,
-    fio::PageBuf,
     key::{KeyPath, KeyPathBuf},
     key_path,
     uint::{InPgIdx, PgIdx, U64},

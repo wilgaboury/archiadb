@@ -9,10 +9,10 @@ use std::{
 use anyhow::Result;
 
 use crate::{
+    bio::BlockIoUring,
     block::{BlockIoDefault, BlockIoRapidHash},
     db::Db,
     file::DbFile,
-    fio::BlockIoUring,
     meta::MetaHandler,
     util::{ChecksumDisk, from_bytes_mut},
 };

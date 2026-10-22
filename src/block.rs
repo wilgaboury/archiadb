@@ -2,7 +2,7 @@ use anyhow::{Result, bail};
 use parking_lot::Mutex;
 
 use crate::{
-    fio::BlockIoUring,
+    bio::BlockIoUring,
     uint::{InPgIdx, PgIdx},
     util::{has_valid_checksum, update_checksum},
 };

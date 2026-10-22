@@ -3,9 +3,9 @@ use std::{cell::RefCell, collections::HashMap, ptr, rc::Rc};
 use anyhow::Result;
 
 use crate::{
+    bio::PageBuf,
     block::BlockIo,
     db::{DirtyEntry, Txn},
-    fio::PageBuf,
     lalloc::free_on_disk_pg,
     uint::PgIdx,
 };

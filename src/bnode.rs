@@ -1,10 +1,10 @@
 use anyhow::Result;
 
 use crate::{
+    bio::MIN_PAGE_SIZE,
     btree::BtreeGetResult,
     const_assert,
     db::Txn,
-    fio::MIN_PAGE_SIZE,
     flux::FluxBuf,
     lalloc::Arena,
     uint::{InPgIdx, InPgIdxDisk, PgIdx, PgIdxDisk, U24, U64},
@@ -149,8 +149,6 @@ impl ArenaDisk {
 pub(crate) trait BNodeBuf {
     fn header(&self) -> &BNodeHeader;
     fn header_mut(&mut self) -> &mut BNodeHeader;
-    fn root_header(&self) -> &BNodeRootHeader;
-    fn root_header_mut(&mut self) -> &mut BNodeRootHeader;
 }
 
 impl BNodeBuf for [u8] {
@@ -160,14 +158,6 @@ impl BNodeBuf for [u8] {
 
     fn header_mut(&mut self) -> &mut BNodeHeader {
         from_bytes_mut::<BNodeHeader>(self)
-    }
-
-    fn root_header(&self) -> &BNodeRootHeader {
-        from_bytes::<BNodeRootHeader>(self)
-    }
-
-    fn root_header_mut(&mut self) -> &mut BNodeRootHeader {
-        from_bytes_mut::<BNodeRootHeader>(self)
     }
 }
 

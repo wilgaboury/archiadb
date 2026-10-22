@@ -1,13 +1,13 @@
 #![feature(coverage_attribute)]
 #![allow(dead_code)]
 
+pub mod bio;
 pub mod block;
 pub mod bnode;
 pub mod btree;
 pub mod db;
 pub mod defer;
 pub mod file;
-pub mod fio;
 pub mod flux;
 pub mod flux_old;
 pub mod galloc;

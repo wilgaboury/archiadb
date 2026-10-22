@@ -5,10 +5,10 @@ use anyhow::{Result, bail};
 use crate::{
     block::BlockIo,
     bnode::{
-        BNodeBuf, BNodeHeader, BNodeKind, LeafValue, LeafValueGetResult, SearchResult, SlotDisk,
-        get_key_inner, get_key_leaf, get_page_ptr, get_value_leaf, in_pg_len, in_pg_size_of,
-        insert_at_inner, insert_at_leaf, remaining_bytes, remove_at_leaf, root_to_inner,
-        search_inner, search_leaf, write_page_ptr,
+        BNodeBuf, BNodeHeader, BNodeKind, BNodeRootHeader, LeafValue, LeafValueGetResult,
+        SearchResult, SlotDisk, get_key_inner, get_key_leaf, get_page_ptr, get_value_leaf,
+        in_pg_len, in_pg_size_of, insert_at_inner, insert_at_leaf, remaining_bytes, remove_at_leaf,
+        root_to_inner, search_inner, search_leaf, write_page_ptr,
     },
     db::{DirtyEntry, Txn},
     flux::{Flux, FluxBuf},
@@ -108,13 +108,13 @@ impl<'a> Txn<'a> {
             .await?
         {
             InsertResult::Single(mut page_buf) => {
-                let header = page_buf.as_mut().root_header_mut();
+                let header = from_bytes_mut::<BNodeRootHeader>(page_buf.as_mut());
                 header.version.set(header.version.get() + 1);
                 Ok(page_buf)
             }
             InsertResult::Split(left, split, right) => {
                 let mut pg_buf = self.flux_buf();
-                let header = pg_buf.as_mut().root_header_mut();
+                let header = from_bytes_mut::<BNodeRootHeader>(pg_buf.as_mut());
                 header.init();
                 header.header.len.set(1);
                 header.version.set(header.version.get() + 1);

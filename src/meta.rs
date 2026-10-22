@@ -8,9 +8,9 @@ use anyhow::{Result, anyhow, bail};
 use tokio::sync::Mutex;
 
 use crate::{
+    bio::{MAX_PAGE_SIZE, MIN_PAGE_SIZE, choose_page_size},
     block::{BlockIo, BlockIoDefault},
     const_assert,
-    fio::{MAX_PAGE_SIZE, MIN_PAGE_SIZE, choose_page_size},
     uint::{InPgIdxDisk, PgIdx, PgIdxDisk, U16, U64, U128},
     util::{Checksum, from_bytes, from_bytes_mut, order_front_back, update_checksum},
 };
