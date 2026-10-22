@@ -5,7 +5,7 @@ use crate::{
     const_assert,
     db::Txn,
     fio::MIN_PAGE_SIZE,
-    flux_old::FluxBuf,
+    flux::FluxBuf,
     lalloc::Arena,
     uint::{InPgIdx, InPgIdxDisk, PgIdx, PgIdxDisk, U24, U64},
     util::{ChecksumDisk, from_bytes, from_bytes_mut},
@@ -574,7 +574,10 @@ impl LeafValueGetResult {
         }
     }
 
-    pub(crate) fn with_page(&self, buf: FluxBuf) -> BtreeGetResult {
+    pub(crate) fn with_page<U>(&self, buf: FluxBuf<U>) -> BtreeGetResult<U>
+    where
+        U: AsMut<[u8]> + AsRef<[u8]> + Send,
+    {
         match self {
             LeafValueGetResult::Btree { pg_idx_1, pg_idx_2 } => BtreeGetResult::Btree {
                 pg_idx_1: *pg_idx_1,

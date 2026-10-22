@@ -32,7 +32,7 @@ impl FluxOld {
 }
 
 #[derive(Debug)]
-pub enum FluxBuf {
+pub enum FluxBufOld {
     Unalloc(PageBuf),
     Alloc(FluxBufAlloc),
 }
@@ -44,29 +44,29 @@ pub struct FluxBufAlloc {
     inner: FluxInner,
 }
 
-impl AsRef<[u8]> for FluxBuf {
+impl AsRef<[u8]> for FluxBufOld {
     fn as_ref(&self) -> &[u8] {
         match self {
-            FluxBuf::Unalloc(buf) => buf.as_ref(),
-            FluxBuf::Alloc(data) => data.buf.as_ref().unwrap().as_ref(),
+            FluxBufOld::Unalloc(buf) => buf.as_ref(),
+            FluxBufOld::Alloc(data) => data.buf.as_ref().unwrap().as_ref(),
         }
     }
 }
 
-impl AsMut<[u8]> for FluxBuf {
+impl AsMut<[u8]> for FluxBufOld {
     fn as_mut(&mut self) -> &mut [u8] {
         match self {
-            FluxBuf::Unalloc(buf) => buf.as_mut(),
-            FluxBuf::Alloc(data) => data.buf.as_mut().unwrap().as_mut(),
+            FluxBufOld::Unalloc(buf) => buf.as_mut(),
+            FluxBufOld::Alloc(data) => data.buf.as_mut().unwrap().as_mut(),
         }
     }
 }
 
-impl FluxBuf {
+impl FluxBufOld {
     fn extract(self) -> (Option<PgIdx>, PageBuf) {
         match self {
-            FluxBuf::Unalloc(buf) => (None, buf),
-            FluxBuf::Alloc(data) => {
+            FluxBufOld::Unalloc(buf) => (None, buf),
+            FluxBufOld::Alloc(data) => {
                 let idx = data.idx;
                 let buf = unsafe { ptr::read(&data.buf) };
                 std::mem::forget(data);
@@ -77,30 +77,30 @@ impl FluxBuf {
 }
 
 impl<'a> Txn<'a> {
-    pub(crate) fn flux_buf(&mut self) -> FluxBuf {
-        FluxBuf::Unalloc(self.db.fio.buf())
+    pub(crate) fn flux_buf(&mut self) -> FluxBufOld {
+        FluxBufOld::Unalloc(self.db.fio.buf())
     }
 
-    pub(crate) async fn flux_read(&mut self, pg_idx: u64) -> Result<FluxBuf> {
+    pub(crate) async fn flux_read(&mut self, pg_idx: u64) -> Result<FluxBufOld> {
         if let Some(buf) = self.flux.inner.map.borrow_mut().get_mut(&pg_idx) {
             if buf.is_none() {
                 panic!("cannot read already owned page")
             }
             let buf = std::mem::replace(buf, None).unwrap();
-            Ok(FluxBuf::Alloc(FluxBufAlloc {
+            Ok(FluxBufOld::Alloc(FluxBufAlloc {
                 idx: pg_idx,
                 buf: Some(buf),
                 inner: self.flux.inner.clone(),
             }))
         } else {
-            Ok(FluxBuf::Unalloc(self.db.fio.read(pg_idx).await?))
+            Ok(FluxBufOld::Unalloc(self.db.fio.read(pg_idx).await?))
         }
     }
 
     pub(crate) async fn flux_write(
         &mut self,
         dirty: &mut DirtyEntry,
-        buf: FluxBuf,
+        buf: FluxBufOld,
     ) -> Result<PgIdx> {
         let (maybe_idx, buf) = buf.extract();
         let idx = if let Some(idx) = maybe_idx {

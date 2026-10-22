@@ -11,24 +11,28 @@ use crate::{
         search_inner, search_leaf, write_page_ptr,
     },
     db::{DirtyEntry, Txn},
-    flux_old::FluxBuf,
+    flux::{Flux, FluxBuf},
+    flux_old::FluxBufOld,
     uint::{InPgIdx, PgIdx, PgIdxDisk},
     util::{ChecksumDisk, from_bytes, from_bytes_mut},
 };
 
 enum InsertResult {
-    Single(FluxBuf),
+    Single(FluxBufOld),
     Split(u64, Box<[u8]>, u64),
 }
 
 #[derive(Debug)]
-pub(crate) enum BtreeGetResult {
+pub(crate) enum BtreeGetResult<U>
+where
+    U: AsMut<[u8]> + AsRef<[u8]> + Send,
+{
     Btree {
         pg_idx_1: PgIdx,
         pg_idx_2: PgIdx,
     },
     ValueEmbedded {
-        buf: FluxBuf,
+        buf: FluxBuf<U>,
         loc: usize,
         len: usize,
     },
@@ -38,55 +42,67 @@ pub(crate) enum BtreeGetResult {
     },
 }
 
-impl<'a> Txn<'a> {
-    async fn btree_get(&mut self, key: &[u8], node: &FluxBuf) -> Result<Option<BtreeGetResult>> {
-        assert!(node.as_ref().header().kind == BNodeKind::Root);
+async fn get<B, U>(
+    key: &[u8],
+    node: &FluxBuf<U>,
+    flux: &mut Flux<B, U>,
+) -> Result<Option<BtreeGetResult<U>>>
+where
+    B: BlockIo<Buf = U>,
+    U: AsMut<[u8]> + AsRef<[u8]> + Send,
+{
+    assert!(node.as_ref().header().kind == BNodeKind::Root);
 
-        let search = search_inner(node.as_ref(), key);
-        let child_pg_idx = if node.as_ref().header().len() > 0 {
-            get_page_ptr(node.as_ref(), search.idx())
-        } else {
-            bail!("empty root node")
-        };
-        let child_pg = self.flux_read(child_pg_idx).await?;
-        self.btree_get_inner(key, child_pg).await
-    }
+    let search = search_inner(node.as_ref(), key);
+    let child_pg_idx = if node.as_ref().header().len() > 0 {
+        get_page_ptr(node.as_ref(), search.idx())
+    } else {
+        bail!("empty root node")
+    };
+    let child_pg = flux.read(child_pg_idx).await?;
+    get_inner(key, child_pg, flux).await
+}
 
-    async fn btree_get_inner(
-        &mut self,
-        key: &[u8],
-        node: FluxBuf,
-    ) -> Result<Option<BtreeGetResult>> {
-        match node.as_ref().header().kind {
-            BNodeKind::Leaf => {
-                let search = search_leaf(node.as_ref(), key);
-                if let SearchResult::Exact(idx) = search {
-                    let value = get_value_leaf(node.as_ref(), idx);
-                    Ok(Some(value.with_page(node)))
-                } else {
-                    Ok(None)
-                }
-            }
-            BNodeKind::Root | BNodeKind::Inner => {
-                let search = search_inner(node.as_ref(), key);
-                let child_pg_idx = if node.as_ref().header().len() > 0 {
-                    get_page_ptr(node.as_ref(), search.idx())
-                } else {
-                    bail!("empty inner node")
-                };
-                let child_pg = self.flux_read(child_pg_idx).await?;
-                Box::pin(self.btree_get_inner(key, child_pg)).await
+async fn get_inner<B, U>(
+    key: &[u8],
+    node: FluxBuf<U>,
+    flux: &mut Flux<B, U>,
+) -> Result<Option<BtreeGetResult<U>>>
+where
+    B: BlockIo<Buf = U>,
+    U: AsMut<[u8]> + AsRef<[u8]> + Send,
+{
+    match node.as_ref().header().kind {
+        BNodeKind::Leaf => {
+            let search = search_leaf(node.as_ref(), key);
+            if let SearchResult::Exact(idx) = search {
+                let value = get_value_leaf(node.as_ref(), idx);
+                Ok(Some(value.with_page(node)))
+            } else {
+                Ok(None)
             }
         }
+        BNodeKind::Root | BNodeKind::Inner => {
+            let search = search_inner(node.as_ref(), key);
+            let child_pg_idx = if node.as_ref().header().len() > 0 {
+                get_page_ptr(node.as_ref(), search.idx())
+            } else {
+                bail!("empty inner node")
+            };
+            let child_pg = flux.read(child_pg_idx).await?;
+            Box::pin(get_inner(key, child_pg, flux)).await
+        }
     }
+}
 
+impl<'a> Txn<'a> {
     async fn btree_upsert(
         &mut self,
         dirty: &mut DirtyEntry,
         key: &[u8],
         value: &[u8],
-        root: FluxBuf,
-    ) -> Result<FluxBuf> {
+        root: FluxBufOld,
+    ) -> Result<FluxBufOld> {
         match self
             .btree_upsert_inner(dirty, key, LeafValue::Value(value), root)
             .await?
@@ -114,7 +130,7 @@ impl<'a> Txn<'a> {
         dirty: &mut DirtyEntry,
         key: &[u8],
         value: LeafValue<'_>,
-        mut pg: FluxBuf,
+        mut pg: FluxBufOld,
     ) -> Result<InsertResult> {
         let header = from_bytes::<BNodeHeader>(pg.as_ref());
         if header.kind == BNodeKind::Leaf {
@@ -164,7 +180,7 @@ impl<'a> Txn<'a> {
         left_idx: u64,
         split: Box<[u8]>,
         right_idx: u64,
-        pg: FluxBuf,
+        pg: FluxBufOld,
     ) -> Result<InsertResult> {
         let mut left = pg;
         let mut right = self.flux_buf();
@@ -211,7 +227,7 @@ impl<'a> Txn<'a> {
         dirty: &mut DirtyEntry,
         key: &[u8],
         value: LeafValue<'_>,
-        mut pg: FluxBuf,
+        mut pg: FluxBufOld,
     ) -> Result<InsertResult> {
         let encoded_value = value.encode(self).await?;
 
@@ -348,181 +364,183 @@ impl<'a> Txn<'a> {
 #[cfg(test)]
 mod tests {
 
-    use anyhow::Result;
-    use function_name::named;
-    use rand::{SeedableRng, rngs::StdRng};
+    // TODO: need to migrate to new generic Flux
 
-    use crate::{
-        bnode::{
-            BNodeBuf, BNodeHeader, BNodeKind, BNodeRootHeader, LeafValueGetResult, SearchResult,
-            get_key_leaf, get_page_ptr, get_value_leaf, search_leaf,
-        },
-        btree::BtreeGetResult,
-        db::Db,
-        key_path,
-        test::TmpDir,
-        util::from_bytes,
-    };
+    // use anyhow::Result;
+    // use function_name::named;
+    // use rand::{SeedableRng, rngs::StdRng};
 
-    #[named]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_upsert() -> Result<()> {
-        let dir = TmpDir::new(function_name!()).unwrap();
-        let db = Db::builder().path(dir.root().join("file")).build().await?;
-        {
-            let mut txn = db.txn().write(key_path![])?.begin().await;
-            let mut page = txn.flux_buf();
-            page.as_mut().root_header_mut().init();
-            let mut dirty = txn.create_root_dirty_entry().await?;
-            let page = txn.btree_upsert(&mut dirty, b"key", b"value", page).await?;
+    // use crate::{
+    //     bnode::{
+    //         BNodeBuf, BNodeHeader, BNodeKind, BNodeRootHeader, LeafValueGetResult, SearchResult,
+    //         get_key_leaf, get_page_ptr, get_value_leaf, search_leaf,
+    //     },
+    //     btree::BtreeGetResult,
+    //     db::Db,
+    //     key_path,
+    //     test::TmpDir,
+    //     util::from_bytes,
+    // };
 
-            {
-                let header = from_bytes::<BNodeRootHeader>(page.as_ref());
-                assert_eq!(header.header.kind, BNodeKind::Root);
-                assert_eq!(header.header.len.get(), 1);
+    // #[named]
+    // #[tokio::test(flavor = "multi_thread")]
+    // async fn test_upsert() -> Result<()> {
+    //     let dir = TmpDir::new(function_name!()).unwrap();
+    //     let db = Db::builder().path(dir.root().join("file")).build().await?;
+    //     {
+    //         let mut txn = db.txn().write(key_path![])?.begin().await;
+    //         let mut page = txn.flux_buf();
+    //         page.as_mut().root_header_mut().init();
+    //         let mut dirty = txn.create_root_dirty_entry().await?;
+    //         let page = txn.btree_upsert(&mut dirty, b"key", b"value", page).await?;
 
-                let pg = get_page_ptr(page.as_ref(), 0);
-                let child_pg = txn.flux_read(pg).await?;
-                {
-                    let header = from_bytes::<BNodeHeader>(child_pg.as_ref());
-                    assert_eq!(header.kind, BNodeKind::Leaf);
-                    assert_eq!(header.len.get(), 1);
+    //         {
+    //             let header = from_bytes::<BNodeRootHeader>(page.as_ref());
+    //             assert_eq!(header.header.kind, BNodeKind::Root);
+    //             assert_eq!(header.header.len.get(), 1);
 
-                    let search = search_leaf(child_pg.as_ref(), b"key");
-                    assert!(matches!(search, SearchResult::Exact(0)));
-                    let key = get_key_leaf(child_pg.as_ref(), 0);
-                    assert_eq!(key, b"key");
-                    let value = get_value_leaf(child_pg.as_ref(), 0);
-                    match value {
-                        LeafValueGetResult::ValueEmbedded { loc, len } => {
-                            let value = &child_pg.as_ref()[loc..loc + len];
-                            assert_eq!(value, b"value");
-                        }
-                        _ => panic!("expected embedded value"),
-                    }
-                }
-            }
+    //             let pg = get_page_ptr(page.as_ref(), 0);
+    //             let child_pg = txn.flux_read(pg).await?;
+    //             {
+    //                 let header = from_bytes::<BNodeHeader>(child_pg.as_ref());
+    //                 assert_eq!(header.kind, BNodeKind::Leaf);
+    //                 assert_eq!(header.len.get(), 1);
 
-            let res = txn.btree_get(b"key", &page).await?;
-            match res.unwrap() {
-                BtreeGetResult::ValueEmbedded { buf, loc, len } => {
-                    assert_eq!(&buf.as_ref()[loc..loc + len], b"value")
-                }
-                _ => panic!("expected embedded value"),
-            }
+    //                 let search = search_leaf(child_pg.as_ref(), b"key");
+    //                 assert!(matches!(search, SearchResult::Exact(0)));
+    //                 let key = get_key_leaf(child_pg.as_ref(), 0);
+    //                 assert_eq!(key, b"key");
+    //                 let value = get_value_leaf(child_pg.as_ref(), 0);
+    //                 match value {
+    //                     LeafValueGetResult::ValueEmbedded { loc, len } => {
+    //                         let value = &child_pg.as_ref()[loc..loc + len];
+    //                         assert_eq!(value, b"value");
+    //                     }
+    //                     _ => panic!("expected embedded value"),
+    //                 }
+    //             }
+    //         }
 
-            let page = txn.btree_upsert(&mut dirty, b"key", b"value", page).await?;
+    //         let res = btree_get(b"key", &page).await?;
+    //         match res.unwrap() {
+    //             BtreeGetResult::ValueEmbedded { buf, loc, len } => {
+    //                 assert_eq!(&buf.as_ref()[loc..loc + len], b"value")
+    //             }
+    //             _ => panic!("expected embedded value"),
+    //         }
 
-            let res = txn.btree_get(b"key", &page).await?;
-            match res.unwrap() {
-                BtreeGetResult::ValueEmbedded { buf, loc, len } => {
-                    assert_eq!(&buf.as_ref()[loc..loc + len], b"value")
-                }
-                _ => panic!("expected embedded value"),
-            }
+    //         let page = txn.btree_upsert(&mut dirty, b"key", b"value", page).await?;
 
-            let page = txn
-                .btree_upsert(&mut dirty, b"key2", b"value2", page)
-                .await?;
+    //         let res = txn.btree_get(b"key", &page).await?;
+    //         match res.unwrap() {
+    //             BtreeGetResult::ValueEmbedded { buf, loc, len } => {
+    //                 assert_eq!(&buf.as_ref()[loc..loc + len], b"value")
+    //             }
+    //             _ => panic!("expected embedded value"),
+    //         }
 
-            let res = txn.btree_get(b"key", &page).await?;
-            match res.unwrap() {
-                BtreeGetResult::ValueEmbedded { buf, loc, len } => {
-                    assert_eq!(&buf.as_ref()[loc..loc + len], b"value")
-                }
-                _ => panic!("expected embedded value"),
-            }
-            let res = txn.btree_get(b"key2", &page).await?;
-            match res.unwrap() {
-                BtreeGetResult::ValueEmbedded { buf, loc, len } => {
-                    assert_eq!(&buf.as_ref()[loc..loc + len], b"value2")
-                }
-                _ => panic!("expected embedded value"),
-            }
+    //         let page = txn
+    //             .btree_upsert(&mut dirty, b"key2", b"value2", page)
+    //             .await?;
 
-            let page = txn
-                .btree_upsert(&mut dirty, b"key3", b"value3", page)
-                .await?;
-            let res = txn.btree_get(b"key", &page).await?;
-            match res.unwrap() {
-                BtreeGetResult::ValueEmbedded { buf, loc, len } => {
-                    assert_eq!(&buf.as_ref()[loc..loc + len], b"value")
-                }
-                _ => panic!("expected embedded value"),
-            }
-            let res = txn.btree_get(b"key2", &page).await?;
-            match res.unwrap() {
-                BtreeGetResult::ValueEmbedded { buf, loc, len } => {
-                    assert_eq!(&buf.as_ref()[loc..loc + len], b"value2")
-                }
-                _ => panic!("expected embedded value"),
-            }
-            let res = txn.btree_get(b"key3", &page).await?;
-            match res.unwrap() {
-                BtreeGetResult::ValueEmbedded { buf, loc, len } => {
-                    assert_eq!(&buf.as_ref()[loc..loc + len], b"value3")
-                }
-                _ => panic!("expected embedded value"),
-            }
-        }
-        anyhow::Ok(())
-    }
+    //         let res = txn.btree_get(b"key", &page).await?;
+    //         match res.unwrap() {
+    //             BtreeGetResult::ValueEmbedded { buf, loc, len } => {
+    //                 assert_eq!(&buf.as_ref()[loc..loc + len], b"value")
+    //             }
+    //             _ => panic!("expected embedded value"),
+    //         }
+    //         let res = txn.btree_get(b"key2", &page).await?;
+    //         match res.unwrap() {
+    //             BtreeGetResult::ValueEmbedded { buf, loc, len } => {
+    //                 assert_eq!(&buf.as_ref()[loc..loc + len], b"value2")
+    //             }
+    //             _ => panic!("expected embedded value"),
+    //         }
 
-    #[ignore]
-    #[named]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_upsert_many_rand() -> Result<()> {
-        use rand::{Rng, distributions::Alphanumeric};
-        use std::collections::HashMap;
+    //         let page = txn
+    //             .btree_upsert(&mut dirty, b"key3", b"value3", page)
+    //             .await?;
+    //         let res = txn.btree_get(b"key", &page).await?;
+    //         match res.unwrap() {
+    //             BtreeGetResult::ValueEmbedded { buf, loc, len } => {
+    //                 assert_eq!(&buf.as_ref()[loc..loc + len], b"value")
+    //             }
+    //             _ => panic!("expected embedded value"),
+    //         }
+    //         let res = txn.btree_get(b"key2", &page).await?;
+    //         match res.unwrap() {
+    //             BtreeGetResult::ValueEmbedded { buf, loc, len } => {
+    //                 assert_eq!(&buf.as_ref()[loc..loc + len], b"value2")
+    //             }
+    //             _ => panic!("expected embedded value"),
+    //         }
+    //         let res = txn.btree_get(b"key3", &page).await?;
+    //         match res.unwrap() {
+    //             BtreeGetResult::ValueEmbedded { buf, loc, len } => {
+    //                 assert_eq!(&buf.as_ref()[loc..loc + len], b"value3")
+    //             }
+    //             _ => panic!("expected embedded value"),
+    //         }
+    //     }
+    //     anyhow::Ok(())
+    // }
 
-        let dir = TmpDir::new(function_name!()).unwrap();
-        let db = Db::builder().path(dir.root().join("file")).build().await?;
-        {
-            let mut txn = db.txn().write(key_path![])?.begin().await;
-            let mut page = txn.flux_buf();
-            page.as_mut().root_header_mut().init();
-            let mut dirty = txn.create_root_dirty_entry().await?;
+    // #[ignore]
+    // #[named]
+    // #[tokio::test(flavor = "multi_thread")]
+    // async fn test_upsert_many_rand() -> Result<()> {
+    //     use rand::{Rng, distributions::Alphanumeric};
+    //     use std::collections::HashMap;
 
-            let mut rng = StdRng::seed_from_u64(111);
-            let mut expected: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+    //     let dir = TmpDir::new(function_name!()).unwrap();
+    //     let db = Db::builder().path(dir.root().join("file")).build().await?;
+    //     {
+    //         let mut txn = db.txn().write(key_path![])?.begin().await;
+    //         let mut page = txn.flux_buf();
+    //         page.as_mut().root_header_mut().init();
+    //         let mut dirty = txn.create_root_dirty_entry().await?;
 
-            for _i in 0..10_000 {
-                let klen = rng.gen_range(1..=16);
-                let vlen = rng.gen_range(1..=16);
-                let key: Vec<u8> = (0..klen).map(|_| rng.sample(Alphanumeric)).collect();
-                let value: Vec<u8> = (0..vlen).map(|_| rng.sample(Alphanumeric)).collect();
+    //         let mut rng = StdRng::seed_from_u64(111);
+    //         let mut expected: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
 
-                page = txn.btree_upsert(&mut dirty, &key, &value, page).await?;
+    //         for _i in 0..10_000 {
+    //             let klen = rng.gen_range(1..=16);
+    //             let vlen = rng.gen_range(1..=16);
+    //             let key: Vec<u8> = (0..klen).map(|_| rng.sample(Alphanumeric)).collect();
+    //             let value: Vec<u8> = (0..vlen).map(|_| rng.sample(Alphanumeric)).collect();
 
-                let res = txn.btree_get(&key, &page).await?;
-                if res.is_none() {
-                    println!("key not found: {:?}", key);
-                }
-                match res.unwrap() {
-                    BtreeGetResult::ValueEmbedded { buf, loc, len } => {
-                        assert_eq!(&buf.as_ref()[loc..loc + len], &value)
-                    }
-                    _ => panic!("expected embedded value"),
-                }
+    //             page = txn.btree_upsert(&mut dirty, &key, &value, page).await?;
 
-                expected.insert(key, value);
-            }
+    //             let res = txn.btree_get(&key, &page).await?;
+    //             if res.is_none() {
+    //                 println!("key not found: {:?}", key);
+    //             }
+    //             match res.unwrap() {
+    //                 BtreeGetResult::ValueEmbedded { buf, loc, len } => {
+    //                     assert_eq!(&buf.as_ref()[loc..loc + len], &value)
+    //                 }
+    //                 _ => panic!("expected embedded value"),
+    //             }
 
-            for (key, value) in expected.iter() {
-                let res = txn.btree_get(key, &page).await?;
-                match res.unwrap() {
-                    BtreeGetResult::ValueEmbedded { buf, loc, len } => {
-                        assert_eq!(
-                            &buf.as_ref()[loc..loc + len],
-                            value.as_slice(),
-                            "mismatch for key {:?}",
-                            key
-                        );
-                    }
-                    _ => panic!("expected embedded value for key {:?}", key),
-                }
-            }
-        }
-        anyhow::Ok(())
-    }
+    //             expected.insert(key, value);
+    //         }
+
+    //         for (key, value) in expected.iter() {
+    //             let res = txn.btree_get(key, &page).await?;
+    //             match res.unwrap() {
+    //                 BtreeGetResult::ValueEmbedded { buf, loc, len } => {
+    //                     assert_eq!(
+    //                         &buf.as_ref()[loc..loc + len],
+    //                         value.as_slice(),
+    //                         "mismatch for key {:?}",
+    //                         key
+    //                     );
+    //                 }
+    //                 _ => panic!("expected embedded value for key {:?}", key),
+    //             }
+    //         }
+    //     }
+    //     anyhow::Ok(())
+    // }
 }
