@@ -14,40 +14,26 @@ use crate::{block::BlockIo, uint::PgIdx};
 /// a transaction, which may edit the same page multiple times.
 ///
 /// These allocations/pages are "in flux" because they are not yet persisted to disk.
-pub(crate) struct Flux<B, U>
-where
-    B: BlockIo<Buf = U>,
-    U: AsMut<[u8]> + AsRef<[u8]> + Send,
-{
-    pub(crate) inner: FluxInnerRef<U>,
+pub(crate) struct Flux<B: BlockIo> {
+    pub(crate) inner: FluxInnerRef<B>,
     pub(crate) bio: B,
 }
 
 #[derive(Debug)]
-pub(crate) enum FluxMapValue<U>
-where
-    U: AsMut<[u8]> + AsRef<[u8]> + Send,
-{
+pub(crate) enum FluxMapValue<B: BlockIo> {
     Flushed,
     Borrowed,
-    Owned(U),
+    Owned(B::Buf),
 }
 
 type FluxInnerRef<U> = Rc<RefCell<FluxInner<U>>>;
 
 #[derive(Debug)]
-pub(crate) struct FluxInner<U>
-where
-    U: AsMut<[u8]> + AsRef<[u8]> + Send,
-{
-    pub(crate) map: HashMap<PgIdx, FluxMapValue<U>>,
+pub(crate) struct FluxInner<B: BlockIo> {
+    pub(crate) map: HashMap<PgIdx, FluxMapValue<B>>,
 }
 
-impl<B, U> Flux<B, U>
-where
-    B: BlockIo<Buf = U>,
-    U: AsMut<[u8]> + AsRef<[u8]> + Send,
-{
+impl<B: BlockIo> Flux<B> {
     pub(crate) fn new(bio: B) -> Self {
         Flux {
             inner: Rc::new(RefCell::new(FluxInner {
@@ -57,11 +43,11 @@ where
         }
     }
 
-    pub(crate) fn buf(&mut self) -> FluxBuf<U> {
+    pub(crate) fn buf(&mut self) -> FluxBuf<B> {
         FluxBuf::Unalloc(self.bio.buf())
     }
 
-    pub(crate) async fn read(&mut self, pg_idx: u64) -> Result<FluxBuf<U>> {
+    pub(crate) async fn read(&mut self, pg_idx: u64) -> Result<FluxBuf<B>> {
         if let Some(val) = self.inner.borrow_mut().map.get_mut(&pg_idx) {
             match val {
                 FluxMapValue::Flushed => {
@@ -97,7 +83,7 @@ where
         }
     }
 
-    pub(crate) async fn write<F, Fut>(&mut self, buf: FluxBuf<U>, alloc: F) -> Result<PgIdx>
+    pub(crate) async fn write<F, Fut>(&mut self, buf: FluxBuf<B>, alloc: F) -> Result<PgIdx>
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<PgIdx>>,
@@ -140,28 +126,19 @@ where
 }
 
 #[derive(Debug)]
-pub enum FluxBuf<U>
-where
-    U: AsMut<[u8]> + AsRef<[u8]> + Send,
-{
-    Unalloc(U),
-    Alloc(FluxBufAlloc<U>),
+pub enum FluxBuf<B: BlockIo> {
+    Unalloc(B::Buf),
+    Alloc(FluxBufAlloc<B>),
 }
 
 #[derive(Debug)]
-pub struct FluxBufAlloc<U>
-where
-    U: AsMut<[u8]> + AsRef<[u8]> + Send,
-{
+pub struct FluxBufAlloc<B: BlockIo> {
     idx: u64,
-    buf: Option<U>,
-    inner: FluxInnerRef<U>,
+    buf: Option<B::Buf>,
+    inner: FluxInnerRef<B>,
 }
 
-impl<U> AsRef<[u8]> for FluxBuf<U>
-where
-    U: AsMut<[u8]> + AsRef<[u8]> + Send,
-{
+impl<B: BlockIo> AsRef<[u8]> for FluxBuf<B> {
     fn as_ref(&self) -> &[u8] {
         match self {
             FluxBuf::Unalloc(buf) => buf.as_ref(),
@@ -170,10 +147,7 @@ where
     }
 }
 
-impl<U> AsMut<[u8]> for FluxBuf<U>
-where
-    U: AsMut<[u8]> + AsRef<[u8]> + Send,
-{
+impl<B: BlockIo> AsMut<[u8]> for FluxBuf<B> {
     fn as_mut(&mut self) -> &mut [u8] {
         match self {
             FluxBuf::Unalloc(buf) => buf.as_mut(),
@@ -182,11 +156,8 @@ where
     }
 }
 
-impl<U> FluxBuf<U>
-where
-    U: AsMut<[u8]> + AsRef<[u8]> + Send,
-{
-    fn extract(self) -> (Option<PgIdx>, U) {
+impl<B: BlockIo> FluxBuf<B> {
+    fn extract(self) -> (Option<PgIdx>, B::Buf) {
         match self {
             FluxBuf::Unalloc(buf) => (None, buf),
             FluxBuf::Alloc(data) => {
@@ -199,10 +170,7 @@ where
     }
 }
 
-impl<U> Drop for FluxBufAlloc<U>
-where
-    U: AsMut<[u8]> + AsRef<[u8]> + Send,
-{
+impl<B: BlockIo> Drop for FluxBufAlloc<B> {
     fn drop(&mut self) {
         let map = &mut self.inner.borrow_mut().map;
         if map.get(&self.idx).is_some() {

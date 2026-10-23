@@ -23,16 +23,13 @@ enum InsertResult {
 }
 
 #[derive(Debug)]
-pub(crate) enum BtreeGetResult<U>
-where
-    U: AsMut<[u8]> + AsRef<[u8]> + Send,
-{
+pub(crate) enum BtreeGetResult<B: BlockIo> {
     Btree {
         pg_idx_1: PgIdx,
         pg_idx_2: PgIdx,
     },
     ValueEmbedded {
-        buf: FluxBuf<U>,
+        buf: FluxBuf<B>,
         loc: usize,
         len: usize,
     },
@@ -42,15 +39,11 @@ where
     },
 }
 
-async fn get<B, U>(
+async fn get<B: BlockIo>(
     key: &[u8],
-    node: &FluxBuf<U>,
-    flux: &mut Flux<B, U>,
-) -> Result<Option<BtreeGetResult<U>>>
-where
-    B: BlockIo<Buf = U>,
-    U: AsMut<[u8]> + AsRef<[u8]> + Send,
-{
+    node: &FluxBuf<B>,
+    flux: &mut Flux<B>,
+) -> Result<Option<BtreeGetResult<B>>> {
     assert!(node.as_ref().header().kind == BNodeKind::Root);
 
     let search = search_inner(node.as_ref(), key);
@@ -63,15 +56,11 @@ where
     get_inner(key, child_pg, flux).await
 }
 
-async fn get_inner<B, U>(
+async fn get_inner<B: BlockIo>(
     key: &[u8],
-    node: FluxBuf<U>,
-    flux: &mut Flux<B, U>,
-) -> Result<Option<BtreeGetResult<U>>>
-where
-    B: BlockIo<Buf = U>,
-    U: AsMut<[u8]> + AsRef<[u8]> + Send,
-{
+    node: FluxBuf<B>,
+    flux: &mut Flux<B>,
+) -> Result<Option<BtreeGetResult<B>>> {
     match node.as_ref().header().kind {
         BNodeKind::Leaf => {
             let search = search_leaf(node.as_ref(), key);

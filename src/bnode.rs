@@ -2,6 +2,7 @@ use anyhow::Result;
 
 use crate::{
     bio::MIN_PAGE_SIZE,
+    block::BlockIo,
     btree::BtreeGetResult,
     const_assert,
     db::Txn,
@@ -564,10 +565,7 @@ impl LeafValueGetResult {
         }
     }
 
-    pub(crate) fn with_page<U>(&self, buf: FluxBuf<U>) -> BtreeGetResult<U>
-    where
-        U: AsMut<[u8]> + AsRef<[u8]> + Send,
-    {
+    pub(crate) fn with_page<B: BlockIo>(&self, buf: FluxBuf<B>) -> BtreeGetResult<B> {
         match self {
             LeafValueGetResult::Btree { pg_idx_1, pg_idx_2 } => BtreeGetResult::Btree {
                 pg_idx_1: *pg_idx_1,

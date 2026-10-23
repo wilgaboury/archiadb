@@ -1,3 +1,5 @@
+use std::fmt::Debug;
+
 use anyhow::{Result, bail};
 use parking_lot::Mutex;
 
@@ -10,7 +12,7 @@ use crate::{
 pub(crate) type BlockIoDefault = BlockIoRapidHash<BlockIoUring>;
 
 pub(crate) trait BlockIo {
-    type Buf: AsMut<[u8]> + AsRef<[u8]> + Send;
+    type Buf: AsMut<[u8]> + AsRef<[u8]> + Send + Debug;
 
     fn page_size(&self) -> InPgIdx;
     fn buf(&self) -> Self::Buf;
