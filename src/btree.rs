@@ -10,7 +10,7 @@ use crate::{
         in_pg_len, in_pg_size_of, insert_at_inner, insert_at_leaf, remaining_bytes, remove_at_leaf,
         root_to_inner, search_inner, search_leaf, write_page_ptr,
     },
-    db::{DirtyEntry, Txn},
+    db::{BRootInfo, Txn},
     flux::{Flux, FluxBuf},
     flux_old::FluxBufOld,
     uint::{InPgIdx, PgIdx, PgIdxDisk},
@@ -84,10 +84,14 @@ async fn get_inner<B: BlockIo>(
     }
 }
 
+pub(crate) struct UpsertCtx<'a> {
+    bruh: &'a mut BRootInfo,
+}
+
 impl<'a> Txn<'a> {
     async fn btree_upsert(
         &mut self,
-        dirty: &mut DirtyEntry,
+        dirty: &mut BRootInfo,
         key: &[u8],
         value: &[u8],
         root: FluxBufOld,
@@ -116,7 +120,7 @@ impl<'a> Txn<'a> {
 
     async fn btree_upsert_inner(
         &mut self,
-        dirty: &mut DirtyEntry,
+        dirty: &mut BRootInfo,
         key: &[u8],
         value: LeafValue<'_>,
         mut pg: FluxBufOld,
@@ -165,7 +169,7 @@ impl<'a> Txn<'a> {
 
     async fn btree_split_inner(
         &mut self,
-        dirty: &mut DirtyEntry,
+        dirty: &mut BRootInfo,
         left_idx: u64,
         split: Box<[u8]>,
         right_idx: u64,
@@ -213,7 +217,7 @@ impl<'a> Txn<'a> {
 
     async fn btree_upsert_leaf(
         &mut self,
-        dirty: &mut DirtyEntry,
+        dirty: &mut BRootInfo,
         key: &[u8],
         value: LeafValue<'_>,
         mut pg: FluxBufOld,
@@ -274,7 +278,7 @@ impl<'a> Txn<'a> {
 
     async fn btree_leaf_remove_at(
         &mut self,
-        dirty: &mut DirtyEntry,
+        dirty: &mut BRootInfo,
         buf: &mut [u8],
         idx: InPgIdx,
     ) -> Result<()> {

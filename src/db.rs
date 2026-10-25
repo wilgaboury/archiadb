@@ -159,17 +159,17 @@ impl<'txn> TxnBuilder<'txn> {
             free: Vec::new(),
             ops: self.ops,
             flux: FluxOld::new(),
-            writes: HashMap::new(),
+            roots: HashMap::new(),
         }
     }
 }
 
-pub(crate) struct DirtyEntry {
+pub(crate) struct BRootInfo {
     pub(crate) fb: FrontBack,
     pub(crate) lalloc: Lalloc,
 }
 
-impl DirtyEntry {
+impl BRootInfo {
     pub fn new(fb: FrontBack, arena: Arena) -> Self {
         Self {
             fb,
@@ -185,11 +185,11 @@ pub struct Txn<'txn> {
     pub(crate) free: Vec<u64>,
     pub(crate) ops: KeyTrie<LockType>,
     pub(crate) flux: FluxOld,
-    pub(crate) writes: HashMap<KeyPathBuf, DirtyEntry>,
+    pub(crate) roots: HashMap<KeyPathBuf, BRootInfo>,
 }
 
 impl<'txn> Txn<'txn> {
-    pub(crate) async fn create_root_dirty_entry(&self) -> Result<DirtyEntry> {
+    pub(crate) async fn create_root_dirty_entry(&self) -> Result<BRootInfo> {
         self.create_dirty_entry(key_path![], self.db.meta.root1(), self.db.meta.root2())
             .await
     }
@@ -199,11 +199,11 @@ impl<'txn> Txn<'txn> {
         key: &KeyPath,
         pg_idx_1: PgIdx,
         pg_idx_2: PgIdx,
-    ) -> Result<DirtyEntry> {
+    ) -> Result<BRootInfo> {
         let (pg_idx_1, pg1, pg_idx_2, _pg2) =
             read_root_w_retry(self.db, key, pg_idx_1, pg_idx_2, Duration::from_secs(1)).await?;
         let root = from_bytes::<BNodeRootHeader>(pg1.as_ref());
-        Ok(DirtyEntry::new(
+        Ok(BRootInfo::new(
             FrontBack::new(pg_idx_1, pg_idx_2),
             root.arena.to_mem(),
         ))
@@ -221,7 +221,7 @@ impl<'txn> Txn<'txn> {
         //     .into_boxed_slice();
         // cur.pop();
 
-        while cur.len() > 0 && !self.writes.contains_key(cur.as_path()) {
+        while cur.len() > 0 && !self.roots.contains_key(cur.as_path()) {
             stack.push(cur.as_path().into_iter().last().unwrap());
             cur.pop();
         }
@@ -263,7 +263,7 @@ impl<'txn> Txn<'txn> {
     // 3. swap buf root
     // 4. fysnc
     pub async fn commit(&mut self) -> Result<()> {
-        let lca = lca(self.writes.keys().map(|k| k.as_ref()));
+        let lca = lca(self.roots.keys().map(|k| k.as_ref()));
 
         // TODO: update intermediary roots in btrees (make sure they are in flux)
 
@@ -271,7 +271,7 @@ impl<'txn> Txn<'txn> {
         self.db.fio.sync().await?;
 
         let mut wlock_keys =
-            collect_intermediary_decendants(lca.as_ref(), self.writes.keys().map(|k| k.as_ref()));
+            collect_intermediary_decendants(lca.as_ref(), self.roots.keys().map(|k| k.as_ref()));
         wlock_keys.reverse(); // aquired in bottom-up order
 
         let wlocks: Vec<_> = wlock_keys

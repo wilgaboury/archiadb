@@ -5,7 +5,7 @@ use anyhow::Result;
 use crate::{
     bio::PageBuf,
     block::BlockIo,
-    db::{DirtyEntry, Txn},
+    db::{BRootInfo, Txn},
     lalloc::free_on_disk_pg,
     uint::PgIdx,
 };
@@ -99,7 +99,7 @@ impl<'a> Txn<'a> {
 
     pub(crate) async fn flux_write(
         &mut self,
-        dirty: &mut DirtyEntry,
+        dirty: &mut BRootInfo,
         buf: FluxBufOld,
     ) -> Result<PgIdx> {
         let (maybe_idx, buf) = buf.extract();
@@ -112,7 +112,7 @@ impl<'a> Txn<'a> {
         Ok(idx)
     }
 
-    pub(crate) fn flux_free(&mut self, dirty: &mut DirtyEntry, idx: u64) {
+    pub(crate) fn flux_free(&mut self, dirty: &mut BRootInfo, idx: u64) {
         if self.flux.inner.map.borrow_mut().remove(&idx).is_some() {
             dirty.lalloc.free_in_mem_page(idx);
         } else {

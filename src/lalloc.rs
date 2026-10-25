@@ -1,13 +1,13 @@
-use std::{cmp, collections::HashMap};
+use std::{cmp, collections::HashMap, fmt::Binary};
 
 use anyhow::Result;
 
 use crate::{
     block::{BlockIo, BlockIoDefault},
     bnode::BNodeRootHeader,
-    db::{DirtyEntry, Txn},
+    db::{BRootInfo, Txn},
     defer::DeferGaurd,
-    galloc::{Galloc, galloc_w_lock},
+    galloc::{Galloc, GallocCtx, galloc_w_lock},
     key::KeyPathBuf,
     meta::MetaHandler,
     uint::{InPgIdx, PgIdx, PgIdxDisk},
@@ -158,7 +158,7 @@ pub(crate) async fn write_fl(
     galloc: &Galloc,
     meta: &MetaHandler,
     fio: &BlockIoDefault,
-    dirty: &mut DirtyEntry,
+    dirty: &mut BRootInfo,
     root: &BNodeRootHeader,
 ) -> Result<PgIdx> {
     // TODO: this function could be more complicated and do proper ordering of deferred/free pg idxs for better effiecency
@@ -195,7 +195,7 @@ pub(crate) async fn write_fl(
 }
 
 impl<'txn> Txn<'txn> {
-    pub(crate) async fn lalloc(&mut self, dirty: &mut DirtyEntry) -> Result<PgIdx> {
+    pub(crate) async fn lalloc(&mut self, dirty: &mut BRootInfo) -> Result<PgIdx> {
         lalloc(
             &self.db.galloc,
             &mut self.defer_gaurd,
@@ -206,7 +206,7 @@ impl<'txn> Txn<'txn> {
         .await
     }
 
-    pub(crate) async fn write_fl(&mut self, dirty: &mut DirtyEntry) -> Result<PgIdx> {
+    pub(crate) async fn write_fl(&mut self, dirty: &mut BRootInfo) -> Result<PgIdx> {
         let root_buf = self.db.fio.read(dirty.fb.front()).await?;
         let root = from_bytes::<BNodeRootHeader>(root_buf.as_ref());
 
@@ -219,12 +219,31 @@ pub(crate) fn free_on_disk_pg(lalloc: &mut Lalloc, defer_gaurd: &mut DeferGaurd,
     defer_gaurd.free(pg_idx);
 }
 
+struct LallocCtx<'a, B: BlockIo> {
+    galloc: &'a Galloc,
+    meta: &'a MetaHandler,
+    bio: &'a B,
+    defer_gaurd: &'a mut DeferGaurd<'a>,
+    root: &'a mut BRootInfo,
+}
+
+impl<'a, B: BlockIo> LallocCtx<'a, B> {
+    pub(crate) fn to_galloc_ctx(&mut self) -> GallocCtx<'_, B> {
+        GallocCtx {
+            galloc: self.galloc,
+            meta: self.meta,
+            bio: self.bio,
+            fb: &mut self.root.fb,
+        }
+    }
+}
+
 pub(crate) async fn lalloc(
     galloc: &Galloc,
     defer_gaurd: &mut DeferGaurd<'_>,
     meta: &MetaHandler,
     fio: &BlockIoDefault,
-    dirty: &mut DirtyEntry,
+    dirty: &mut BRootInfo,
 ) -> Result<PgIdx> {
     let root_buf = fio.read(dirty.fb.front()).await?;
     let root = from_bytes::<BNodeRootHeader>(root_buf.as_ref());
@@ -304,7 +323,7 @@ pub(crate) async fn lalloc_from_dirty_or_arena(
     galloc: &Galloc,
     meta: &MetaHandler,
     fio: &BlockIoDefault,
-    dirty: &mut DirtyEntry,
+    dirty: &mut BRootInfo,
     root: &BNodeRootHeader,
 ) -> Result<PgIdx> {
     if let Some(free) = dirty.lalloc.free.pop() {
@@ -318,7 +337,7 @@ pub(crate) async fn lalloc_from_arena_or_galloc(
     galloc: &Galloc,
     meta: &MetaHandler,
     fio: &BlockIoDefault,
-    dirty: &mut DirtyEntry,
+    dirty: &mut BRootInfo,
     root: &BNodeRootHeader,
 ) -> Result<PgIdx> {
     if let Some(free) = dirty.lalloc.pop_arena_with_encode_reserve(fio.page_size()) {
@@ -343,7 +362,7 @@ pub(crate) fn next_arena_len(prev: PgIdx) -> PgIdx {
 // for simplity this makes no attempt to compact the previous head node
 pub(crate) async fn encode_arena_and_commit(
     fio: &BlockIoDefault,
-    dirty: &mut DirtyEntry,
+    dirty: &mut BRootInfo,
 ) -> Result<()> {
     let to_encode = dirty.lalloc.pages_to_fl_encode_arena(fio.page_size());
     let left = dirty.lalloc.arena.len - dirty.lalloc.arena.next;

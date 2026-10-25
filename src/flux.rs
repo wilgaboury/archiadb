@@ -126,13 +126,13 @@ impl<B: BlockIo> Flux<B> {
 }
 
 #[derive(Debug)]
-pub enum FluxBuf<B: BlockIo> {
+pub(crate) enum FluxBuf<B: BlockIo> {
     Unalloc(B::Buf),
     Alloc(FluxBufAlloc<B>),
 }
 
 #[derive(Debug)]
-pub struct FluxBufAlloc<B: BlockIo> {
+pub(crate) struct FluxBufAlloc<B: BlockIo> {
     idx: u64,
     buf: Option<B::Buf>,
     inner: FluxInnerRef<B>,

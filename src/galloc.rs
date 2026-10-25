@@ -30,6 +30,13 @@ impl DbInner {
     }
 }
 
+pub(crate) struct GallocCtx<'a, B: BlockIo> {
+    pub(crate) galloc: &'a Galloc,
+    pub(crate) meta: &'a MetaHandler,
+    pub(crate) bio: &'a B,
+    pub(crate) fb: &'a mut FrontBack,
+}
+
 pub(crate) async fn galloc_w_lock(
     lock: &Galloc,
     meta: &MetaHandler,
