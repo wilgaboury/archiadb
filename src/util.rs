@@ -119,22 +119,22 @@ pub(crate) fn order_front_back<V, B: AsRef<[u8]>, F: Fn(&B) -> u64>(
     }
 }
 
-pub(crate) fn btree_header_version(pg: &PageBuf) -> u64 {
+pub(crate) fn btree_header_version<P: AsRef<[u8]>>(pg: &P) -> u64 {
     let root = from_bytes::<BNodeRootHeader>(&pg.as_ref());
     root.version.get()
 }
 
-pub(crate) async fn read_root_w_retry(
-    db: &DbInner,
+pub(crate) async fn read_root_w_retry<B: BlockIo>(
+    db: &DbInner<B>,
     key: &KeyPath,
     pg_idx1: PgIdx,
     pg_idx2: PgIdx,
     timeout: Duration,
-) -> Result<(PgIdx, PageBuf, PgIdx, PageBuf)> {
+) -> Result<(PgIdx, B::Buf, PgIdx, B::Buf)> {
     let start = Instant::now();
     while Instant::now().duration_since(start) < timeout {
-        let pg1 = db.fio.read_unchecked(pg_idx1).await?;
-        let pg2 = db.fio.read_unchecked(pg_idx2).await?;
+        let pg1 = db.bio.read_unchecked(pg_idx1).await?;
+        let pg2 = db.bio.read_unchecked(pg_idx2).await?;
         if let Ok(ret) = order_front_back(pg_idx1, pg1, pg_idx2, pg2, btree_header_version) {
             return Ok(ret);
         }
@@ -142,8 +142,8 @@ pub(crate) async fn read_root_w_retry(
 
     let carc = db.write_locks.get(key.to_owned());
     let _gaurd = carc.lock().await;
-    let pg1 = db.fio.read_unchecked(pg_idx1).await?;
-    let pg2 = db.fio.read_unchecked(pg_idx2).await?;
+    let pg1 = db.bio.read_unchecked(pg_idx1).await?;
+    let pg2 = db.bio.read_unchecked(pg_idx2).await?;
     order_front_back(pg_idx1, pg1, pg_idx2, pg2, btree_header_version)
 }
 
@@ -373,13 +373,13 @@ mod tests {
         let tmp = TmpDir::new(function_name!())?;
         let db = tmp.db().await?;
 
-        let mut buf: PageBuf = db.inner.fio.read(2).await?;
+        let mut buf: PageBuf = db.inner.bio.read(2).await?;
         corrupt_checksum(buf.as_mut());
-        db.inner.fio.write_unchecked(2, buf).await?;
-        let mut buf: PageBuf = db.inner.fio.read(3).await?;
+        db.inner.bio.write_unchecked(2, buf).await?;
+        let mut buf: PageBuf = db.inner.bio.read(3).await?;
         corrupt_checksum(buf.as_mut());
-        db.inner.fio.write_unchecked(3, buf).await?;
-        db.inner.fio.sync().await?;
+        db.inner.bio.write_unchecked(3, buf).await?;
+        db.inner.bio.sync().await?;
 
         let db2 = db.clone();
         let task: JoinHandle<Result<()>> = tokio::spawn(async move {
@@ -396,8 +396,8 @@ mod tests {
 
         assert!(!task.is_finished());
 
-        let buf: PageBuf = db.inner.fio.read_unchecked(3).await?;
-        db.inner.fio.write(3, buf).await?;
+        let buf: PageBuf = db.inner.bio.read_unchecked(3).await?;
+        db.inner.bio.write(3, buf).await?;
 
         task.await??;
 
@@ -410,10 +410,10 @@ mod tests {
         let tmp = TmpDir::new(function_name!())?;
         let db = tmp.db().await?;
 
-        let mut buf: PageBuf = db.inner.fio.read(3).await?;
+        let mut buf: PageBuf = db.inner.bio.read(3).await?;
         corrupt_checksum(buf.as_mut());
-        db.inner.fio.write_unchecked(3, buf).await?;
-        db.inner.fio.sync().await?;
+        db.inner.bio.write_unchecked(3, buf).await?;
+        db.inner.bio.sync().await?;
 
         let carc = db.inner.write_locks.get(key_path![].to_owned());
         let gaurd = carc.lock().await;

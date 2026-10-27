@@ -1,4 +1,4 @@
-use std::fmt::Debug;
+use std::{fmt::Debug, sync::Arc};
 
 use anyhow::{Result, bail};
 use parking_lot::Mutex;
@@ -11,7 +11,7 @@ use crate::{
 
 pub(crate) type BlockIoDefault = BlockIoRapidHash<BlockIoUring>;
 
-pub(crate) trait BlockIo {
+pub(crate) trait BlockIo: Clone {
     type Buf: AsMut<[u8]> + AsRef<[u8]> + Send + Debug;
 
     fn page_size(&self) -> InPgIdx;
@@ -28,15 +28,16 @@ pub(crate) trait BlockIo {
     async fn sync(&self) -> Result<()>;
 }
 
+#[derive(Clone)]
 pub(crate) struct BlockIoMemory {
-    data: Mutex<Vec<u8>>,
+    data: Arc<Mutex<Vec<u8>>>,
     page_size: InPgIdx,
 }
 
 impl BlockIoMemory {
     fn new(page_size: InPgIdx) -> Self {
         Self {
-            data: Mutex::new(Vec::new()),
+            data: Arc::new(Mutex::new(Vec::new())),
             page_size,
         }
     }

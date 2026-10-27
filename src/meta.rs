@@ -9,7 +9,7 @@ use tokio::sync::Mutex;
 
 use crate::{
     bio::{MAX_PAGE_SIZE, MIN_PAGE_SIZE, choose_page_size},
-    block::{BlockIo, BlockIoDefault},
+    block::BlockIo,
     const_assert,
     uint::{InPgIdxDisk, PgIdx, PgIdxDisk, U16, U64, U128},
     util::{Checksum, from_bytes, from_bytes_mut, order_front_back, update_checksum},
@@ -255,9 +255,9 @@ impl MetaHandler {
         Ok(())
     }
 
-    pub(crate) async fn mutate_async(
+    pub(crate) async fn mutate_async<B: BlockIo>(
         &self,
-        fio: &BlockIoDefault,
+        bio: &B,
         f: impl FnOnce(&mut Meta),
     ) -> Result<()> {
         let mut inner_guard = self.inner.lock().await;
@@ -272,10 +272,10 @@ impl MetaHandler {
 
             let pg_idx = if inner.is_first { 1 } else { 0 };
             {
-                let mut buf = fio.buf();
+                let mut buf = bio.buf();
                 buf.as_mut().copy_from_slice(&inner.back);
-                fio.write(pg_idx, buf).await?;
-                fio.sync().await?;
+                bio.write(pg_idx, buf).await?;
+                bio.sync().await?;
             }
 
             std::mem::swap(&mut inner.front, &mut inner.back);

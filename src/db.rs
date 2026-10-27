@@ -10,12 +10,12 @@ use crate::{
     bnode::BNodeRootHeader,
     defer::{Defer, DeferGaurd},
     file::DbFile,
-    flux_old::FluxOld,
+    flux::Flux,
     galloc::{Galloc, galloc_recover},
     karc::Karc,
     key::{KeyPath, KeyPathBuf},
     key_path,
-    lalloc::{Arena, Lalloc},
+    lalloc::{Arena, Lalloc, LallocCtx},
     lock::{Lock, LockGuard, LockType},
     meta::MetaHandler,
     trie::KeyTrie,
@@ -27,15 +27,15 @@ use crate::{
 };
 
 #[derive(Debug, Clone)]
-pub struct Db {
-    pub(crate) inner: Arc<DbInner>,
+pub struct Db<B: BlockIo> {
+    pub(crate) inner: Arc<DbInner<B>>,
 }
 
 #[derive(Debug)]
-pub(crate) struct DbInner {
+pub(crate) struct DbInner<B: BlockIo> {
     pub(crate) file: Arc<DbFile>,
     pub(crate) meta: MetaHandler,
-    pub(crate) fio: BlockIoDefault,
+    pub(crate) bio: B,
     pub(crate) galloc: Galloc,
     pub(crate) defer: Defer,
     pub(crate) read_locks: Karc<KeyPathBuf, Lock>,
@@ -43,7 +43,7 @@ pub(crate) struct DbInner {
 }
 
 #[bon]
-impl Db {
+impl Db<BlockIoDefault> {
     #[builder]
     pub async fn new<P: AsRef<Path>>(
         path: P,
@@ -54,7 +54,7 @@ impl Db {
     ) -> Result<Self> {
         let file = Arc::new(DbFile::open(path)?);
         let meta = MetaHandler::new(&file.file())?;
-        let fio = BlockIoRapidHash::new(BlockIoUring::new(
+        let bio = BlockIoRapidHash::new(BlockIoUring::new(
             file.clone(),
             meta.page_size(),
             sq,
@@ -63,17 +63,17 @@ impl Db {
             generic_op_state_pool,
         )?);
 
-        galloc_recover(&meta, &fio).await?;
+        galloc_recover(&meta, &bio).await?;
 
         if meta.len() == 2 {
-            init_db_root(&meta, &fio).await?;
+            init_db_root(&meta, &bio).await?;
         }
 
         Ok(Self {
             inner: Arc::new(DbInner {
                 file,
                 meta,
-                fio,
+                bio,
                 galloc: Galloc::new(),
                 defer: Defer::new(),
                 read_locks: Karc::new(Box::new(|| Lock::new())),
@@ -86,7 +86,7 @@ impl Db {
         self.inner.meta.page_size() as usize
     }
 
-    pub fn txn(&self) -> TxnBuilder<'_> {
+    pub fn txn(&self) -> TxnBuilder<'_, BlockIoDefault> {
         TxnBuilder {
             db: &self.inner,
             ops: KeyTrie::new(),
@@ -114,7 +114,7 @@ pub(crate) async fn init_db_root(meta: &MetaHandler, fio: &BlockIoDefault) -> Re
 
     fio.sync().await?;
 
-    meta.mutate_async(&fio, |meta| {
+    meta.mutate_async(fio, |meta| {
         meta.set_len(4);
     })
     .await?;
@@ -122,12 +122,12 @@ pub(crate) async fn init_db_root(meta: &MetaHandler, fio: &BlockIoDefault) -> Re
     Ok(())
 }
 
-pub struct TxnBuilder<'txn> {
-    db: &'txn DbInner,
+pub struct TxnBuilder<'a, B: BlockIo> {
+    db: &'a DbInner<B>,
     ops: KeyTrie<LockType>,
 }
 
-impl<'txn> TxnBuilder<'txn> {
+impl<'a, B: BlockIo> TxnBuilder<'a, B> {
     pub fn read(mut self, path: &KeyPath) -> Result<Self> {
         self.ops.insert_lock(path, LockType::Read)?;
         Ok(self)
@@ -143,7 +143,7 @@ impl<'txn> TxnBuilder<'txn> {
         Ok(self)
     }
 
-    pub async fn begin(self) -> Txn<'txn> {
+    pub async fn begin(self) -> Txn<'a, B> {
         let defer_gaurd = self.db.defer.begin();
         let mut guards = LockVec(Vec::new());
         for (path, lock_type) in self.ops.bfs_iter() {
@@ -158,7 +158,7 @@ impl<'txn> TxnBuilder<'txn> {
             guards,
             free: Vec::new(),
             ops: self.ops,
-            flux: FluxOld::new(),
+            flux: Flux::new(self.db.bio.clone()),
             roots: HashMap::new(),
         }
     }
@@ -178,23 +178,50 @@ impl BRootInfo {
     }
 }
 
-pub struct Txn<'txn> {
-    pub(crate) db: &'txn DbInner,
-    pub(crate) defer_gaurd: DeferGaurd<'txn>,
+pub struct Txn<'a, B: BlockIo> {
+    pub(crate) db: &'a DbInner<B>,
+    pub(crate) defer_gaurd: DeferGaurd<'a>,
+
     pub(crate) guards: LockVec<LockGuard>,
     pub(crate) free: Vec<u64>,
     pub(crate) ops: KeyTrie<LockType>,
-    pub(crate) flux: FluxOld,
+    pub(crate) flux: Flux<B>,
     pub(crate) roots: HashMap<KeyPathBuf, BRootInfo>,
 }
 
-impl<'txn> Txn<'txn> {
-    pub(crate) async fn create_root_dirty_entry(&self) -> Result<BRootInfo> {
-        self.create_dirty_entry(key_path![], self.db.meta.root1(), self.db.meta.root2())
+impl<'a, B: BlockIo> Txn<'a, B> {
+    pub(crate) fn to_lalloc_ctx<'b>(&'b mut self, root: &'b mut BRootInfo) -> LallocCtx<'b, 'a, B> {
+        LallocCtx {
+            galloc: &self.db.galloc,
+            meta: &self.db.meta,
+            bio: &self.db.bio,
+            defer_gaurd: &mut self.defer_gaurd,
+            root,
+        }
+    }
+
+    pub(crate) fn to_lalloc_ctx_and_flux<'b>(
+        &'b mut self,
+        root: &'b mut BRootInfo,
+    ) -> (LallocCtx<'b, 'a, B>, &'b mut Flux<B>) {
+        (
+            LallocCtx {
+                galloc: &self.db.galloc,
+                meta: &self.db.meta,
+                bio: &self.db.bio,
+                defer_gaurd: &mut self.defer_gaurd,
+                root,
+            },
+            &mut self.flux,
+        )
+    }
+
+    pub(crate) async fn create_root_root_info(&self) -> Result<BRootInfo> {
+        self.create_root_info(key_path![], self.db.meta.root1(), self.db.meta.root2())
             .await
     }
 
-    pub(crate) async fn create_dirty_entry(
+    pub(crate) async fn create_root_info(
         &self,
         key: &KeyPath,
         pg_idx_1: PgIdx,
@@ -267,8 +294,8 @@ impl<'txn> Txn<'txn> {
 
         // TODO: update intermediary roots in btrees (make sure they are in flux)
 
-        self.flux_drain().await?;
-        self.db.fio.sync().await?;
+        self.flux.flush().await?;
+        self.db.bio.sync().await?;
 
         let mut wlock_keys =
             collect_intermediary_decendants(lca.as_ref(), self.roots.keys().map(|k| k.as_ref()));
@@ -294,21 +321,9 @@ impl<'txn> Txn<'txn> {
     async fn upsert_dirty_entries_to_lca(&mut self, _lca: &KeyPath) -> Result<()> {
         Ok(())
     }
-
-    async fn flux_drain(&mut self) -> Result<()> {
-        let mut flux_writes: Vec<_> = Vec::with_capacity(self.flux.inner.map.borrow().len());
-        for (idx, buf) in self.flux.inner.map.borrow_mut().drain() {
-            let buf = buf.unwrap(); // critical logic failure if any of these are none
-            flux_writes.push(self.db.fio.write(idx, buf));
-        }
-        for flux_write in flux_writes {
-            flux_write.await?;
-        }
-        Ok(())
-    }
 }
 
-impl<'txn> Drop for Txn<'txn> {
+impl<'a, B: BlockIo> Drop for Txn<'a, B> {
     fn drop(&mut self) {
         // no-op
         // TODO: idk, does anything rly need to be done here
@@ -323,6 +338,7 @@ mod tests {
     use crate::{
         meta::{MAGIC, MagicType},
         test::TmpDir,
+        uint::InPgIdx,
         util::update_checksum,
     };
 
@@ -333,8 +349,8 @@ mod tests {
     #[named]
     #[tokio::test]
     async fn magic_check() -> Result<()> {
-        fn corrput_magic(page_size: usize, file: &File, loc: usize) -> Result<()> {
-            let mut buf = vec![0u8; page_size];
+        fn corrput_magic(page_size: PgIdx, file: &File, loc: InPgIdx) -> Result<()> {
+            let mut buf = vec![0u8; page_size as usize];
             file.read_exact_at(&mut buf, (loc * page_size) as u64)?;
             let bad_magic = MagicType::to_le_bytes(MAGIC + 1);
             buf[0..size_of::<MagicType>()].copy_from_slice(&bad_magic);
@@ -345,7 +361,7 @@ mod tests {
 
         let tmp = TmpDir::new(function_name!()).unwrap();
         let db = tmp.db().await?;
-        let page_size = db.page_size();
+        let page_size = db.inner.bio.page_size();
         db.try_close()?;
 
         corrput_magic(page_size, &tmp.file_raw()?, 0)?;

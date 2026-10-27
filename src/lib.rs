@@ -9,7 +9,6 @@ pub mod db;
 pub mod defer;
 pub mod file;
 pub mod flux;
-pub mod flux_old;
 pub mod galloc;
 pub mod intrusive;
 pub mod karc;

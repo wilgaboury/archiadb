@@ -134,8 +134,8 @@ impl ArenaDisk {
         self.start.set(0);
     }
 
-    pub(crate) fn is_init(&self) -> bool {
-        self.start.get() == 0
+    pub(crate) fn is_valid(&self) -> bool {
+        self.start.get() != 0
     }
 
     pub(crate) fn to_mem(&self) -> Arena {
@@ -476,7 +476,7 @@ pub(crate) enum LeafValue<'a> {
 }
 
 impl<'a> LeafValue<'a> {
-    pub async fn encode(self, txn: &mut Txn<'_>) -> Result<LeafValueEncoded<'a>> {
+    pub async fn encode<B: BlockIo>(self, txn: &mut Txn<'_, B>) -> Result<LeafValueEncoded<'a>> {
         Ok(match self {
             LeafValue::Btree { pg_idx_1, pg_idx_2 } => {
                 LeafValueEncoded::Btree { pg_idx_1, pg_idx_2 }

@@ -2,9 +2,8 @@ use anyhow::Result;
 use tokio::sync::Mutex;
 
 use crate::{
-    block::{BlockIo, BlockIoDefault},
+    block::BlockIo,
     bnode::BNodeRootHeader,
-    db::DbInner,
     lalloc::Arena,
     meta::MetaHandler,
     uint::PgIdx,
@@ -24,12 +23,6 @@ impl Galloc {
     }
 }
 
-impl DbInner {
-    pub(crate) async fn galloc(&self, fb: &mut FrontBack, len: PgIdx) -> Result<Arena> {
-        galloc_w_lock(&self.galloc, &self.meta, &self.fio, fb, len).await
-    }
-}
-
 pub(crate) struct GallocCtx<'a, B: BlockIo> {
     pub(crate) galloc: &'a Galloc,
     pub(crate) meta: &'a MetaHandler,
@@ -37,31 +30,25 @@ pub(crate) struct GallocCtx<'a, B: BlockIo> {
     pub(crate) fb: &'a mut FrontBack,
 }
 
-pub(crate) async fn galloc_w_lock(
-    lock: &Galloc,
-    meta: &MetaHandler,
-    fio: &BlockIoDefault,
-    fb: &mut FrontBack,
-    len: PgIdx,
-) -> Result<Arena> {
-    let _gaurd = lock.lock.lock().await;
-    galloc_io_proc(meta, fio, fb, len).await
+pub(crate) async fn galloc<'a, B: BlockIo>(ctx: GallocCtx<'a, B>, len: PgIdx) -> Result<Arena> {
+    let _gaurd = ctx.galloc.lock.lock().await;
+    galloc_no_lock(ctx.meta, ctx.bio, ctx.fb, len).await
 }
 
-pub(crate) async fn galloc_io_proc(
+pub(crate) async fn galloc_no_lock<B: BlockIo>(
     meta: &MetaHandler,
-    fio: &BlockIoDefault,
+    bio: &B,
     fb: &mut FrontBack,
     len: PgIdx,
 ) -> Result<Arena> {
-    let mut root = fio.read(fb.front()).await?;
+    let mut root = bio.read(fb.front()).await?;
     let btree = from_bytes_mut::<BNodeRootHeader>(root.as_mut());
     let start = meta.len();
     let flen = meta.len() + len;
 
-    fio.alloc(flen).await?;
+    bio.alloc(flen).await?;
 
-    meta.mutate_async(&fio, |meta| {
+    meta.mutate_async(bio, |meta| {
         meta.galloc_fidx.set(fb.front());
         meta.galloc_bidx.set(fb.back());
         meta.galloc_len.set(len);
@@ -72,11 +59,11 @@ pub(crate) async fn galloc_io_proc(
     btree.arena.start.set(start);
     btree.arena.len.set(len);
     btree.arena.next.set(0);
-    fio.write(fb.back(), root).await?;
-    fio.sync().await?;
+    bio.write(fb.back(), root).await?;
+    bio.sync().await?;
     fb.flip();
 
-    meta.mutate_async(&fio, |meta| {
+    meta.mutate_async(bio, |meta| {
         meta.len.set(flen);
         meta.galloc_fidx.set(0);
         meta.galloc_bidx.set(0);
@@ -87,7 +74,7 @@ pub(crate) async fn galloc_io_proc(
     Ok(Arena::new(start, len))
 }
 
-pub(crate) async fn galloc_recover(meta: &MetaHandler, fio: &BlockIoDefault) -> Result<()> {
+pub(crate) async fn galloc_recover<B: BlockIo>(meta: &MetaHandler, bio: &B) -> Result<()> {
     let (front_idx, back_idx, alen) = meta
         .access_async(|meta| {
             (
@@ -98,7 +85,7 @@ pub(crate) async fn galloc_recover(meta: &MetaHandler, fio: &BlockIoDefault) -> 
         })
         .await;
     if front_idx != 0 && back_idx != 0 {
-        galloc_io_proc(meta, fio, &mut FrontBack::new(front_idx, back_idx), alen).await?;
+        galloc_no_lock(meta, bio, &mut FrontBack::new(front_idx, back_idx), alen).await?;
     }
     Ok(())
 }
@@ -108,9 +95,20 @@ pub(crate) async fn galloc_recover(meta: &MetaHandler, fio: &BlockIoDefault) -> 
 mod tests {
     use function_name::named;
 
-    use crate::{meta::Meta, test::TmpDir, util::from_bytes};
+    use crate::{db::DbInner, meta::Meta, test::TmpDir, util::from_bytes};
 
     use super::*;
+
+    impl<B: BlockIo> DbInner<B> {
+        pub(crate) fn to_galloc_ctx<'a>(&'a self, fb: &'a mut FrontBack) -> GallocCtx<'a, B> {
+            GallocCtx {
+                galloc: &self.galloc,
+                meta: &self.meta,
+                bio: &self.bio,
+                fb,
+            }
+        }
+    }
 
     #[named]
     #[tokio::test]
@@ -118,14 +116,15 @@ mod tests {
         let tmp = TmpDir::new(function_name!()).unwrap();
         let db = tmp.db().await?;
 
+        let mut fb = FrontBack::from_roots(&db.inner.bio, 2, 3).await?.0;
+        let ctx = db.inner.to_galloc_ctx(&mut fb);
+
         assert_eq!(4, db.inner.meta.len());
 
-        db.inner
-            .galloc(&mut FrontBack::from_roots(&db.inner.fio, 2, 3).await?.0, 4)
-            .await?;
+        galloc(ctx, 4).await?;
         assert_eq!(8, db.inner.meta.len());
 
-        let buf = db.inner.fio.read(3).await?;
+        let buf = db.inner.bio.read(3).await?;
         let root = from_bytes::<BNodeRootHeader>(&buf.as_ref());
         assert_eq!(4, root.arena.start.get());
         assert_eq!(4, root.arena.len.get());
@@ -158,7 +157,7 @@ mod tests {
         }
 
         let db = tmp.db().await?;
-        let buf = db.inner.fio.read(3).await?;
+        let buf = db.inner.bio.read(3).await?;
         let root = from_bytes::<BNodeRootHeader>(buf.as_ref());
         assert_eq!(4, root.arena.start.get());
         assert_eq!(4, root.arena.len.get());

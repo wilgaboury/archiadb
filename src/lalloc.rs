@@ -1,13 +1,13 @@
-use std::{cmp, collections::HashMap, fmt::Binary};
+use std::{cmp, collections::HashMap};
 
 use anyhow::Result;
 
 use crate::{
-    block::{BlockIo, BlockIoDefault},
+    block::BlockIo,
     bnode::BNodeRootHeader,
     db::{BRootInfo, Txn},
     defer::DeferGaurd,
-    galloc::{Galloc, GallocCtx, galloc_w_lock},
+    galloc::{Galloc, GallocCtx, galloc},
     key::KeyPathBuf,
     meta::MetaHandler,
     uint::{InPgIdx, PgIdx, PgIdxDisk},
@@ -154,63 +154,46 @@ impl Lalloc {
     }
 }
 
-pub(crate) async fn write_fl(
-    galloc: &Galloc,
-    meta: &MetaHandler,
-    fio: &BlockIoDefault,
-    dirty: &mut BRootInfo,
-    root: &BNodeRootHeader,
+pub(crate) async fn write_fl<'a, 'd, B: BlockIo>(
+    ctx: &mut LallocCtx<'a, 'd, B>,
+    header: &BNodeRootHeader,
 ) -> Result<PgIdx> {
     // TODO: this function could be more complicated and do proper ordering of deferred/free pg idxs for better effiecency
 
-    let mut next = dirty.lalloc.clean.unwrap_or(0);
+    let mut next = ctx.root.lalloc.clean.unwrap_or(0);
     loop {
-        let maybe_load = dirty.lalloc.pop_deferred_then_free();
+        let maybe_load = ctx.root.lalloc.pop_deferred_then_free();
         let mut free_idx = if let Some(v) = maybe_load { v } else { break };
 
-        let n_pg_idx = lalloc_from_dirty_or_arena(galloc, meta, fio, dirty, root).await?;
-        let mut buf = fio.buf();
+        let n_pg_idx = lalloc_from_dirty_or_arena(ctx, header).await?;
+        let mut buf = ctx.bio.buf();
         from_bytes_mut::<FreeListHeader>(buf.as_mut())
             .next
             .set(next);
 
         let mut i = 0;
-        let idxs_per = idxs_per_fl_page(fio.page_size());
+        let idxs_per = idxs_per_fl_page(ctx.bio.page_size());
         while i < idxs_per {
             write_fl_idx(buf.as_mut(), i, free_idx);
 
             i += 1;
-            let maybe_load = dirty.lalloc.pop_deferred_then_free();
+            let maybe_load = ctx.root.lalloc.pop_deferred_then_free();
             free_idx = if let Some(v) = maybe_load { v } else { break };
         }
         if i < idxs_per {
             term_fl(buf.as_mut(), i);
         }
 
-        fio.write(n_pg_idx, buf).await?;
+        ctx.bio.write(n_pg_idx, buf).await?;
         next = n_pg_idx;
     }
 
     Ok(next)
 }
 
-impl<'txn> Txn<'txn> {
-    pub(crate) async fn lalloc(&mut self, dirty: &mut BRootInfo) -> Result<PgIdx> {
-        lalloc(
-            &self.db.galloc,
-            &mut self.defer_gaurd,
-            &self.db.meta,
-            &self.db.fio,
-            dirty,
-        )
-        .await
-    }
-
-    pub(crate) async fn write_fl(&mut self, dirty: &mut BRootInfo) -> Result<PgIdx> {
-        let root_buf = self.db.fio.read(dirty.fb.front()).await?;
-        let root = from_bytes::<BNodeRootHeader>(root_buf.as_ref());
-
-        write_fl(&self.db.galloc, &self.db.meta, &self.db.fio, dirty, root).await
+impl<'a, B: BlockIo> Txn<'a, B> {
+    pub(crate) async fn lalloc<'b>(&'b mut self, root: &'b mut BRootInfo) -> Result<PgIdx> {
+        lalloc(&mut self.to_lalloc_ctx(root)).await
     }
 }
 
@@ -219,15 +202,15 @@ pub(crate) fn free_on_disk_pg(lalloc: &mut Lalloc, defer_gaurd: &mut DeferGaurd,
     defer_gaurd.free(pg_idx);
 }
 
-struct LallocCtx<'a, B: BlockIo> {
-    galloc: &'a Galloc,
-    meta: &'a MetaHandler,
-    bio: &'a B,
-    defer_gaurd: &'a mut DeferGaurd<'a>,
-    root: &'a mut BRootInfo,
+pub(crate) struct LallocCtx<'a, 'd, B: BlockIo> {
+    pub(crate) galloc: &'a Galloc,
+    pub(crate) meta: &'a MetaHandler,
+    pub(crate) bio: &'a B,
+    pub(crate) defer_gaurd: &'a mut DeferGaurd<'d>,
+    pub(crate) root: &'a mut BRootInfo,
 }
 
-impl<'a, B: BlockIo> LallocCtx<'a, B> {
+impl<'a, 'd, B: BlockIo> LallocCtx<'a, 'd, B> {
     pub(crate) fn to_galloc_ctx(&mut self) -> GallocCtx<'_, B> {
         GallocCtx {
             galloc: self.galloc,
@@ -238,44 +221,43 @@ impl<'a, B: BlockIo> LallocCtx<'a, B> {
     }
 }
 
-pub(crate) async fn lalloc(
-    galloc: &Galloc,
-    defer_gaurd: &mut DeferGaurd<'_>,
-    meta: &MetaHandler,
-    fio: &BlockIoDefault,
-    dirty: &mut BRootInfo,
-) -> Result<PgIdx> {
-    let root_buf = fio.read(dirty.fb.front()).await?;
-    let root = from_bytes::<BNodeRootHeader>(root_buf.as_ref());
+pub(crate) async fn lalloc<'a, 'd, B: BlockIo>(ctx: &mut LallocCtx<'a, 'd, B>) -> Result<PgIdx> {
+    let buf = ctx.bio.read(ctx.root.fb.front()).await?;
+    let header = from_bytes::<BNodeRootHeader>(buf.as_ref());
 
-    if should_init_arena(root) {
+    if should_init_arena(header) {
+        // I'm not even sure what I meant by comment below
         // unlikely case, but post arena encode crash + fl depletion could leave inlavid arena with large len. use that len for galloc not init.
-        let len = cmp::max(INIT_ARENA_SIZE, next_arena_len(root.arena.len.get()));
-        dirty.lalloc.arena = galloc_w_lock(galloc, meta, fio, &mut dirty.fb, len).await?;
-        dirty.lalloc.orig_next = dirty.lalloc.arena.next;
-        return Ok(dirty.lalloc.arena.pop().unwrap());
+        let len = cmp::max(INIT_ARENA_SIZE, next_arena_len(header.arena.len.get()));
+        let arena = {
+            let gctx = ctx.to_galloc_ctx();
+            galloc(gctx, len).await?
+        };
+        ctx.root.lalloc.arena = arena;
+        ctx.root.lalloc.orig_next = ctx.root.lalloc.arena.next;
+        return Ok(ctx.root.lalloc.arena.pop().unwrap());
     }
 
     if let Some(free) =
-        find_free_idx_and_consume_fl(defer_gaurd, fio, root, &mut dirty.lalloc).await?
+        find_free_idx_and_consume_fl(ctx.defer_gaurd, ctx.bio, header, &mut ctx.root.lalloc).await?
     {
         return Ok(free);
     }
 
-    lalloc_from_arena_or_galloc(galloc, meta, fio, dirty, root).await
+    lalloc_from_arena_or_galloc(ctx, header).await
 }
 
 pub(crate) fn should_init_arena(root: &BNodeRootHeader) -> bool {
-    root.free.get() == 0 && root.arena.is_init()
+    root.free.get() == 0 && !root.arena.is_valid()
 }
 
-pub(crate) async fn find_free_idx_and_consume_fl(
+pub(crate) async fn find_free_idx_and_consume_fl<B: BlockIo>(
     defer_gaurd: &mut DeferGaurd<'_>,
-    fio: &BlockIoDefault,
-    root: &BNodeRootHeader,
+    fio: &B,
+    header: &BNodeRootHeader,
     lalloc: &mut Lalloc,
 ) -> Result<Option<PgIdx>> {
-    let mut clean = lalloc.clean_or(root);
+    let mut clean = lalloc.clean_or(header);
     loop {
         if let Some(free) = lalloc.free.pop() {
             return Ok(Some(free));
@@ -293,19 +275,19 @@ pub(crate) async fn find_free_idx_and_consume_fl(
 }
 
 // TODO: need test with long fl to test this
-pub(crate) async fn load_fl_node(
+pub(crate) async fn load_fl_node<B: BlockIo>(
     defer_gaurd: &mut DeferGaurd<'_>,
-    fio: &BlockIoDefault,
+    bio: &B,
     lalloc: &mut Lalloc,
     fl_n_idx: PgIdx,
 ) -> Result<PgIdx> {
-    let fl_pg = fio.read(fl_n_idx).await?;
+    let buf = bio.read(fl_n_idx).await?;
     free_on_disk_pg(lalloc, defer_gaurd, fl_n_idx);
 
-    let header = from_bytes::<FreeListHeader>(fl_pg.as_ref());
-    let idxs_per = idxs_per_fl_page(fio.page_size());
+    let header = from_bytes::<FreeListHeader>(buf.as_ref());
+    let idxs_per = idxs_per_fl_page(bio.page_size());
     for i in 0..idxs_per {
-        let free_pg_idx = read_fl_idx(fl_pg.as_ref(), i);
+        let free_pg_idx = read_fl_idx(buf.as_ref(), i);
         if free_pg_idx == 0 {
             break;
         }
@@ -319,35 +301,33 @@ pub(crate) async fn load_fl_node(
     Ok(header.next.get())
 }
 
-pub(crate) async fn lalloc_from_dirty_or_arena(
-    galloc: &Galloc,
-    meta: &MetaHandler,
-    fio: &BlockIoDefault,
-    dirty: &mut BRootInfo,
-    root: &BNodeRootHeader,
+pub(crate) async fn lalloc_from_dirty_or_arena<'a, 'd, B: BlockIo>(
+    ctx: &mut LallocCtx<'a, 'd, B>,
+    header: &BNodeRootHeader,
 ) -> Result<PgIdx> {
-    if let Some(free) = dirty.lalloc.free.pop() {
+    if let Some(free) = ctx.root.lalloc.free.pop() {
         Ok(free)
     } else {
-        lalloc_from_arena_or_galloc(galloc, meta, fio, dirty, root).await
+        lalloc_from_arena_or_galloc(ctx, header).await
     }
 }
 
-pub(crate) async fn lalloc_from_arena_or_galloc(
-    galloc: &Galloc,
-    meta: &MetaHandler,
-    fio: &BlockIoDefault,
-    dirty: &mut BRootInfo,
-    root: &BNodeRootHeader,
+pub(crate) async fn lalloc_from_arena_or_galloc<'a, 'd, B: BlockIo>(
+    ctx: &mut LallocCtx<'a, 'd, B>,
+    header: &BNodeRootHeader,
 ) -> Result<PgIdx> {
-    if let Some(free) = dirty.lalloc.pop_arena_with_encode_reserve(fio.page_size()) {
+    if let Some(free) = ctx
+        .root
+        .lalloc
+        .pop_arena_with_encode_reserve(ctx.bio.page_size())
+    {
         Ok(free)
     } else {
-        encode_arena_and_commit(fio, dirty).await?;
-        let next_len = next_arena_len(root.arena.len.get());
-        dirty.lalloc.arena = galloc_w_lock(galloc, meta, fio, &mut dirty.fb, next_len).await?;
-        dirty.lalloc.orig_next = dirty.lalloc.arena.next;
-        Ok(dirty.lalloc.arena.pop().unwrap())
+        encode_arena_and_sync(ctx.bio, ctx.root).await?;
+        let next_len = next_arena_len(header.arena.len.get());
+        ctx.root.lalloc.arena = galloc(ctx.to_galloc_ctx(), next_len).await?;
+        ctx.root.lalloc.orig_next = ctx.root.lalloc.arena.next;
+        Ok(ctx.root.lalloc.arena.pop().unwrap())
     }
 }
 
@@ -360,25 +340,22 @@ pub(crate) fn next_arena_len(prev: PgIdx) -> PgIdx {
 }
 
 // for simplity this makes no attempt to compact the previous head node
-pub(crate) async fn encode_arena_and_commit(
-    fio: &BlockIoDefault,
-    dirty: &mut BRootInfo,
-) -> Result<()> {
-    let to_encode = dirty.lalloc.pages_to_fl_encode_arena(fio.page_size());
-    let left = dirty.lalloc.arena.len - dirty.lalloc.arena.next;
+pub(crate) async fn encode_arena_and_sync<B: BlockIo>(bio: &B, root: &mut BRootInfo) -> Result<()> {
+    let to_encode = root.lalloc.pages_to_fl_encode_arena(bio.page_size());
+    let left = root.lalloc.arena.len - root.lalloc.arena.next;
     assert!(left == to_encode);
 
-    let idxs_per = idxs_per_fl_page(fio.page_size());
-    let mut root_buf = fio.read(dirty.fb.front()).await?;
-    let root = from_bytes_mut::<BNodeRootHeader>(root_buf.as_mut());
+    let idxs_per = idxs_per_fl_page(bio.page_size());
+    let mut root_buf = bio.read(root.fb.front()).await?;
+    let header = from_bytes_mut::<BNodeRootHeader>(root_buf.as_mut());
 
-    let arena = &dirty.lalloc.arena;
-    let mut encode_idx = dirty.lalloc.orig_next;
+    let arena = &root.lalloc.arena;
+    let mut encode_idx = root.lalloc.orig_next;
     let mut alloc_idx = arena.next;
 
-    let mut next = root.free.get();
+    let mut next = header.free.get();
     while encode_idx < arena.next {
-        let mut fl_buf = fio.buf();
+        let mut fl_buf = bio.buf();
         from_bytes_mut::<FreeListHeader>(fl_buf.as_mut())
             .next
             .set(next);
@@ -396,16 +373,16 @@ pub(crate) async fn encode_arena_and_commit(
 
         next = arena.start + alloc_idx;
         alloc_idx += 1;
-        fio.write(next, fl_buf).await?;
+        bio.write(next, fl_buf).await?;
     }
 
-    root.arena.invalidate();
-    root.free.set(next);
-    let version = root.version.get() + 1;
-    root.version.set(version);
-    fio.write(dirty.fb.back(), root_buf).await?;
-    fio.sync().await?;
-    dirty.fb.flip();
+    header.arena.invalidate();
+    header.free.set(next);
+    let version = header.version.get() + 1;
+    header.version.set(version);
+    bio.write(root.fb.back(), root_buf).await?;
+    bio.sync().await?;
+    root.fb.flip();
 
     Ok(())
 }
@@ -419,47 +396,58 @@ mod tests {
     use crate::{
         block::BlockIo,
         bnode::BNodeRootHeader,
+        db::{BRootInfo, Txn},
         key_path,
-        lalloc::{FreeListHeader, INIT_ARENA_SIZE, free_on_disk_pg, read_fl_idx},
+        lalloc::{FreeListHeader, INIT_ARENA_SIZE, free_on_disk_pg, read_fl_idx, write_fl},
         test::TmpDir,
+        uint::PgIdx,
         util::from_bytes,
     };
+
+    impl<'a, B: BlockIo> Txn<'a, B> {
+        pub(crate) async fn write_fl<'b>(&'b mut self, root: &'b mut BRootInfo) -> Result<PgIdx> {
+            let root_buf = self.db.bio.read(root.fb.front()).await?;
+            let header = from_bytes::<BNodeRootHeader>(root_buf.as_ref());
+
+            write_fl(&mut self.to_lalloc_ctx(root), header).await
+        }
+    }
 
     #[named]
     #[tokio::test]
     async fn test_single_encode_arena() -> Result<()> {
         let tmp = TmpDir::new(function_name!())?;
         let db = tmp.db().await?;
-        let fio = &db.inner.fio;
+        let bio = &db.inner.bio;
         let mut txn = db.txn().write(key_path![])?.begin().await;
-        let mut dirty = txn.create_root_dirty_entry().await?;
-        assert_eq!(4, txn.lalloc(&mut dirty).await?);
+        let mut root = txn.create_root_root_info().await?;
+        assert_eq!(4, txn.lalloc(&mut root).await?);
 
         {
-            assert_eq!(3, dirty.fb.front());
-            assert_eq!(2, dirty.fb.back());
+            assert_eq!(3, root.fb.front());
+            assert_eq!(2, root.fb.back());
         }
 
-        assert_eq!(5, txn.lalloc(&mut dirty).await?);
-        assert_eq!(6, txn.lalloc(&mut dirty).await?);
-        assert_eq!(7, txn.lalloc(&mut dirty).await?);
-        assert_eq!(8, txn.lalloc(&mut dirty).await?);
-        assert_eq!(9, txn.lalloc(&mut dirty).await?);
-        assert_eq!(10, txn.lalloc(&mut dirty).await?);
+        assert_eq!(5, txn.lalloc(&mut root).await?);
+        assert_eq!(6, txn.lalloc(&mut root).await?);
+        assert_eq!(7, txn.lalloc(&mut root).await?);
+        assert_eq!(8, txn.lalloc(&mut root).await?);
+        assert_eq!(9, txn.lalloc(&mut root).await?);
+        assert_eq!(10, txn.lalloc(&mut root).await?);
 
-        let root_buf = fio.read(dirty.fb.front()).await?;
-        let root = from_bytes::<BNodeRootHeader>(root_buf.as_ref());
-        let start_version = root.version.get();
-        assert_eq!(12, txn.lalloc(&mut dirty).await?);
+        let root_buf = bio.read(root.fb.front()).await?;
+        let header = from_bytes::<BNodeRootHeader>(root_buf.as_ref());
+        let start_version = header.version.get();
+        assert_eq!(12, txn.lalloc(&mut root).await?);
 
-        assert_eq!(3, dirty.fb.front());
-        assert_eq!(2, dirty.fb.back());
-        let root_buf = fio.read(dirty.fb.front()).await?;
+        assert_eq!(3, root.fb.front());
+        assert_eq!(2, root.fb.back());
+        let root_buf = bio.read(root.fb.front()).await?;
         let root = from_bytes::<BNodeRootHeader>(root_buf.as_ref());
         assert_eq!(11, root.free.get());
         assert_eq!(start_version + 2, root.version.get());
 
-        let fl_buf = fio.read(root.free.get()).await?;
+        let fl_buf = bio.read(root.free.get()).await?;
         assert_eq!(0, from_bytes::<FreeListHeader>(fl_buf.as_ref()).next.get());
         assert_eq!(4, read_fl_idx(fl_buf.as_ref(), 0));
         assert_eq!(5, read_fl_idx(fl_buf.as_ref(), 1));
@@ -482,28 +470,34 @@ mod tests {
     async fn test_single_node_write_fl() -> Result<()> {
         let tmp = TmpDir::new(function_name!())?;
         let db = tmp.db().await?;
-        let fio = &db.inner.fio;
+        let bio = &db.inner.bio;
         let mut txn = db.txn().write(key_path![])?.begin().await;
-        let mut dirty = txn.create_root_dirty_entry().await?;
+        let mut root = txn.create_root_root_info().await?;
 
-        let free = txn.write_fl(&mut dirty).await?;
+        let free = txn.write_fl(&mut root).await?;
         assert_eq!(0, free);
 
-        assert_eq!(4, txn.lalloc(&mut dirty).await?);
-        assert_eq!(5, txn.lalloc(&mut dirty).await?);
-        free_on_disk_pg(&mut dirty.lalloc, &mut txn.defer_gaurd, 4);
-        free_on_disk_pg(&mut dirty.lalloc, &mut txn.defer_gaurd, 5);
+        assert_eq!(4, txn.lalloc(&mut root).await?);
+        assert_eq!(5, txn.lalloc(&mut root).await?);
+        free_on_disk_pg(&mut root.lalloc, &mut txn.defer_gaurd, 4);
+        free_on_disk_pg(&mut root.lalloc, &mut txn.defer_gaurd, 5);
 
-        let free = txn.write_fl(&mut dirty).await?;
+        let free = txn.write_fl(&mut root).await?;
         assert_eq!(6, free);
-        fio.sync().await?;
+        bio.sync().await?;
 
-        let fl_buf = fio.read(free).await?;
+        let fl_buf = bio.read(free).await?;
         assert_eq!(0, from_bytes::<FreeListHeader>(fl_buf.as_ref()).next.get());
         assert_eq!(5, read_fl_idx(fl_buf.as_ref(), 0));
         assert_eq!(4, read_fl_idx(fl_buf.as_ref(), 1));
         assert_eq!(0, read_fl_idx(fl_buf.as_ref(), 2));
 
+        Ok(())
+    }
+
+    #[named]
+    #[tokio::test]
+    async fn test_long_fl() -> Result<()> {
         Ok(())
     }
 }

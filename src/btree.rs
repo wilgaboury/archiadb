@@ -12,13 +12,13 @@ use crate::{
     },
     db::{BRootInfo, Txn},
     flux::{Flux, FluxBuf},
-    flux_old::FluxBufOld,
+    lalloc::lalloc,
     uint::{InPgIdx, PgIdx, PgIdxDisk},
     util::{ChecksumDisk, from_bytes, from_bytes_mut},
 };
 
-enum InsertResult {
-    Single(FluxBufOld),
+enum InsertResult<B: BlockIo> {
+    Single(FluxBuf<B>),
     Split(u64, Box<[u8]>, u64),
 }
 
@@ -88,14 +88,14 @@ pub(crate) struct UpsertCtx<'a> {
     bruh: &'a mut BRootInfo,
 }
 
-impl<'a> Txn<'a> {
+impl<'a, B: BlockIo> Txn<'a, B> {
     async fn btree_upsert(
         &mut self,
         dirty: &mut BRootInfo,
         key: &[u8],
         value: &[u8],
-        root: FluxBufOld,
-    ) -> Result<FluxBufOld> {
+        root: FluxBuf<B>,
+    ) -> Result<FluxBuf<B>> {
         match self
             .btree_upsert_inner(dirty, key, LeafValue::Value(value), root)
             .await?
@@ -106,7 +106,7 @@ impl<'a> Txn<'a> {
                 Ok(page_buf)
             }
             InsertResult::Split(left, split, right) => {
-                let mut pg_buf = self.flux_buf();
+                let mut pg_buf = self.flux.buf();
                 let header = from_bytes_mut::<BNodeRootHeader>(pg_buf.as_mut());
                 header.init();
                 header.header.len.set(1);
@@ -123,8 +123,8 @@ impl<'a> Txn<'a> {
         dirty: &mut BRootInfo,
         key: &[u8],
         value: LeafValue<'_>,
-        mut pg: FluxBufOld,
-    ) -> Result<InsertResult> {
+        mut pg: FluxBuf<B>,
+    ) -> Result<InsertResult<B>> {
         let header = from_bytes::<BNodeHeader>(pg.as_ref());
         if header.kind == BNodeKind::Leaf {
             self.btree_upsert_leaf(dirty, key, value, pg).await
@@ -133,10 +133,10 @@ impl<'a> Txn<'a> {
             let child_pg = if pg.as_ref().header().len() > 0 {
                 let child_pg_idx = get_page_ptr(pg.as_ref(), search);
                 self.free.push(child_pg_idx);
-                self.flux_read(child_pg_idx).await?
+                self.flux.read(child_pg_idx).await?
             } else {
                 pg.as_mut().header_mut().set_len(1);
-                let mut child_pg = self.flux_buf();
+                let mut child_pg = self.flux.buf();
                 child_pg.as_mut().header_mut().init(BNodeKind::Leaf);
                 child_pg
             };
@@ -144,7 +144,8 @@ impl<'a> Txn<'a> {
 
             match insert {
                 InsertResult::Single(child_pg) => {
-                    let child_pg_idx = self.flux_write(dirty, child_pg).await?;
+                    let (mut ctx, flux) = self.to_lalloc_ctx_and_flux(dirty);
+                    let child_pg_idx = flux.write(child_pg, || lalloc(&mut ctx)).await?;
                     write_page_ptr(pg.as_mut(), search, child_pg_idx);
                     Ok(InsertResult::Single(pg))
                 }
@@ -173,10 +174,10 @@ impl<'a> Txn<'a> {
         left_idx: u64,
         split: Box<[u8]>,
         right_idx: u64,
-        pg: FluxBufOld,
-    ) -> Result<InsertResult> {
+        pg: FluxBuf<B>,
+    ) -> Result<InsertResult<B>> {
         let mut left = pg;
-        let mut right = self.flux_buf();
+        let mut right = self.flux.buf();
 
         right.as_mut().header_mut().init(BNodeKind::Inner);
 
@@ -209,8 +210,9 @@ impl<'a> Txn<'a> {
 
         let key = get_key_leaf(right.as_ref(), 0).to_vec().into_boxed_slice();
 
-        let ret_left_idx = self.flux_write(dirty, left).await?;
-        let ret_right_idx = self.flux_write(dirty, right).await?;
+        let (mut ctx, flux) = self.to_lalloc_ctx_and_flux(dirty);
+        let ret_left_idx = flux.write(left, || lalloc(&mut ctx)).await?;
+        let ret_right_idx = flux.write(right, || lalloc(&mut ctx)).await?;
 
         Ok(InsertResult::Split(ret_left_idx, key, ret_right_idx))
     }
@@ -220,8 +222,8 @@ impl<'a> Txn<'a> {
         dirty: &mut BRootInfo,
         key: &[u8],
         value: LeafValue<'_>,
-        mut pg: FluxBufOld,
-    ) -> Result<InsertResult> {
+        mut pg: FluxBuf<B>,
+    ) -> Result<InsertResult<B>> {
         let encoded_value = value.encode(self).await?;
 
         let can_insert = remaining_bytes(pg.as_ref())
@@ -238,7 +240,7 @@ impl<'a> Txn<'a> {
             Ok(InsertResult::Single(pg))
         } else {
             let mut left = pg;
-            let mut right = self.flux_buf();
+            let mut right = self.flux.buf();
 
             right.as_mut().header_mut().init(BNodeKind::Leaf);
 
@@ -269,8 +271,9 @@ impl<'a> Txn<'a> {
 
             let key = get_key_leaf(right.as_ref(), 0).to_vec().into_boxed_slice();
 
-            let left_idx = self.flux_write(dirty, left).await?;
-            let right_idx = self.flux_write(dirty, right).await?;
+            let (mut ctx, flux) = self.to_lalloc_ctx_and_flux(dirty);
+            let left_idx = flux.write(left, || lalloc(&mut ctx)).await?;
+            let right_idx = flux.write(right, || lalloc(&mut ctx)).await?;
 
             Ok(InsertResult::Split(left_idx, key, right_idx))
         }
@@ -278,7 +281,7 @@ impl<'a> Txn<'a> {
 
     async fn btree_leaf_remove_at(
         &mut self,
-        dirty: &mut BRootInfo,
+        _dirty: &mut BRootInfo,
         buf: &mut [u8],
         idx: InPgIdx,
     ) -> Result<()> {
@@ -294,13 +297,14 @@ impl<'a> Txn<'a> {
                 // no-op
             }
             LeafValueGetResult::ValueLinkedList { mut pg_idx, len } => loop {
-                self.flux_free(dirty, pg_idx);
+                // self.flux.free(dirty, pg_idx);
+                // TODO: reimplement free in lalloc or something
 
                 if len < self.db.meta.page_size() {
                     break;
                 }
 
-                let pg = self.db.fio.read(pg_idx).await?;
+                let pg = self.db.bio.read(pg_idx).await?;
                 let next_idx =
                     pg.as_ref().len() - size_of::<PgIdxDisk>() - size_of::<ChecksumDisk>();
                 pg_idx = from_bytes::<PgIdxDisk>(&pg.as_ref()[next_idx..]).get();
@@ -316,14 +320,14 @@ impl<'a> Txn<'a> {
         let mut prev_pg_idx: PgIdx = 0;
         for chunk in value.chunks(chunk_size).rev() {
             let pg_idx = self.alloc().await?;
-            let mut buf = self.db.fio.buf();
+            let mut buf = self.db.bio.buf();
             let mbuf = buf.as_mut();
             let len = chunk.len();
             mbuf[..len].copy_from_slice(chunk);
             from_bytes_mut::<PgIdxDisk>(&mut mbuf[len..len + size_of::<PgIdxDisk>()])
                 .set(prev_pg_idx);
             prev_pg_idx = pg_idx;
-            self.db.fio.write(pg_idx, buf).await?;
+            self.db.bio.write(pg_idx, buf).await?;
         }
         Ok(prev_pg_idx)
     }
@@ -335,7 +339,7 @@ impl<'a> Txn<'a> {
     ) -> Result<()> {
         let mut empty = buf.len();
         while empty > 0 {
-            let pg = self.db.fio.read(pg_idx).await?;
+            let pg = self.db.bio.read(pg_idx).await?;
             let pg_buf = pg.as_ref();
             let len = pg_buf.len() - size_of::<PgIdxDisk>() - size_of::<ChecksumDisk>();
             let cp_len = std::cmp::min(len, empty);

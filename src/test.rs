@@ -76,11 +76,11 @@ impl TmpDir {
         self.path.join(path)
     }
 
-    pub async fn db(&self) -> Result<Db> {
+    pub async fn db(&self) -> Result<Db<BlockIoDefault>> {
         self.db_at(DEFAULT_FILE_PATH).await
     }
 
-    pub async fn db_at<P: AsRef<Path>>(&self, path: P) -> Result<Db> {
+    pub async fn db_at<P: AsRef<Path>>(&self, path: P) -> Result<Db<BlockIoDefault>> {
         Db::builder()
             .path(self.path(path))
             .sq(2)
