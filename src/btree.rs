@@ -41,15 +41,15 @@ pub(crate) enum BtreeGetResult<B: BlockIo> {
 
 async fn get<B: BlockIo>(
     key: &[u8],
-    root: &FluxBuf<B>,
+    root: &[u8],
     flux: &mut Flux<B>,
 ) -> Result<Option<BtreeGetResult<B>>> {
-    assert!(root.as_ref().header().kind == BNodeKind::Root);
+    assert!(root.header().kind == BNodeKind::Root);
 
     let mut cur = {
-        let search = search_inner(root.as_ref(), key);
-        let child_pg_idx = if root.as_ref().header().len() > 0 {
-            get_page_ptr(root.as_ref(), search.pg_idx())
+        let search = search_inner(root, key);
+        let child_pg_idx = if root.header().len() > 0 {
+            get_page_ptr(root, search.pg_idx())
         } else {
             bail!("empty root node")
         };
@@ -362,7 +362,7 @@ mod tests {
         bio::MIN_PAGE_SIZE,
         block::{BlockIo, BlockIoMemory},
         bnode::{self, BNodeHeader, BNodeKind, BNodeRootHeader, LeafValueEncoded},
-        btree::{self, BtreeGetResult, get},
+        btree::{BtreeGetResult, get},
         flux::Flux,
         util::from_bytes_mut,
     };
@@ -535,7 +535,8 @@ mod tests {
 
         async fn check_keys<B: BlockIo>(bio: B) -> Result<()> {
             let mut flux = Flux::new(bio);
-            let root = flux.read(0).await?;
+            let root_buf = flux.read(0).await?;
+            let root = root_buf.as_ref();
 
             assert_value(get(b"a", &root, &mut flux).await?, b"00");
             assert_value(get(b"b", &root, &mut flux).await?, b"01");
