@@ -35,7 +35,7 @@ pub(crate) struct BlockIoMemory {
 }
 
 impl BlockIoMemory {
-    fn new(page_size: InPgIdx) -> Self {
+    pub(crate) fn new(page_size: InPgIdx) -> Self {
         Self {
             data: Arc::new(Mutex::new(Vec::new())),
             page_size,
@@ -77,7 +77,7 @@ impl BlockIo for BlockIoMemory {
 
     async fn alloc(&self, size: PgIdx) -> Result<()> {
         let mut data = self.data.lock();
-        let new_len = data.len() + size as usize;
+        let new_len = data.len() + self.page_size as usize * size as usize;
         data.resize(new_len, 0);
         Ok(())
     }

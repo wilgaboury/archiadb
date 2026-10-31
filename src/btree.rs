@@ -48,7 +48,7 @@ async fn get<B: BlockIo>(
 
     let search = search_inner(node.as_ref(), key);
     let child_pg_idx = if node.as_ref().header().len() > 0 {
-        get_page_ptr(node.as_ref(), search.idx())
+        get_page_ptr(node.as_ref(), search.pg_idx())
     } else {
         bail!("empty root node")
     };
@@ -74,7 +74,7 @@ async fn get_inner<B: BlockIo>(
         BNodeKind::Root | BNodeKind::Inner => {
             let search = search_inner(node.as_ref(), key);
             let child_pg_idx = if node.as_ref().header().len() > 0 {
-                get_page_ptr(node.as_ref(), search.idx())
+                get_page_ptr(node.as_ref(), search.pg_idx())
             } else {
                 bail!("empty inner node")
             };
@@ -360,6 +360,209 @@ impl<'a, B: BlockIo> Txn<'a, B> {
 #[coverage(off)]
 #[cfg(test)]
 mod tests {
+    use anyhow::Result;
+
+    use crate::{
+        bio::MIN_PAGE_SIZE,
+        block::{BlockIo, BlockIoMemory},
+        bnode::{self, BNodeHeader, BNodeKind, BNodeRootHeader, LeafValueEncoded},
+        btree::{self, BtreeGetResult, get},
+        flux::Flux,
+        util::from_bytes_mut,
+    };
+
+    async fn build_basic_three_level_tree() -> Result<BlockIoMemory> {
+        let bio = BlockIoMemory::new(MIN_PAGE_SIZE);
+        bio.alloc(8).await?;
+
+        let mut p0 = bio.buf();
+
+        let h0 = from_bytes_mut::<BNodeRootHeader>(&mut p0);
+        h0.init();
+        bnode::insert_at_inner(&mut p0, 0, 2, b"g", 3);
+        let p1 = p0.clone();
+
+        bio.write(0, p0).await?;
+        bio.write(1, p1).await?;
+
+        let mut p2 = bio.buf();
+        from_bytes_mut::<BNodeHeader>(&mut p2).init(BNodeKind::Inner);
+        bnode::insert_at_inner(&mut p2, 0, 4, b"d", 5);
+        assert_eq!(from_bytes_mut::<BNodeHeader>(&mut p2).len(), 2);
+        bio.write(2, p2).await?;
+
+        let mut p3 = bio.buf();
+        from_bytes_mut::<BNodeHeader>(&mut p3).init(BNodeKind::Inner);
+        bnode::insert_at_inner(&mut p3, 0, 6, b"j", 7);
+        bio.write(3, p3).await?;
+
+        let mut p4 = bio.buf();
+        from_bytes_mut::<BNodeHeader>(&mut p4).init(BNodeKind::Leaf);
+        bnode::insert_at_leaf(&mut p4, 0, b"a", &LeafValueEncoded::ValueEmbedded(b"00"));
+        bnode::insert_at_leaf(&mut p4, 1, b"b", &LeafValueEncoded::ValueEmbedded(b"01"));
+        bnode::insert_at_leaf(&mut p4, 2, b"c", &LeafValueEncoded::ValueEmbedded(b"02"));
+        bio.write(4, p4).await?;
+
+        let mut p5 = bio.buf();
+        from_bytes_mut::<BNodeHeader>(&mut p5).init(BNodeKind::Leaf);
+        bnode::insert_at_leaf(&mut p5, 0, b"d", &LeafValueEncoded::ValueEmbedded(b"03"));
+        bnode::insert_at_leaf(&mut p5, 1, b"e", &LeafValueEncoded::ValueEmbedded(b"04"));
+        bnode::insert_at_leaf(&mut p5, 2, b"f", &LeafValueEncoded::ValueEmbedded(b"05"));
+        bio.write(5, p5).await?;
+
+        let mut p6 = bio.buf();
+        from_bytes_mut::<BNodeHeader>(&mut p6).init(BNodeKind::Leaf);
+        bnode::insert_at_leaf(&mut p6, 0, b"g", &LeafValueEncoded::ValueEmbedded(b"06"));
+        bnode::insert_at_leaf(&mut p6, 1, b"h", &LeafValueEncoded::ValueEmbedded(b"07"));
+        bnode::insert_at_leaf(&mut p6, 2, b"i", &LeafValueEncoded::ValueEmbedded(b"08"));
+        bio.write(6, p6).await?;
+
+        let mut p7 = bio.buf();
+        from_bytes_mut::<BNodeHeader>(&mut p7).init(BNodeKind::Leaf);
+        bnode::insert_at_leaf(&mut p7, 0, b"j", &LeafValueEncoded::ValueEmbedded(b"09"));
+        bnode::insert_at_leaf(&mut p7, 1, b"k", &LeafValueEncoded::ValueEmbedded(b"10"));
+        bnode::insert_at_leaf(&mut p7, 2, b"l", &LeafValueEncoded::ValueEmbedded(b"11"));
+        bio.write(7, p7).await?;
+
+        Ok(bio)
+    }
+
+    async fn build_basic_flat() -> Result<BlockIoMemory> {
+        let bio = BlockIoMemory::new(MIN_PAGE_SIZE);
+        bio.alloc(6).await?;
+
+        let mut p0 = bio.buf();
+
+        let h0 = from_bytes_mut::<BNodeRootHeader>(&mut p0);
+        h0.init();
+        bnode::insert_at_inner(&mut p0, 0, 2, b"d", 3);
+        bnode::insert_at_inner(&mut p0, 1, 3, b"g", 4);
+        bnode::insert_at_inner(&mut p0, 2, 4, b"j", 5);
+        let p1 = p0.clone();
+
+        bio.write(0, p0).await?;
+        bio.write(1, p1).await?;
+
+        let mut p2 = bio.buf();
+        from_bytes_mut::<BNodeHeader>(&mut p2).init(BNodeKind::Leaf);
+        bnode::insert_at_leaf(&mut p2, 0, b"a", &LeafValueEncoded::ValueEmbedded(b"00"));
+        bnode::insert_at_leaf(&mut p2, 1, b"b", &LeafValueEncoded::ValueEmbedded(b"01"));
+        bnode::insert_at_leaf(&mut p2, 2, b"c", &LeafValueEncoded::ValueEmbedded(b"02"));
+        bio.write(2, p2).await?;
+
+        let mut p3 = bio.buf();
+        from_bytes_mut::<BNodeHeader>(&mut p3).init(BNodeKind::Leaf);
+        bnode::insert_at_leaf(&mut p3, 0, b"d", &LeafValueEncoded::ValueEmbedded(b"03"));
+        bnode::insert_at_leaf(&mut p3, 1, b"e", &LeafValueEncoded::ValueEmbedded(b"04"));
+        bnode::insert_at_leaf(&mut p3, 2, b"f", &LeafValueEncoded::ValueEmbedded(b"05"));
+        bio.write(3, p3).await?;
+
+        let mut p4: Vec<u8> = bio.buf();
+        from_bytes_mut::<BNodeHeader>(&mut p4).init(BNodeKind::Leaf);
+        bnode::insert_at_leaf(&mut p4, 0, b"g", &LeafValueEncoded::ValueEmbedded(b"06"));
+        bnode::insert_at_leaf(&mut p4, 1, b"h", &LeafValueEncoded::ValueEmbedded(b"07"));
+        bnode::insert_at_leaf(&mut p4, 2, b"i", &LeafValueEncoded::ValueEmbedded(b"08"));
+        bio.write(4, p4).await?;
+
+        let mut p5 = bio.buf();
+        from_bytes_mut::<BNodeHeader>(&mut p5).init(BNodeKind::Leaf);
+        bnode::insert_at_leaf(&mut p5, 0, b"j", &LeafValueEncoded::ValueEmbedded(b"09"));
+        bnode::insert_at_leaf(&mut p5, 1, b"k", &LeafValueEncoded::ValueEmbedded(b"10"));
+        bnode::insert_at_leaf(&mut p5, 2, b"l", &LeafValueEncoded::ValueEmbedded(b"11"));
+        bio.write(5, p5).await?;
+
+        Ok(bio)
+    }
+
+    async fn build_basic_flat2() -> Result<BlockIoMemory> {
+        let bio = BlockIoMemory::new(MIN_PAGE_SIZE);
+        bio.alloc(7).await?;
+
+        let mut p0 = bio.buf();
+
+        let h0 = from_bytes_mut::<BNodeRootHeader>(&mut p0);
+        h0.init();
+        bnode::insert_init_at_inner(&mut p0, 2);
+        let p1 = p0.clone();
+
+        bio.write(0, p0).await?;
+        bio.write(1, p1).await?;
+
+        let mut p2 = bio.buf();
+        from_bytes_mut::<BNodeHeader>(&mut p2).init(BNodeKind::Inner);
+        bnode::insert_at_inner(&mut p2, 0, 3, b"d", 4);
+        bnode::insert_at_inner(&mut p2, 1, 4, b"g", 5);
+        bnode::insert_at_inner(&mut p2, 2, 5, b"j", 6);
+        bio.write(2, p2).await?;
+
+        let mut p3 = bio.buf();
+        from_bytes_mut::<BNodeHeader>(&mut p3).init(BNodeKind::Leaf);
+        bnode::insert_at_leaf(&mut p3, 0, b"a", &LeafValueEncoded::ValueEmbedded(b"00"));
+        bnode::insert_at_leaf(&mut p3, 1, b"b", &LeafValueEncoded::ValueEmbedded(b"01"));
+        bnode::insert_at_leaf(&mut p3, 2, b"c", &LeafValueEncoded::ValueEmbedded(b"02"));
+        bio.write(3, p3).await?;
+
+        let mut p4 = bio.buf();
+        from_bytes_mut::<BNodeHeader>(&mut p4).init(BNodeKind::Leaf);
+        bnode::insert_at_leaf(&mut p4, 0, b"d", &LeafValueEncoded::ValueEmbedded(b"03"));
+        bnode::insert_at_leaf(&mut p4, 1, b"e", &LeafValueEncoded::ValueEmbedded(b"04"));
+        bnode::insert_at_leaf(&mut p4, 2, b"f", &LeafValueEncoded::ValueEmbedded(b"05"));
+        bio.write(4, p4).await?;
+
+        let mut p5: Vec<u8> = bio.buf();
+        from_bytes_mut::<BNodeHeader>(&mut p5).init(BNodeKind::Leaf);
+        bnode::insert_at_leaf(&mut p5, 0, b"g", &LeafValueEncoded::ValueEmbedded(b"06"));
+        bnode::insert_at_leaf(&mut p5, 1, b"h", &LeafValueEncoded::ValueEmbedded(b"07"));
+        bnode::insert_at_leaf(&mut p5, 2, b"i", &LeafValueEncoded::ValueEmbedded(b"08"));
+        bio.write(5, p5).await?;
+
+        let mut p6 = bio.buf();
+        from_bytes_mut::<BNodeHeader>(&mut p6).init(BNodeKind::Leaf);
+        bnode::insert_at_leaf(&mut p6, 0, b"j", &LeafValueEncoded::ValueEmbedded(b"09"));
+        bnode::insert_at_leaf(&mut p6, 1, b"k", &LeafValueEncoded::ValueEmbedded(b"10"));
+        bnode::insert_at_leaf(&mut p6, 2, b"l", &LeafValueEncoded::ValueEmbedded(b"11"));
+        bio.write(6, p6).await?;
+
+        Ok(bio)
+    }
+
+    #[tokio::test]
+    async fn get_test() -> Result<()> {
+        fn assert_value<B: BlockIo>(res: Option<BtreeGetResult<B>>, value: &[u8]) {
+            match res {
+                Some(BtreeGetResult::ValueEmbedded { buf, loc, len }) => {
+                    assert_eq!(&buf.as_ref()[loc..loc + len], value)
+                }
+                _ => panic!("expected embedded value"),
+            }
+        }
+
+        async fn check_keys<B: BlockIo>(bio: B) -> Result<()> {
+            let mut flux = Flux::new(bio);
+            let root = flux.read(0).await?;
+
+            assert_value(get(b"a", &root, &mut flux).await?, b"00");
+            assert_value(get(b"b", &root, &mut flux).await?, b"01");
+            assert_value(get(b"c", &root, &mut flux).await?, b"02");
+            assert_value(get(b"d", &root, &mut flux).await?, b"03");
+            assert_value(get(b"e", &root, &mut flux).await?, b"04");
+            assert_value(get(b"f", &root, &mut flux).await?, b"05");
+            assert_value(get(b"g", &root, &mut flux).await?, b"06");
+            assert_value(get(b"h", &root, &mut flux).await?, b"07");
+            assert_value(get(b"i", &root, &mut flux).await?, b"08");
+            assert_value(get(b"j", &root, &mut flux).await?, b"09");
+            assert_value(get(b"k", &root, &mut flux).await?, b"10");
+            assert_value(get(b"l", &root, &mut flux).await?, b"11");
+
+            Ok(())
+        }
+
+        check_keys(build_basic_three_level_tree().await?).await?;
+        check_keys(build_basic_flat().await?).await?;
+        check_keys(build_basic_flat2().await?).await?;
+
+        Ok(())
+    }
 
     // TODO: need to migrate to new generic Flux
 

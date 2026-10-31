@@ -226,6 +226,15 @@ pub(crate) fn insert_init_inner(buf: &mut [u8], ptr: u64) {
     from_bytes_mut::<PgIdxDisk>(&mut buf[start as usize..end as usize]).set(ptr);
 }
 
+pub(crate) fn insert_init_at_inner(buf: &mut [u8], child: PgIdx) {
+    let header = from_bytes_mut::<BNodeHeader>(buf);
+    header.set_len(1);
+
+    let start = in_pg_len(buf) - in_pg_size_of::<ChecksumDisk>() - in_pg_size_of::<PgIdxDisk>();
+    let end = start + in_pg_size_of::<PgIdxDisk>();
+    from_bytes_mut::<PgIdxDisk>(&mut buf[start as usize..end as usize]).set(child);
+}
+
 /// will unconditionally copy the key into the node without checking if there is space, always inserts as ptr|key
 pub(crate) fn insert_at_inner(buf: &mut [u8], idx: InPgIdx, left: PgIdx, key: &[u8], right: PgIdx) {
     {
@@ -278,7 +287,11 @@ pub(crate) fn insert_at_inner(buf: &mut [u8], idx: InPgIdx, left: PgIdx, key: &[
 
     {
         let header = buf.header_mut();
-        header.set_len(header.len() + 1);
+        if header.len() == 0 {
+            header.set_len(2);
+        } else {
+            header.set_len(header.len() + 1);
+        }
     }
 }
 
@@ -624,6 +637,13 @@ impl SearchResult {
     pub fn idx(&self) -> InPgIdx {
         match self {
             SearchResult::Exact(idx) => *idx,
+            SearchResult::Insert(idx) => *idx,
+        }
+    }
+
+    pub fn pg_idx(&self) -> InPgIdx {
+        match self {
+            SearchResult::Exact(idx) => *idx + 1,
             SearchResult::Insert(idx) => *idx,
         }
     }
