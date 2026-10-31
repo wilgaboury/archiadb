@@ -41,45 +41,41 @@ pub(crate) enum BtreeGetResult<B: BlockIo> {
 
 async fn get<B: BlockIo>(
     key: &[u8],
-    node: &FluxBuf<B>,
+    root: &FluxBuf<B>,
     flux: &mut Flux<B>,
 ) -> Result<Option<BtreeGetResult<B>>> {
-    assert!(node.as_ref().header().kind == BNodeKind::Root);
+    assert!(root.as_ref().header().kind == BNodeKind::Root);
 
-    let search = search_inner(node.as_ref(), key);
-    let child_pg_idx = if node.as_ref().header().len() > 0 {
-        get_page_ptr(node.as_ref(), search.pg_idx())
-    } else {
-        bail!("empty root node")
+    let mut cur = {
+        let search = search_inner(root.as_ref(), key);
+        let child_pg_idx = if root.as_ref().header().len() > 0 {
+            get_page_ptr(root.as_ref(), search.pg_idx())
+        } else {
+            bail!("empty root node")
+        };
+        flux.read(child_pg_idx).await?
     };
-    let child_pg = flux.read(child_pg_idx).await?;
-    get_inner(key, child_pg, flux).await
-}
 
-async fn get_inner<B: BlockIo>(
-    key: &[u8],
-    node: FluxBuf<B>,
-    flux: &mut Flux<B>,
-) -> Result<Option<BtreeGetResult<B>>> {
-    match node.as_ref().header().kind {
-        BNodeKind::Leaf => {
-            let search = search_leaf(node.as_ref(), key);
-            if let SearchResult::Exact(idx) = search {
-                let value = get_value_leaf(node.as_ref(), idx);
-                Ok(Some(value.with_page(node)))
-            } else {
-                Ok(None)
+    loop {
+        match cur.as_ref().header().kind {
+            BNodeKind::Leaf => {
+                let search = search_leaf(cur.as_ref(), key);
+                if let SearchResult::Exact(idx) = search {
+                    let value = get_value_leaf(cur.as_ref(), idx);
+                    return Ok(Some(value.with_page(cur)));
+                } else {
+                    return Ok(None);
+                }
             }
-        }
-        BNodeKind::Root | BNodeKind::Inner => {
-            let search = search_inner(node.as_ref(), key);
-            let child_pg_idx = if node.as_ref().header().len() > 0 {
-                get_page_ptr(node.as_ref(), search.pg_idx())
-            } else {
-                bail!("empty inner node")
-            };
-            let child_pg = flux.read(child_pg_idx).await?;
-            Box::pin(get_inner(key, child_pg, flux)).await
+            BNodeKind::Root | BNodeKind::Inner => {
+                let search = search_inner(cur.as_ref(), key);
+                let child_pg_idx = if cur.as_ref().header().len() > 0 {
+                    get_page_ptr(cur.as_ref(), search.pg_idx())
+                } else {
+                    bail!("empty inner node")
+                };
+                cur = flux.read(child_pg_idx).await?;
+            }
         }
     }
 }
