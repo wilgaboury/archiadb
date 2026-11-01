@@ -1,18 +1,18 @@
 use std::cmp::Ordering;
 
-use anyhow::{Result, bail};
+use anyhow::{Ok, Result, bail};
 
 use crate::{
     block::BlockIo,
     bnode::{
         BNodeBuf, BNodeHeader, BNodeKind, BNodeRootHeader, LeafValue, LeafValueGetResult,
         SearchResult, SlotDisk, get_key_inner, get_key_leaf, get_page_ptr, get_value_leaf,
-        in_pg_len, in_pg_size_of, insert_at_inner, insert_at_leaf, remaining_bytes, remove_at_leaf,
-        root_to_inner, search_inner, search_leaf, write_page_ptr,
+        in_pg_len, in_pg_size_of, insert_at_inner, insert_at_leaf, insert_init_at_inner,
+        remaining_bytes, remove_at_leaf, root_to_inner, search_inner, search_leaf, write_page_ptr,
     },
     db::{BRootInfo, Txn},
-    flux::{Flux, FluxBuf},
-    lalloc::lalloc,
+    flux::{self, Flux, FluxBuf},
+    lalloc::{LallocCtx, lalloc},
     uint::{InPgIdx, PgIdx, PgIdxDisk},
     util::{ChecksumDisk, from_bytes, from_bytes_mut},
 };
@@ -80,8 +80,139 @@ async fn get<B: BlockIo>(
     }
 }
 
-pub(crate) struct UpsertCtx<'a> {
-    bruh: &'a mut BRootInfo,
+async fn get_path<B: BlockIo>(
+    key: &[u8],
+    root: &[u8],
+    flux: &mut Flux<B>,
+) -> Result<Vec<FluxBuf<B>>> {
+    assert!(root.header().kind == BNodeKind::Root);
+
+    let mut cur = {
+        let search = search_inner(root, key);
+        let child_pg_idx = if root.header().len() > 0 {
+            get_page_ptr(root, search.pg_idx())
+        } else {
+            bail!("empty root node")
+        };
+        flux.read(child_pg_idx).await?
+    };
+
+    let mut ret = Vec::new();
+
+    loop {
+        match cur.as_ref().header().kind {
+            BNodeKind::Leaf => {
+                // let search = search_leaf(cur.as_ref(), key);
+                // if let SearchResult::Exact(idx) = search {
+                //     let value = get_value_leaf(cur.as_ref(), idx);
+                //     return Ok(Some(value.with_page(cur)));
+                // } else {
+                //     return Ok(None);
+                // }
+                ret.push(cur);
+                return Ok(ret);
+            }
+            BNodeKind::Root | BNodeKind::Inner => {
+                let search = search_inner(cur.as_ref(), key);
+                let child_pg_idx = if cur.as_ref().header().len() > 0 {
+                    get_page_ptr(cur.as_ref(), search.pg_idx())
+                } else {
+                    bail!("empty inner node")
+                };
+                let next = flux.read(child_pg_idx).await?;
+                ret.push(std::mem::replace(&mut cur, next));
+            }
+        }
+    }
+}
+
+async fn upsert<'a, 'b, B: BlockIo>(
+    key: &[u8],
+    value: &[u8],
+    flux: &mut Flux<B>,
+    mut ctx: LallocCtx<'a, 'b, B>,
+) -> Result<()> {
+    let mut root_buf = flux.read(ctx.root.fb.front()).await?;
+
+    // new btree, empty root node
+    {
+        let header = from_bytes_mut::<BNodeRootHeader>(root_buf.as_mut());
+        if header.node.len() == 0 {
+            let mut buf = flux.buf();
+            let header = from_bytes_mut::<BNodeHeader>(buf.as_mut());
+            header.init(BNodeKind::Leaf);
+
+            // TODO: insert key/value into leaf node
+
+            let pg_idx = flux.write(buf, || lalloc(&mut ctx)).await?;
+            insert_init_at_inner(root_buf.as_mut(), pg_idx);
+            return Ok(());
+        }
+    }
+
+    let path = get_path(key, root_buf.as_ref(), flux).await?;
+
+    todo!("implement rest of upsert")
+}
+
+async fn upsert_leaf<B: BlockIo>(
+    key: &[u8],
+    value: LeafValue<'_>,
+    mut pg: FluxBuf<B>,
+) -> Result<InsertResult<B>> {
+    let encoded_value = value.encode(self).await?;
+
+    let can_insert = remaining_bytes(pg.as_ref())
+        > in_pg_len(key) + encoded_value.len() + in_pg_size_of::<SlotDisk>();
+    if can_insert {
+        let search = search_leaf(pg.as_ref(), key);
+        if let SearchResult::Exact(idx) = search
+            && pg.as_ref().header().len() > 0
+        {
+            // ignoring underflow during upsert because it's less complicated
+            self.btree_leaf_remove_at(dirty, pg.as_mut(), idx).await?;
+        }
+        insert_at_leaf(pg.as_mut(), search.idx(), key, &encoded_value);
+        Ok(InsertResult::Single(pg))
+    } else {
+        let mut left = pg;
+        let mut right = self.flux.buf();
+
+        right.as_mut().header_mut().init(BNodeKind::Leaf);
+
+        let len = left.as_ref().header().len();
+        let start = len / 2;
+        for idx in start..len {
+            let key = get_key_leaf(left.as_ref(), idx);
+            let value = get_value_leaf(left.as_ref(), idx).encode(left.as_ref());
+            insert_at_leaf(right.as_mut(), idx - start, key, &value);
+        }
+        left.as_mut().header_mut().set_len(start as u64);
+
+        {
+            let insert = if key.cmp(get_key_leaf(right.as_ref(), 0)) == Ordering::Less {
+                &mut left
+            } else {
+                &mut right
+            };
+
+            let search = search_leaf(insert.as_ref(), key);
+            if let SearchResult::Exact(idx) = search {
+                // ignoring underflow during upsert because it's less complicated
+                self.btree_leaf_remove_at(dirty, insert.as_mut(), idx)
+                    .await?;
+            }
+            insert_at_leaf(insert.as_mut(), search.idx(), key, &encoded_value);
+        }
+
+        let key = get_key_leaf(right.as_ref(), 0).to_vec().into_boxed_slice();
+
+        let (mut ctx, flux) = self.to_lalloc_ctx_and_flux(dirty);
+        let left_idx = flux.write(left, || lalloc(&mut ctx)).await?;
+        let right_idx = flux.write(right, || lalloc(&mut ctx)).await?;
+
+        Ok(InsertResult::Split(left_idx, key, right_idx))
+    }
 }
 
 impl<'a, B: BlockIo> Txn<'a, B> {
@@ -105,7 +236,7 @@ impl<'a, B: BlockIo> Txn<'a, B> {
                 let mut pg_buf = self.flux.buf();
                 let header = from_bytes_mut::<BNodeRootHeader>(pg_buf.as_mut());
                 header.init();
-                header.header.len.set(1);
+                header.node.len.set(1);
                 header.version.set(header.version.get() + 1);
                 insert_at_inner(pg_buf.as_mut(), 0, left, &split, right);
 

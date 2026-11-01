@@ -99,7 +99,7 @@ impl BNodeHeader {
 
 #[repr(C, packed)]
 pub(crate) struct BNodeRootHeader {
-    pub(crate) header: BNodeHeader,
+    pub(crate) node: BNodeHeader,
     pub(crate) version: U64,
     pub(crate) free: PgIdxDisk,
     pub(crate) arena: ArenaDisk,
@@ -107,7 +107,7 @@ pub(crate) struct BNodeRootHeader {
 
 impl BNodeRootHeader {
     pub(crate) fn init(&mut self) {
-        self.header.init(BNodeKind::Root);
+        self.node.init(BNodeKind::Root);
         self.version.set(0);
         self.free.set(0);
         self.arena.init();
@@ -711,9 +711,9 @@ mod tests {
         let buffer = vec![0u8; 4096];
         let slice = &buffer[1..];
         let header = from_bytes::<BNodeRootHeader>(slice);
-        assert_eq!({ header.header.kind.clone() }, BNodeKind::Root);
+        assert_eq!({ header.node.kind.clone() }, BNodeKind::Root);
         assert_eq!(header.version.get(), 0);
-        assert_eq!(header.header.len(), 0);
+        assert_eq!(header.node.len(), 0);
     }
 
     #[test]
