@@ -155,64 +155,67 @@ async fn upsert<'a, 'b, B: BlockIo>(
     todo!("implement rest of upsert")
 }
 
-async fn upsert_leaf<B: BlockIo>(
+async fn upsert_leaf<'a, 'b, B: BlockIo>(
     key: &[u8],
     value: LeafValue<'_>,
-    mut pg: FluxBuf<B>,
+    flux: &mut Flux<B>,
+    mut ctx: LallocCtx<'a, 'b, B>,
 ) -> Result<InsertResult<B>> {
-    let encoded_value = value.encode(self).await?;
+    // let encoded_value = value.encode(self).await?;
 
-    let can_insert = remaining_bytes(pg.as_ref())
-        > in_pg_len(key) + encoded_value.len() + in_pg_size_of::<SlotDisk>();
-    if can_insert {
-        let search = search_leaf(pg.as_ref(), key);
-        if let SearchResult::Exact(idx) = search
-            && pg.as_ref().header().len() > 0
-        {
-            // ignoring underflow during upsert because it's less complicated
-            self.btree_leaf_remove_at(dirty, pg.as_mut(), idx).await?;
-        }
-        insert_at_leaf(pg.as_mut(), search.idx(), key, &encoded_value);
-        Ok(InsertResult::Single(pg))
-    } else {
-        let mut left = pg;
-        let mut right = self.flux.buf();
+    // let can_insert = remaining_bytes(pg.as_ref())
+    //     > in_pg_len(key) + encoded_value.len() + in_pg_size_of::<SlotDisk>();
+    // if can_insert {
+    //     let search = search_leaf(pg.as_ref(), key);
+    //     if let SearchResult::Exact(idx) = search
+    //         && pg.as_ref().header().len() > 0
+    //     {
+    //         // ignoring underflow during upsert because it's less complicated
+    //         self.btree_leaf_remove_at(dirty, pg.as_mut(), idx).await?;
+    //     }
+    //     insert_at_leaf(pg.as_mut(), search.idx(), key, &encoded_value);
+    //     Ok(InsertResult::Single(pg))
+    // } else {
+    //     let mut left = pg;
+    //     let mut right = self.flux.buf();
 
-        right.as_mut().header_mut().init(BNodeKind::Leaf);
+    //     right.as_mut().header_mut().init(BNodeKind::Leaf);
 
-        let len = left.as_ref().header().len();
-        let start = len / 2;
-        for idx in start..len {
-            let key = get_key_leaf(left.as_ref(), idx);
-            let value = get_value_leaf(left.as_ref(), idx).encode(left.as_ref());
-            insert_at_leaf(right.as_mut(), idx - start, key, &value);
-        }
-        left.as_mut().header_mut().set_len(start as u64);
+    //     let len = left.as_ref().header().len();
+    //     let start = len / 2;
+    //     for idx in start..len {
+    //         let key = get_key_leaf(left.as_ref(), idx);
+    //         let value = get_value_leaf(left.as_ref(), idx).encode(left.as_ref());
+    //         insert_at_leaf(right.as_mut(), idx - start, key, &value);
+    //     }
+    //     left.as_mut().header_mut().set_len(start as u64);
 
-        {
-            let insert = if key.cmp(get_key_leaf(right.as_ref(), 0)) == Ordering::Less {
-                &mut left
-            } else {
-                &mut right
-            };
+    //     {
+    //         let insert = if key.cmp(get_key_leaf(right.as_ref(), 0)) == Ordering::Less {
+    //             &mut left
+    //         } else {
+    //             &mut right
+    //         };
 
-            let search = search_leaf(insert.as_ref(), key);
-            if let SearchResult::Exact(idx) = search {
-                // ignoring underflow during upsert because it's less complicated
-                self.btree_leaf_remove_at(dirty, insert.as_mut(), idx)
-                    .await?;
-            }
-            insert_at_leaf(insert.as_mut(), search.idx(), key, &encoded_value);
-        }
+    //         let search = search_leaf(insert.as_ref(), key);
+    //         if let SearchResult::Exact(idx) = search {
+    //             // ignoring underflow during upsert because it's less complicated
+    //             self.btree_leaf_remove_at(dirty, insert.as_mut(), idx)
+    //                 .await?;
+    //         }
+    //         insert_at_leaf(insert.as_mut(), search.idx(), key, &encoded_value);
+    //     }
 
-        let key = get_key_leaf(right.as_ref(), 0).to_vec().into_boxed_slice();
+    //     let key = get_key_leaf(right.as_ref(), 0).to_vec().into_boxed_slice();
 
-        let (mut ctx, flux) = self.to_lalloc_ctx_and_flux(dirty);
-        let left_idx = flux.write(left, || lalloc(&mut ctx)).await?;
-        let right_idx = flux.write(right, || lalloc(&mut ctx)).await?;
+    //     let (mut ctx, flux) = self.to_lalloc_ctx_and_flux(dirty);
+    //     let left_idx = flux.write(left, || lalloc(&mut ctx)).await?;
+    //     let right_idx = flux.write(right, || lalloc(&mut ctx)).await?;
 
-        Ok(InsertResult::Split(left_idx, key, right_idx))
-    }
+    //     Ok(InsertResult::Split(left_idx, key, right_idx))
+    // }
+
+    todo!()
 }
 
 impl<'a, B: BlockIo> Txn<'a, B> {

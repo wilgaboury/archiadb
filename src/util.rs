@@ -43,7 +43,7 @@ pub fn fs_block_size<P: AsRef<Path>>(path: P) -> Result<InPgIdx> {
 
 /// file must exist
 pub fn default_page_size<P: AsRef<Path>>(path: P) -> Result<u64> {
-    let block_size = fs_block_size(path)?;
+    let block_size: u64 = fs_block_size(path)?;
     if block_size >= MIN_PAGE_SIZE && block_size <= MAX_PAGE_SIZE && block_size % MIN_PAGE_SIZE == 0
     {
         Ok(block_size)

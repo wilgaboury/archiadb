@@ -7,7 +7,7 @@ use crate::{
     const_assert,
     db::Txn,
     flux::FluxBuf,
-    lalloc::Arena,
+    lalloc::{Arena, LallocCtx},
     uint::{InPgIdx, InPgIdxDisk, PgIdx, PgIdxDisk, U24, U64},
     util::{ChecksumDisk, from_bytes, from_bytes_mut},
 };
@@ -486,6 +486,13 @@ pub(crate) enum LeafValueGetResult {
 pub(crate) enum LeafValue<'a> {
     Btree { pg_idx_1: PgIdx, pg_idx_2: PgIdx },
     Value(&'a [u8]),
+}
+
+pub(crate) fn encode_value<'v, 'a, 'b, B: BlockIo>(
+    ctx: &mut LallocCtx<'a, 'b, B>,
+    value: LeafValue<'v>,
+) -> Result<LeafValueEncoded<'v>> {
+    todo!("implement")
 }
 
 impl<'a> LeafValue<'a> {

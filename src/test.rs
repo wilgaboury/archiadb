@@ -10,9 +10,11 @@ use anyhow::Result;
 
 use crate::{
     bio::BlockIoUring,
-    block::{BlockIoDefault, BlockIoRapidHash},
-    db::Db,
+    block::{BlockIo, BlockIoDefault, BlockIoRapidHash},
+    db::{BRootInfo, Db},
+    defer::{Defer, DeferGaurd},
     file::DbFile,
+    galloc::Galloc,
     meta::MetaHandler,
     util::{ChecksumDisk, from_bytes_mut},
 };
@@ -166,4 +168,13 @@ impl Drop for TmpDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.path);
     }
+}
+
+pub(crate) struct TestLallocCtx<'d, B: BlockIo> {
+    pub(crate) galloc: Galloc,
+    pub(crate) meta: MetaHandler,
+    pub(crate) bio: B,
+    pub(crate) defer: Defer,
+    pub(crate) defer_gaurd: DeferGaurd<'d>,
+    pub(crate) root: BRootInfo,
 }
