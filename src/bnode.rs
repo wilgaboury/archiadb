@@ -2,10 +2,11 @@ use anyhow::Result;
 
 use crate::{
     bio::BlockIo,
+    bll,
     btree::BtreeGetResult,
     const_assert,
     db::Txn,
-    flux::FluxBuf,
+    flux::{Flux, FluxBuf},
     lalloc::{Arena, LallocCtx},
     uint::{InPgIdx, InPgIdxDisk, PgIdx, PgIdxDisk, U24, U64},
     uring::MIN_PAGE_SIZE,
@@ -494,11 +495,25 @@ pub(crate) enum LeafValue<'a> {
     Value(&'a [u8]),
 }
 
-pub(crate) fn encode_value<'v, 'a, 'b, B: BlockIo>(
-    _ctx: &mut LallocCtx<'a, 'b, B>,
-    _value: LeafValue<'v>,
+pub(crate) async fn encode_value<'v, 'a, 'b, B: BlockIo>(
+    value: LeafValue<'v>,
+    ctx: &mut LallocCtx<'a, 'b, B>,
+    flux: &mut Flux<B>,
 ) -> Result<LeafValueEncoded<'v>> {
-    todo!("implement")
+    Ok(match value {
+        LeafValue::Btree { pg_idx_1, pg_idx_2 } => LeafValueEncoded::Btree { pg_idx_1, pg_idx_2 },
+        LeafValue::Value(buf) => {
+            if buf.len() < 256 {
+                LeafValueEncoded::ValueEmbedded(buf)
+            } else {
+                let pg_idx = bll::create(ctx, flux, buf).await?;
+                LeafValueEncoded::ValueLinkedList {
+                    pg_idx,
+                    len: buf.len() as u64,
+                }
+            }
+        }
+    })
 }
 
 impl<'a> LeafValue<'a> {

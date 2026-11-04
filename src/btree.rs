@@ -5,7 +5,7 @@ use anyhow::{Ok, Result, bail};
 use crate::{
     bio::BlockIo,
     bnode::{
-        BNodeBuf, BNodeHeader, BNodeKind, BNodeRootHeader, LeafValue, LeafValueGetResult,
+        self, BNodeBuf, BNodeHeader, BNodeKind, BNodeRootHeader, LeafValue, LeafValueGetResult,
         SearchResult, SlotDisk, get_key_inner, get_key_leaf, get_page_ptr, get_value_leaf,
         in_pg_len, in_pg_size_of, insert_at_inner, insert_at_leaf, insert_init_at_inner,
         remaining_bytes, remove_at_leaf, root_to_inner, search_inner, search_leaf, write_page_ptr,
@@ -128,7 +128,7 @@ async fn get_path<B: BlockIo>(
 
 async fn upsert<'a, 'b, B: BlockIo>(
     key: &[u8],
-    _value: &[u8],
+    value: LeafValue<'_>,
     flux: &mut Flux<B>,
     mut ctx: LallocCtx<'a, 'b, B>,
 ) -> Result<()> {
@@ -150,18 +150,22 @@ async fn upsert<'a, 'b, B: BlockIo>(
         }
     }
 
-    let _path = get_path(key, root_buf.as_ref(), flux).await?;
+    let mut path = get_path(key, root_buf.as_ref(), flux).await?;
+
+    let leaf = path.pop().unwrap();
+    let _insert = upsert_leaf(leaf, key, value, &mut ctx, flux).await?;
 
     todo!("implement rest of upsert")
 }
 
 async fn upsert_leaf<'a, 'b, B: BlockIo>(
+    _pg: FluxBuf<B>,
     _key: &[u8],
-    _value: LeafValue<'_>,
-    _flux: &mut Flux<B>,
-    _ctx: LallocCtx<'a, 'b, B>,
+    value: LeafValue<'_>,
+    ctx: &mut LallocCtx<'a, 'b, B>,
+    flux: &mut Flux<B>,
 ) -> Result<InsertResult<B>> {
-    // let encoded_value = value.encode(self).await?;
+    let _value = bnode::encode_value(value, ctx, flux).await?;
 
     // let can_insert = remaining_bytes(pg.as_ref())
     //     > in_pg_len(key) + encoded_value.len() + in_pg_size_of::<SlotDisk>();

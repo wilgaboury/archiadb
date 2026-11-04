@@ -5,7 +5,7 @@ use anyhow::Result;
 use crate::{
     bio::BlockIo,
     bnode::BNodeRootHeader,
-    db::{BRootInfo, Txn},
+    db::BRootInfo,
     defer::DeferGuard,
     galloc::{Galloc, GallocCtx, galloc},
     key::KeyPathBuf,
@@ -189,12 +189,6 @@ pub(crate) async fn write_fl<'a, 'd, B: BlockIo>(
     }
 
     Ok(next)
-}
-
-impl<'a, B: BlockIo> Txn<'a, B> {
-    pub(crate) async fn lalloc<'b>(&'b mut self, root: &'b mut BRootInfo) -> Result<PgIdx> {
-        lalloc(&mut self.to_lalloc_ctx(root)).await
-    }
 }
 
 pub(crate) fn free_on_disk_pg(lalloc: &mut Lalloc, defer_guard: &mut DeferGuard, pg_idx: PgIdx) {
@@ -398,13 +392,17 @@ mod tests {
         bnode::BNodeRootHeader,
         db::{BRootInfo, Txn},
         key_path,
-        lalloc::{FreeListHeader, INIT_ARENA_SIZE, free_on_disk_pg, read_fl_idx, write_fl},
+        lalloc::{FreeListHeader, INIT_ARENA_SIZE, free_on_disk_pg, lalloc, read_fl_idx, write_fl},
         test::TmpDir,
         uint::PgIdx,
         util::from_bytes,
     };
 
     impl<'a, B: BlockIo> Txn<'a, B> {
+        pub(crate) async fn lalloc<'b>(&'b mut self, root: &'b mut BRootInfo) -> Result<PgIdx> {
+            lalloc(&mut self.to_lalloc_ctx(root)).await
+        }
+
         pub(crate) async fn write_fl<'b>(&'b mut self, root: &'b mut BRootInfo) -> Result<PgIdx> {
             let root_buf = self.db.bio.read(root.fb.front()).await?;
             let header = from_bytes::<BNodeRootHeader>(root_buf.as_ref());
