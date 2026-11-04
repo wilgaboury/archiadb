@@ -1,14 +1,14 @@
 use anyhow::Result;
 
 use crate::{
-    bio::MIN_PAGE_SIZE,
-    block::BlockIo,
+    bio::BlockIo,
     btree::BtreeGetResult,
     const_assert,
     db::Txn,
     flux::FluxBuf,
     lalloc::{Arena, LallocCtx},
     uint::{InPgIdx, InPgIdxDisk, PgIdx, PgIdxDisk, U24, U64},
+    uring::MIN_PAGE_SIZE,
     util::{ChecksumDisk, from_bytes, from_bytes_mut},
 };
 
@@ -128,6 +128,12 @@ impl ArenaDisk {
         self.start.set(0);
         self.len.set(0);
         self.next.set(0);
+    }
+
+    pub(crate) fn from(&mut self, arena: &Arena) {
+        self.start.set(arena.start);
+        self.len.set(arena.len);
+        self.next.set(arena.next);
     }
 
     pub(crate) fn invalidate(&mut self) {
@@ -489,8 +495,8 @@ pub(crate) enum LeafValue<'a> {
 }
 
 pub(crate) fn encode_value<'v, 'a, 'b, B: BlockIo>(
-    ctx: &mut LallocCtx<'a, 'b, B>,
-    value: LeafValue<'v>,
+    _ctx: &mut LallocCtx<'a, 'b, B>,
+    _value: LeafValue<'v>,
 ) -> Result<LeafValueEncoded<'v>> {
     todo!("implement")
 }

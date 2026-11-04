@@ -2,7 +2,7 @@ use std::{cell::RefCell, collections::HashMap, ptr, rc::Rc};
 
 use anyhow::Result;
 
-use crate::{block::BlockIo, uint::PgIdx};
+use crate::{bio::BlockIo, uint::PgIdx};
 
 /// Answers this question: was a given page allocated during the current transaction?
 ///
@@ -48,7 +48,8 @@ impl<B: BlockIo> Flux<B> {
     }
 
     pub(crate) async fn read(&mut self, pg_idx: u64) -> Result<FluxBuf<B>> {
-        if let Some(val) = self.inner.borrow_mut().map.get_mut(&pg_idx) {
+        let mut inner = self.inner.borrow_mut();
+        if let Some(val) = inner.map.get_mut(&pg_idx) {
             match val {
                 FluxMapValue::Flushed => {
                     *val = FluxMapValue::Borrowed;
@@ -62,12 +63,7 @@ impl<B: BlockIo> Flux<B> {
                     panic!("cannot read already borrowed page")
                 }
                 FluxMapValue::Owned(_) => {
-                    let value = self
-                        .inner
-                        .borrow_mut()
-                        .map
-                        .insert(pg_idx, FluxMapValue::Borrowed)
-                        .unwrap();
+                    let value = inner.map.insert(pg_idx, FluxMapValue::Borrowed).unwrap();
                     match value {
                         FluxMapValue::Owned(buf) => Ok(FluxBuf::Alloc(FluxBufAlloc {
                             idx: pg_idx,
@@ -179,5 +175,67 @@ impl<B: BlockIo> Drop for FluxBufAlloc<B> {
                 FluxMapValue::Owned(std::mem::take(&mut self.buf).unwrap()),
             );
         }
+    }
+}
+
+#[coverage(off)]
+#[cfg(test)]
+mod tests {
+    use anyhow::Result;
+
+    use crate::{
+        bio::{BlockIo, BlockIoMemory},
+        flux::Flux,
+        uring::MIN_PAGE_SIZE,
+    };
+
+    #[tokio::test]
+    async fn verify_basic_workflow() -> Result<()> {
+        let bio = BlockIoMemory::new(MIN_PAGE_SIZE);
+        bio.alloc(2).await?;
+
+        let mut buf = bio.buf();
+        buf.fill(0x01);
+        bio.write(0, buf).await?;
+
+        let mut buf = bio.buf();
+        buf.fill(0x02);
+        bio.write(1, buf).await?;
+
+        let mut flux = Flux::new(bio.clone());
+
+        let buf = flux.read(0).await?;
+        assert!(buf.as_ref().iter().all(|b| *b == 0x01));
+
+        let buf = flux.read(1).await?;
+        assert!(buf.as_ref().iter().all(|b| *b == 0x02));
+
+        let mut buf = flux.buf();
+        buf.as_mut().fill(0x03);
+        flux.write(buf, || async { Ok(0) }).await?;
+
+        let buf = bio.read(0).await?;
+        assert!(buf.iter().all(|b| *b == 0x01));
+
+        let mut buf = flux.read(0).await?;
+        assert!(buf.as_ref().iter().all(|b| *b == 0x03));
+
+        buf.as_mut().fill(0x04);
+        flux.write(buf, || async { panic!("already allocated") })
+            .await?;
+
+        flux.flush().await?;
+
+        let buf = bio.read(0).await?;
+        assert!(buf.iter().all(|b| *b == 0x04));
+
+        let mut buf = flux.read(0).await?;
+        assert!(buf.as_ref().iter().all(|b| *b == 0x04));
+
+        buf.as_mut().fill(0x05);
+        flux.write(buf, || async { panic!("already allocated") })
+            .await?;
+
+        Ok(())
     }
 }

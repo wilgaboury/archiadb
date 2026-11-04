@@ -2,7 +2,7 @@ use anyhow::Result;
 use tokio::sync::Mutex;
 
 use crate::{
-    block::BlockIo,
+    bio::BlockIo,
     bnode::BNodeRootHeader,
     lalloc::Arena,
     meta::MetaHandler,

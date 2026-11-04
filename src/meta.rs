@@ -8,10 +8,10 @@ use anyhow::{Result, anyhow, bail};
 use tokio::sync::Mutex;
 
 use crate::{
-    bio::{MAX_PAGE_SIZE, MIN_PAGE_SIZE, choose_page_size},
-    block::BlockIo,
+    bio::BlockIo,
     const_assert,
     uint::{InPgIdxDisk, PgIdx, PgIdxDisk, U16, U64, U128},
+    uring::{MAX_PAGE_SIZE, MIN_PAGE_SIZE, choose_page_size},
     util::{Checksum, from_bytes, from_bytes_mut, order_front_back, update_checksum},
 };
 
@@ -150,7 +150,7 @@ struct Inner {
 }
 
 impl MetaHandler {
-    pub fn new(file: &File) -> Result<Self> {
+    pub fn from_file(file: &File) -> Result<Self> {
         let (is_first, front, back) = if file.metadata()?.len() == 0 {
             let page_size = choose_page_size(file)?;
             let mut front = Self::create_buf(page_size);
@@ -179,8 +179,29 @@ impl MetaHandler {
             (is_first, front, back)
         };
 
+        Ok(Self::from_bufs(front, back, is_first))
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn from_bio<B: BlockIo>(bio: &B) -> Result<Self> {
+        let mut front = Self::create_buf(bio.page_size());
+        let mut back = Self::create_buf(bio.page_size());
+        update_checksum(&mut front);
+        let mut buf = bio.buf();
+        buf.as_mut().copy_from_slice(&front);
+        bio.write(0, buf).await?;
+        update_checksum(&mut back);
+        let mut buf = bio.buf();
+        buf.as_mut().copy_from_slice(&back);
+        bio.write(1, buf).await?;
+
+        Ok(Self::from_bufs(front, back, true))
+    }
+
+    pub(crate) fn from_bufs(front: Box<[u8]>, back: Box<[u8]>, is_first: bool) -> Self {
         let meta = from_bytes::<Meta>(&front);
-        Ok(Self {
+
+        Self {
             fmt_ver: meta.fmt_ver(),
             pg_size: meta.pg_size(),
             root1: meta.root1(),
@@ -192,7 +213,7 @@ impl MetaHandler {
                 front,
                 back,
             }),
-        })
+        }
     }
 
     pub(crate) fn fmt_ver(&self) -> FmtVer {
@@ -334,7 +355,7 @@ mod tests {
     use anyhow::Result;
     use function_name::named;
 
-    use crate::block::BlockIo;
+    use crate::bio::BlockIo;
     use crate::meta::{CUR_FMT_VER, MAGIC, Meta};
     use crate::test::TmpDir;
     use crate::util::{from_bytes, from_bytes_mut, update_checksum};

@@ -3,7 +3,6 @@
 
 pub mod bio;
 pub mod bll;
-pub mod block;
 pub mod bnode;
 pub mod btree;
 pub mod db;
@@ -19,6 +18,7 @@ pub mod lock;
 pub mod meta;
 pub mod trie;
 pub mod uint;
+pub mod uring;
 pub mod util;
 
 #[coverage(off)]

@@ -13,13 +13,13 @@ use std::{
 use anyhow::{Result, anyhow, bail};
 
 use crate::{
-    bio::PageBuf,
-    block::{BlockIo, BlockIoDefault},
+    bio::{BlockIo, BlockIoDefault},
     bnode::BNodeRootHeader,
     db::DbInner,
     key::{KeyPath, KeyPathBuf},
     key_path,
     uint::{InPgIdx, PgIdx, U64},
+    uring::PageBuf,
 };
 
 #[macro_export]
@@ -278,7 +278,7 @@ mod tests {
     };
 
     use crate::{
-        block::BlockIo,
+        bio::BlockIo,
         key_path,
         test::{TmpDir, corrupt_checksum},
     };

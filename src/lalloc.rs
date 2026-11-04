@@ -3,10 +3,10 @@ use std::{cmp, collections::HashMap};
 use anyhow::Result;
 
 use crate::{
-    block::BlockIo,
+    bio::BlockIo,
     bnode::BNodeRootHeader,
     db::{BRootInfo, Txn},
-    defer::DeferGaurd,
+    defer::DeferGuard,
     galloc::{Galloc, GallocCtx, galloc},
     key::KeyPathBuf,
     meta::MetaHandler,
@@ -197,16 +197,16 @@ impl<'a, B: BlockIo> Txn<'a, B> {
     }
 }
 
-pub(crate) fn free_on_disk_pg(lalloc: &mut Lalloc, defer_gaurd: &mut DeferGaurd, pg_idx: PgIdx) {
+pub(crate) fn free_on_disk_pg(lalloc: &mut Lalloc, defer_guard: &mut DeferGuard, pg_idx: PgIdx) {
     lalloc.deferred.push(pg_idx);
-    defer_gaurd.free(pg_idx);
+    defer_guard.free(pg_idx);
 }
 
 pub(crate) struct LallocCtx<'a, 'd, B: BlockIo> {
     pub(crate) galloc: &'a Galloc,
     pub(crate) meta: &'a MetaHandler,
     pub(crate) bio: &'a B,
-    pub(crate) defer_gaurd: &'a mut DeferGaurd<'d>,
+    pub(crate) defer_guard: &'a mut DeferGuard<'d>,
     pub(crate) root: &'a mut BRootInfo,
 }
 
@@ -239,7 +239,7 @@ pub(crate) async fn lalloc<'a, 'd, B: BlockIo>(ctx: &mut LallocCtx<'a, 'd, B>) -
     }
 
     if let Some(free) =
-        find_free_idx_and_consume_fl(ctx.defer_gaurd, ctx.bio, header, &mut ctx.root.lalloc).await?
+        find_free_idx_and_consume_fl(ctx.defer_guard, ctx.bio, header, &mut ctx.root.lalloc).await?
     {
         return Ok(free);
     }
@@ -252,7 +252,7 @@ pub(crate) fn should_init_arena(root: &BNodeRootHeader) -> bool {
 }
 
 pub(crate) async fn find_free_idx_and_consume_fl<B: BlockIo>(
-    defer_gaurd: &mut DeferGaurd<'_>,
+    defer_guard: &mut DeferGuard<'_>,
     fio: &B,
     header: &BNodeRootHeader,
     lalloc: &mut Lalloc,
@@ -267,7 +267,7 @@ pub(crate) async fn find_free_idx_and_consume_fl<B: BlockIo>(
             break;
         }
 
-        clean = load_fl_node(defer_gaurd, fio, lalloc, clean).await?;
+        clean = load_fl_node(defer_guard, fio, lalloc, clean).await?;
         lalloc.clean = Some(clean);
     }
 
@@ -276,13 +276,13 @@ pub(crate) async fn find_free_idx_and_consume_fl<B: BlockIo>(
 
 // TODO: need test with long fl to test this
 pub(crate) async fn load_fl_node<B: BlockIo>(
-    defer_gaurd: &mut DeferGaurd<'_>,
+    defer_guard: &mut DeferGuard<'_>,
     bio: &B,
     lalloc: &mut Lalloc,
     fl_n_idx: PgIdx,
 ) -> Result<PgIdx> {
     let buf = bio.read(fl_n_idx).await?;
-    free_on_disk_pg(lalloc, defer_gaurd, fl_n_idx);
+    free_on_disk_pg(lalloc, defer_guard, fl_n_idx);
 
     let header = from_bytes::<FreeListHeader>(buf.as_ref());
     let idxs_per = idxs_per_fl_page(bio.page_size());
@@ -292,7 +292,7 @@ pub(crate) async fn load_fl_node<B: BlockIo>(
             break;
         }
 
-        if defer_gaurd.defer.contains(free_pg_idx) {
+        if defer_guard.defer.contains(free_pg_idx) {
             lalloc.deferred.push(free_pg_idx);
         } else {
             lalloc.free.push(free_pg_idx);
@@ -394,7 +394,7 @@ mod tests {
     use function_name::named;
 
     use crate::{
-        block::BlockIo,
+        bio::BlockIo,
         bnode::BNodeRootHeader,
         db::{BRootInfo, Txn},
         key_path,
@@ -479,8 +479,8 @@ mod tests {
 
         assert_eq!(4, txn.lalloc(&mut root).await?);
         assert_eq!(5, txn.lalloc(&mut root).await?);
-        free_on_disk_pg(&mut root.lalloc, &mut txn.defer_gaurd, 4);
-        free_on_disk_pg(&mut root.lalloc, &mut txn.defer_gaurd, 5);
+        free_on_disk_pg(&mut root.lalloc, &mut txn.defer_guard, 4);
+        free_on_disk_pg(&mut root.lalloc, &mut txn.defer_guard, 5);
 
         let free = txn.write_fl(&mut root).await?;
         assert_eq!(6, free);

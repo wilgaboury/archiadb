@@ -5,10 +5,9 @@ use bon::bon;
 use tokio::sync::Mutex;
 
 use crate::{
-    bio::{BlockIoUring, DEFAULT_CQ_SIZE, DEFAULT_SQ_SIZE},
-    block::{BlockIo, BlockIoDefault, BlockIoRapidHash},
+    bio::{BlockIo, BlockIoDefault, BlockIoRapidHash},
     bnode::BNodeRootHeader,
-    defer::{Defer, DeferGaurd},
+    defer::{Defer, DeferGuard},
     file::DbFile,
     flux::Flux,
     galloc::{Galloc, galloc_recover},
@@ -20,6 +19,7 @@ use crate::{
     meta::MetaHandler,
     trie::KeyTrie,
     uint::PgIdx,
+    uring::{BlockIoUring, DEFAULT_CQ_SIZE, DEFAULT_SQ_SIZE},
     util::{
         FrontBack, LockVec, collect_intermediary_decendants, from_bytes, from_bytes_mut, lca,
         read_root_w_retry,
@@ -53,7 +53,7 @@ impl Db<BlockIoDefault> {
         generic_op_state_pool: Option<usize>,
     ) -> Result<Self> {
         let file = Arc::new(DbFile::open(path)?);
-        let meta = MetaHandler::new(&file.file())?;
+        let meta = MetaHandler::from_file(&file.file())?;
         let bio = BlockIoRapidHash::new(BlockIoUring::new(
             file.clone(),
             meta.page_size(),
@@ -144,7 +144,7 @@ impl<'a, B: BlockIo> TxnBuilder<'a, B> {
     }
 
     pub async fn begin(self) -> Txn<'a, B> {
-        let defer_gaurd = self.db.defer.begin();
+        let defer_guard = self.db.defer.begin();
         let mut guards = LockVec(Vec::new());
         for (path, lock_type) in self.ops.bfs_iter() {
             guards
@@ -154,7 +154,7 @@ impl<'a, B: BlockIo> TxnBuilder<'a, B> {
 
         Txn {
             db: self.db,
-            defer_gaurd,
+            defer_guard,
             guards,
             free: Vec::new(),
             ops: self.ops,
@@ -180,7 +180,7 @@ impl BRootInfo {
 
 pub struct Txn<'a, B: BlockIo> {
     pub(crate) db: &'a DbInner<B>,
-    pub(crate) defer_gaurd: DeferGaurd<'a>,
+    pub(crate) defer_guard: DeferGuard<'a>,
 
     pub(crate) guards: LockVec<LockGuard>,
     pub(crate) free: Vec<u64>,
@@ -195,7 +195,7 @@ impl<'a, B: BlockIo> Txn<'a, B> {
             galloc: &self.db.galloc,
             meta: &self.db.meta,
             bio: &self.db.bio,
-            defer_gaurd: &mut self.defer_gaurd,
+            defer_guard: &mut self.defer_guard,
             root,
         }
     }
@@ -209,7 +209,7 @@ impl<'a, B: BlockIo> Txn<'a, B> {
                 galloc: &self.db.galloc,
                 meta: &self.db.meta,
                 bio: &self.db.bio,
-                defer_gaurd: &mut self.defer_gaurd,
+                defer_guard: &mut self.defer_guard,
                 root,
             },
             &mut self.flux,
@@ -313,7 +313,7 @@ impl<'a, B: BlockIo> Txn<'a, B> {
         // TODO: implement btree root writes
 
         // free page in-mem bookkeeping
-        self.defer_gaurd.flush();
+        self.defer_guard.flush();
 
         Ok(())
     }

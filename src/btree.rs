@@ -3,7 +3,7 @@ use std::cmp::Ordering;
 use anyhow::{Ok, Result, bail};
 
 use crate::{
-    block::BlockIo,
+    bio::BlockIo,
     bnode::{
         BNodeBuf, BNodeHeader, BNodeKind, BNodeRootHeader, LeafValue, LeafValueGetResult,
         SearchResult, SlotDisk, get_key_inner, get_key_leaf, get_page_ptr, get_value_leaf,
@@ -11,7 +11,7 @@ use crate::{
         remaining_bytes, remove_at_leaf, root_to_inner, search_inner, search_leaf, write_page_ptr,
     },
     db::{BRootInfo, Txn},
-    flux::{self, Flux, FluxBuf},
+    flux::{Flux, FluxBuf},
     lalloc::{LallocCtx, lalloc},
     uint::{InPgIdx, PgIdx, PgIdxDisk},
     util::{ChecksumDisk, from_bytes, from_bytes_mut},
@@ -128,7 +128,7 @@ async fn get_path<B: BlockIo>(
 
 async fn upsert<'a, 'b, B: BlockIo>(
     key: &[u8],
-    value: &[u8],
+    _value: &[u8],
     flux: &mut Flux<B>,
     mut ctx: LallocCtx<'a, 'b, B>,
 ) -> Result<()> {
@@ -150,16 +150,16 @@ async fn upsert<'a, 'b, B: BlockIo>(
         }
     }
 
-    let path = get_path(key, root_buf.as_ref(), flux).await?;
+    let _path = get_path(key, root_buf.as_ref(), flux).await?;
 
     todo!("implement rest of upsert")
 }
 
 async fn upsert_leaf<'a, 'b, B: BlockIo>(
-    key: &[u8],
-    value: LeafValue<'_>,
-    flux: &mut Flux<B>,
-    mut ctx: LallocCtx<'a, 'b, B>,
+    _key: &[u8],
+    _value: LeafValue<'_>,
+    _flux: &mut Flux<B>,
+    _ctx: LallocCtx<'a, 'b, B>,
 ) -> Result<InsertResult<B>> {
     // let encoded_value = value.encode(self).await?;
 
@@ -493,11 +493,11 @@ mod tests {
     use anyhow::Result;
 
     use crate::{
-        bio::MIN_PAGE_SIZE,
-        block::{BlockIo, BlockIoMemory},
+        bio::{BlockIo, BlockIoMemory},
         bnode::{self, BNodeHeader, BNodeKind, BNodeRootHeader, LeafValueEncoded},
         btree::{BtreeGetResult, get},
         flux::Flux,
+        uring::MIN_PAGE_SIZE,
         util::from_bytes_mut,
     };
 

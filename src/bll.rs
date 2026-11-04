@@ -1,7 +1,7 @@
 use anyhow::Result;
 
 use crate::{
-    block::BlockIo,
+    bio::BlockIo,
     flux::Flux,
     lalloc::{LallocCtx, lalloc},
     uint::{PgIdx, PgIdxDisk},
@@ -50,26 +50,73 @@ pub(crate) async fn read<B: BlockIo>(
 #[coverage(off)]
 #[cfg(test)]
 mod tests {
-    use std::f32::MIN;
-
     use anyhow::Result;
+    use rand::{Rng, RngCore, SeedableRng, rngs::StdRng};
 
-    use crate::{bio::MIN_PAGE_SIZE, block::BlockIoMemory, lalloc::LallocCtx};
+    use crate::{
+        bio::{BlockIo, BlockIoMemory, BlockIoRapidHash},
+        bll,
+        bnode::BNodeRootHeader,
+        db::BRootInfo,
+        defer::Defer,
+        flux::Flux,
+        galloc::Galloc,
+        lalloc::Arena,
+        meta::MetaHandler,
+        test::TestLallocCtx,
+        uint::PgIdx,
+        uring::MIN_PAGE_SIZE,
+        util::{FrontBack, from_bytes_mut},
+    };
 
-    #[named]
     #[tokio::test]
     async fn test_linked_list() -> Result<()> {
-        let bio = BlockIoMemory::new(MIN_PAGE_SIZE);
+        const BIO_SIZE: PgIdx = 2000;
+        const ITERS: usize = 100;
+        const MIN_VAL_SIZE: PgIdx = 2 * MIN_PAGE_SIZE;
+        const MAX_VAL_SIZE: PgIdx = 8 * MIN_PAGE_SIZE;
 
-        let dir = TmpDir::new(function_name!())?;
-        let db = dir.db().await?;
-        let mut txn = db.txn().begin().await;
-        let value_len = txn.db.meta.page_size() as usize * 2.5 as usize;
-        let value = vec![1u8; value_len];
-        let mut value_test = vec![0u8; value_len];
-        let pg_idx = txn.create_value_linked_list(&value).await?;
-        txn.read_value_linked_list(pg_idx, &mut value_test).await?;
-        assert_eq!(value, value_test);
+        let mut rng = StdRng::seed_from_u64(88369992);
+
+        for _ in 0..ITERS {
+            let bio = BlockIoRapidHash::new(BlockIoMemory::new(MIN_PAGE_SIZE));
+            bio.alloc(BIO_SIZE).await?;
+            let defer = Defer::new();
+            let arena = Arena::new(4, BIO_SIZE - 4);
+            let mut test_ctx = TestLallocCtx {
+                galloc: Galloc::new(),
+                meta: MetaHandler::from_bio(&bio).await?,
+                bio: bio.clone(),
+                defer_guard: defer.begin(),
+                root: BRootInfo::new(FrontBack::new(2, 3), arena.clone()),
+            };
+            let mut flux = Flux::new(bio.clone());
+
+            {
+                let mut buf1 = bio.buf();
+                let header1 = from_bytes_mut::<BNodeRootHeader>(buf1.as_mut());
+                header1.init();
+                header1.arena.from(&arena);
+                bio.write(2, buf1).await?;
+
+                let mut buf2 = bio.buf();
+                let header2 = from_bytes_mut::<BNodeRootHeader>(buf2.as_mut());
+                header2.init();
+                header2.arena.from(&arena);
+                bio.write(3, buf2).await?;
+            }
+
+            let size = rng.gen_range(MIN_VAL_SIZE..=MAX_VAL_SIZE);
+            let mut buffer = vec![0u8; size as usize];
+            rng.fill_bytes(&mut buffer);
+
+            let mut ctx = test_ctx.ctx();
+            let pg_idx = bll::create(&mut ctx, &mut flux, &buffer).await?;
+            let mut read_buffer = vec![0u8; size as usize];
+            bll::read(&mut flux, pg_idx, &mut read_buffer).await?;
+            assert_eq!(buffer, read_buffer);
+        }
+
         Ok(())
     }
 }

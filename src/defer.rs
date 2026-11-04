@@ -36,19 +36,19 @@ impl Defer {
     }
 }
 
-pub(crate) struct DeferGaurd<'txn> {
+pub(crate) struct DeferGuard<'txn> {
     id: DeferId,
     freed: Vec<PgIdx>,
     pub(crate) defer: &'txn Defer,
 }
 
 impl Defer {
-    pub(crate) fn begin(&self) -> DeferGaurd<'_> {
+    pub(crate) fn begin(&self) -> DeferGuard<'_> {
         let mut inner = self.inner.lock();
         let id = inner.next;
         inner.next += 1;
         inner.to_free.insert(id, Vec::with_capacity(0));
-        DeferGaurd {
+        DeferGuard {
             id,
             freed: Vec::new(),
             defer: &self,
@@ -56,7 +56,7 @@ impl Defer {
     }
 }
 
-impl<'a> DeferGaurd<'a> {
+impl<'a> DeferGuard<'a> {
     pub(crate) fn free(&mut self, pg_idx: PgIdx) {
         self.freed.push(pg_idx);
     }
@@ -80,7 +80,7 @@ impl<'a> DeferGaurd<'a> {
     }
 }
 
-impl<'a> Drop for DeferGaurd<'a> {
+impl<'a> Drop for DeferGuard<'a> {
     fn drop(&mut self) {
         let free = {
             let mut inner = self.defer.inner.lock();

@@ -9,13 +9,14 @@ use std::{
 use anyhow::Result;
 
 use crate::{
-    bio::BlockIoUring,
-    block::{BlockIo, BlockIoDefault, BlockIoRapidHash},
+    bio::{BlockIo, BlockIoDefault, BlockIoRapidHash},
     db::{BRootInfo, Db},
-    defer::{Defer, DeferGaurd},
+    defer::DeferGuard,
     file::DbFile,
     galloc::Galloc,
+    lalloc::LallocCtx,
     meta::MetaHandler,
+    uring::BlockIoUring,
     util::{ChecksumDisk, from_bytes_mut},
 };
 
@@ -118,7 +119,7 @@ impl TmpDir {
 
     pub fn meta_at<P: AsRef<Path>>(&self, path: P) -> Result<MetaHandler> {
         let file = self.file_raw_at(path)?;
-        MetaHandler::new(&file)
+        MetaHandler::from_file(&file)
     }
 
     pub fn fio(&self) -> Result<BlockIoDefault> {
@@ -127,7 +128,7 @@ impl TmpDir {
 
     pub fn fio_at<P: AsRef<Path>>(&self, path: P) -> Result<BlockIoDefault> {
         let file = self.file_at(path)?;
-        let meta = MetaHandler::new(file.file())?;
+        let meta = MetaHandler::from_file(file.file())?;
         Ok(BlockIoRapidHash::new(
             BlockIoUring::builder()
                 .file(Arc::new(file))
@@ -148,7 +149,7 @@ impl TmpDir {
         path: P,
     ) -> Result<(BlockIoDefault, MetaHandler)> {
         let file = self.file_at(path)?;
-        let meta = MetaHandler::new(file.file())?;
+        let meta = MetaHandler::from_file(file.file())?;
         Ok((
             BlockIoRapidHash::new(
                 BlockIoUring::builder()
@@ -174,7 +175,18 @@ pub(crate) struct TestLallocCtx<'d, B: BlockIo> {
     pub(crate) galloc: Galloc,
     pub(crate) meta: MetaHandler,
     pub(crate) bio: B,
-    pub(crate) defer: Defer,
-    pub(crate) defer_gaurd: DeferGaurd<'d>,
+    pub(crate) defer_guard: DeferGuard<'d>,
     pub(crate) root: BRootInfo,
+}
+
+impl<'d, B: BlockIo> TestLallocCtx<'d, B> {
+    pub(crate) fn ctx(&mut self) -> LallocCtx<'_, 'd, B> {
+        LallocCtx {
+            galloc: &mut self.galloc,
+            meta: &self.meta,
+            bio: &self.bio,
+            defer_guard: &mut self.defer_guard,
+            root: &mut self.root,
+        }
+    }
 }
