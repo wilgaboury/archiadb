@@ -70,7 +70,7 @@ mod tests {
     };
 
     #[tokio::test]
-    async fn test_linked_list() -> Result<()> {
+    async fn fuzz_block_linked_list() -> Result<()> {
         const BIO_SIZE: PgIdx = 2000;
         const ITERS: usize = 100;
         const MIN_VAL_SIZE: PgIdx = 2 * MIN_PAGE_SIZE;

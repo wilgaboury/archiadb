@@ -2,7 +2,11 @@ use std::{cell::RefCell, collections::HashMap, ptr, rc::Rc};
 
 use anyhow::Result;
 
-use crate::{bio::BlockIo, uint::PgIdx};
+use crate::{
+    bio::BlockIo,
+    lalloc::{LallocCtx, free_on_disk_pg},
+    uint::PgIdx,
+};
 
 /// Answers this question: was a given page allocated during the current transaction?
 ///
@@ -75,7 +79,7 @@ impl<B: BlockIo> Flux<B> {
                 }
             }
         } else {
-            Ok(FluxBuf::Unalloc(self.bio.read(pg_idx).await?))
+            Ok(FluxBuf::Disk(pg_idx, self.bio.read(pg_idx).await?))
         }
     }
 
@@ -95,10 +99,6 @@ impl<B: BlockIo> Flux<B> {
             .map
             .insert(idx, FluxMapValue::Owned(buf));
         Ok(idx)
-    }
-
-    pub(crate) fn free(&mut self, idx: PgIdx) {
-        self.inner.borrow_mut().map.remove(&idx);
     }
 
     pub(crate) async fn flush(&mut self) -> Result<()> {
@@ -124,6 +124,7 @@ impl<B: BlockIo> Flux<B> {
 #[derive(Debug)]
 pub(crate) enum FluxBuf<B: BlockIo> {
     Unalloc(B::Buf),
+    Disk(PgIdx, B::Buf),
     Alloc(FluxBufAlloc<B>),
 }
 
@@ -134,10 +135,42 @@ pub(crate) struct FluxBufAlloc<B: BlockIo> {
     inner: FluxInnerRef<B>,
 }
 
+impl<B: BlockIo> FluxBuf<B> {
+    pub(crate) fn free<'a, 'd>(self, flux: &mut Flux<B>, ctx: &mut LallocCtx<'a, 'd, B>) {
+        match self {
+            FluxBuf::Unalloc(_buf) => {
+                // no-op
+            }
+            FluxBuf::Disk(pg_idx, _buf) => {
+                free_on_disk_pg(&mut ctx.root.lalloc, ctx.defer_guard, pg_idx);
+            }
+            FluxBuf::Alloc(alloc) => {
+                let idx = alloc.idx;
+                flux.inner.borrow_mut().map.remove(&idx);
+                ctx.root.lalloc.free_in_mem_page(idx);
+            }
+        }
+    }
+    pub(crate) fn free_disk<'a, 'd>(self, ctx: &mut LallocCtx<'a, 'd, B>) {
+        match self {
+            FluxBuf::Unalloc(_buf) => {
+                // no-op
+            }
+            FluxBuf::Disk(pg_idx, _buf) => {
+                free_on_disk_pg(&mut ctx.root.lalloc, ctx.defer_guard, pg_idx);
+            }
+            FluxBuf::Alloc(_data) => {
+                // no-op
+            }
+        }
+    }
+}
+
 impl<B: BlockIo> AsRef<[u8]> for FluxBuf<B> {
     fn as_ref(&self) -> &[u8] {
         match self {
             FluxBuf::Unalloc(buf) => buf.as_ref(),
+            FluxBuf::Disk(_pg_idx, buf) => buf.as_ref(),
             FluxBuf::Alloc(data) => data.buf.as_ref().unwrap().as_ref(),
         }
     }
@@ -147,6 +180,7 @@ impl<B: BlockIo> AsMut<[u8]> for FluxBuf<B> {
     fn as_mut(&mut self) -> &mut [u8] {
         match self {
             FluxBuf::Unalloc(buf) => buf.as_mut(),
+            FluxBuf::Disk(_pg_idx, buf) => buf.as_mut(),
             FluxBuf::Alloc(data) => data.buf.as_mut().unwrap().as_mut(),
         }
     }
@@ -156,6 +190,7 @@ impl<B: BlockIo> FluxBuf<B> {
     fn extract(self) -> (Option<PgIdx>, B::Buf) {
         match self {
             FluxBuf::Unalloc(buf) => (None, buf),
+            FluxBuf::Disk(_pg_idx, buf) => (None, buf),
             FluxBuf::Alloc(data) => {
                 let idx = data.idx;
                 let buf = unsafe { ptr::read(&data.buf) };

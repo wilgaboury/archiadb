@@ -7,8 +7,8 @@ use crate::{
     bnode::{
         self, BNodeBuf, BNodeHeader, BNodeKind, BNodeRootHeader, LeafValue, LeafValueGetResult,
         SearchResult, SlotDisk, get_key_inner, get_key_leaf, get_page_ptr, get_value_leaf,
-        in_pg_len, in_pg_size_of, insert_at_inner, insert_at_leaf, insert_init_at_inner,
-        remaining_bytes, remove_at_leaf, root_to_inner, search_inner, search_leaf, write_page_ptr,
+        in_pg_len, in_pg_size_of, insert_at_inner, insert_at_leaf, remaining_bytes, root_to_inner,
+        search_inner, search_leaf, write_page_ptr,
     },
     db::{BRootInfo, Txn},
     flux::{Flux, FluxBuf},
@@ -17,9 +17,14 @@ use crate::{
     util::{ChecksumDisk, from_bytes, from_bytes_mut},
 };
 
-enum InsertResult<B: BlockIo> {
+enum UpsertSplitResult<B: BlockIo> {
     Single(FluxBuf<B>),
     Split(u64, Box<[u8]>, u64),
+}
+
+enum UpsertSplitResult2 {
+    Single(PgIdx),
+    Split(PgIdx, Box<[u8]>, PgIdx),
 }
 
 #[derive(Debug)]
@@ -84,33 +89,27 @@ async fn get_path<B: BlockIo>(
     key: &[u8],
     root: &[u8],
     flux: &mut Flux<B>,
-) -> Result<Vec<FluxBuf<B>>> {
+) -> Result<(SearchResult, Vec<(SearchResult, FluxBuf<B>)>)> {
     assert!(root.header().kind == BNodeKind::Root);
 
-    let mut cur = {
+    let (root_search, mut cur) = {
         let search = search_inner(root, key);
         let child_pg_idx = if root.header().len() > 0 {
             get_page_ptr(root, search.pg_idx())
         } else {
             bail!("empty root node")
         };
-        flux.read(child_pg_idx).await?
+        (search, flux.read(child_pg_idx).await?)
     };
 
-    let mut ret = Vec::new();
+    let mut ret: Vec<(SearchResult, FluxBuf<B>)> = Vec::new();
 
     loop {
         match cur.as_ref().header().kind {
             BNodeKind::Leaf => {
-                // let search = search_leaf(cur.as_ref(), key);
-                // if let SearchResult::Exact(idx) = search {
-                //     let value = get_value_leaf(cur.as_ref(), idx);
-                //     return Ok(Some(value.with_page(cur)));
-                // } else {
-                //     return Ok(None);
-                // }
-                ret.push(cur);
-                return Ok(ret);
+                let search = search_leaf(cur.as_ref(), key);
+                ret.push((search, cur));
+                return Ok((root_search, ret));
             }
             BNodeKind::Root | BNodeKind::Inner => {
                 let search = search_inner(cur.as_ref(), key);
@@ -120,7 +119,7 @@ async fn get_path<B: BlockIo>(
                     bail!("empty inner node")
                 };
                 let next = flux.read(child_pg_idx).await?;
-                ret.push(std::mem::replace(&mut cur, next));
+                ret.push((search, std::mem::replace(&mut cur, next)));
             }
         }
     }
@@ -130,8 +129,8 @@ async fn upsert<'a, 'b, B: BlockIo>(
     key: &[u8],
     value: LeafValue<'_>,
     flux: &mut Flux<B>,
-    mut ctx: LallocCtx<'a, 'b, B>,
-) -> Result<()> {
+    ctx: &mut LallocCtx<'a, 'b, B>,
+) -> Result<FluxBuf<B>> {
     let mut root_buf = flux.read(ctx.root.fb.front()).await?;
 
     // new btree, empty root node
@@ -142,84 +141,158 @@ async fn upsert<'a, 'b, B: BlockIo>(
             let header = from_bytes_mut::<BNodeHeader>(buf.as_mut());
             header.init(BNodeKind::Leaf);
 
-            // TODO: insert key/value into leaf node
-
-            let pg_idx = flux.write(buf, || lalloc(&mut ctx)).await?;
-            insert_init_at_inner(root_buf.as_mut(), pg_idx);
-            return Ok(());
+            // new empty node, should never need to split
+            let _split = upsert_leaf(buf, key, value, ctx, flux).await?;
+            return Ok(root_buf);
         }
     }
 
-    let mut path = get_path(key, root_buf.as_ref(), flux).await?;
+    let (_root_search, mut path) = get_path(key, root_buf.as_ref(), flux).await?;
 
-    let leaf = path.pop().unwrap();
-    let _insert = upsert_leaf(leaf, key, value, &mut ctx, flux).await?;
+    let (_, leaf_buf) = path.pop().unwrap();
+    let mut split = upsert_leaf(leaf_buf, key, value, ctx, flux).await?;
 
-    todo!("implement rest of upsert")
+    while !path.is_empty() {
+        let (search, buf) = path.pop().unwrap();
+        split = upsert_inner(split, search, buf, flux, ctx).await?;
+    }
+
+    todo!("finish this");
+    // split = upsert_inner(split, root_search, , flux, ctx).await?;
+
+    Ok(root_buf)
 }
 
 async fn upsert_leaf<'a, 'b, B: BlockIo>(
-    _pg: FluxBuf<B>,
-    _key: &[u8],
+    mut fbuf: FluxBuf<B>,
+    key: &[u8],
     value: LeafValue<'_>,
     ctx: &mut LallocCtx<'a, 'b, B>,
     flux: &mut Flux<B>,
-) -> Result<InsertResult<B>> {
-    let _value = bnode::encode_value(value, ctx, flux).await?;
+) -> Result<UpsertSplitResult2> {
+    let value = bnode::encode_value(value, ctx, flux).await?;
 
-    // let can_insert = remaining_bytes(pg.as_ref())
-    //     > in_pg_len(key) + encoded_value.len() + in_pg_size_of::<SlotDisk>();
-    // if can_insert {
-    //     let search = search_leaf(pg.as_ref(), key);
-    //     if let SearchResult::Exact(idx) = search
-    //         && pg.as_ref().header().len() > 0
-    //     {
-    //         // ignoring underflow during upsert because it's less complicated
-    //         self.btree_leaf_remove_at(dirty, pg.as_mut(), idx).await?;
-    //     }
-    //     insert_at_leaf(pg.as_mut(), search.idx(), key, &encoded_value);
-    //     Ok(InsertResult::Single(pg))
-    // } else {
-    //     let mut left = pg;
-    //     let mut right = self.flux.buf();
+    let can_insert =
+        remaining_bytes(fbuf.as_ref()) > in_pg_len(key) + value.len() + in_pg_size_of::<SlotDisk>();
+    if can_insert {
+        let search = search_leaf(fbuf.as_ref(), key);
+        if let SearchResult::Exact(idx) = search
+            && fbuf.as_ref().header().len() > 0
+        {
+            // ignoring underflow during upsert because it's less complicated
+            remove_at_leaf(fbuf.as_mut(), idx, ctx).await?;
+        }
+        insert_at_leaf(fbuf.as_mut(), search.idx(), key, &value);
+        let pg_idx = flux.write(fbuf, || lalloc(ctx)).await?;
+        Ok(UpsertSplitResult2::Single(pg_idx))
+    } else {
+        let mut left = fbuf;
+        let mut right = flux.buf();
 
-    //     right.as_mut().header_mut().init(BNodeKind::Leaf);
+        right.as_mut().header_mut().init(BNodeKind::Leaf);
 
-    //     let len = left.as_ref().header().len();
-    //     let start = len / 2;
-    //     for idx in start..len {
-    //         let key = get_key_leaf(left.as_ref(), idx);
-    //         let value = get_value_leaf(left.as_ref(), idx).encode(left.as_ref());
-    //         insert_at_leaf(right.as_mut(), idx - start, key, &value);
-    //     }
-    //     left.as_mut().header_mut().set_len(start as u64);
+        let len = left.as_ref().header().len();
+        let start = len / 2;
+        for idx in start..len {
+            let key = get_key_leaf(left.as_ref(), idx);
+            let value = get_value_leaf(left.as_ref(), idx).encode(left.as_ref());
+            insert_at_leaf(right.as_mut(), idx - start, key, &value);
+        }
+        left.as_mut().header_mut().set_len(start as u64);
 
-    //     {
-    //         let insert = if key.cmp(get_key_leaf(right.as_ref(), 0)) == Ordering::Less {
-    //             &mut left
-    //         } else {
-    //             &mut right
-    //         };
+        {
+            let insert = if key.cmp(get_key_leaf(right.as_ref(), 0)) == Ordering::Less {
+                &mut left
+            } else {
+                &mut right
+            };
 
-    //         let search = search_leaf(insert.as_ref(), key);
-    //         if let SearchResult::Exact(idx) = search {
-    //             // ignoring underflow during upsert because it's less complicated
-    //             self.btree_leaf_remove_at(dirty, insert.as_mut(), idx)
-    //                 .await?;
-    //         }
-    //         insert_at_leaf(insert.as_mut(), search.idx(), key, &encoded_value);
-    //     }
+            let search = search_leaf(insert.as_ref(), key);
+            if let SearchResult::Exact(idx) = search {
+                // ignoring underflow during upsert because it's less complicated
+                remove_at_leaf(insert.as_mut(), idx, ctx).await?;
+            }
+            insert_at_leaf(insert.as_mut(), search.idx(), key, &value);
+        }
 
-    //     let key = get_key_leaf(right.as_ref(), 0).to_vec().into_boxed_slice();
+        let key = get_key_leaf(right.as_ref(), 0).to_vec().into_boxed_slice();
 
-    //     let (mut ctx, flux) = self.to_lalloc_ctx_and_flux(dirty);
-    //     let left_idx = flux.write(left, || lalloc(&mut ctx)).await?;
-    //     let right_idx = flux.write(right, || lalloc(&mut ctx)).await?;
+        let left_idx = flux.write(left, || lalloc(ctx)).await?;
+        let right_idx = flux.write(right, || lalloc(ctx)).await?;
 
-    //     Ok(InsertResult::Split(left_idx, key, right_idx))
-    // }
+        Ok(UpsertSplitResult2::Split(left_idx, key, right_idx))
+    }
+}
 
-    todo!()
+// TODO: need to handle root as well
+async fn upsert_inner<'a, 'b, B: BlockIo>(
+    split: UpsertSplitResult2,
+    search: SearchResult,
+    mut fbuf: FluxBuf<B>,
+    flux: &mut Flux<B>,
+    ctx: &mut LallocCtx<'a, 'b, B>,
+) -> Result<UpsertSplitResult2> {
+    let _header = from_bytes::<BNodeHeader>(fbuf.as_ref());
+
+    let search_idx = search.pg_idx();
+
+    match split {
+        UpsertSplitResult2::Single(pg_idx) => {
+            write_page_ptr(fbuf.as_mut(), search_idx, pg_idx);
+            let pg_idx = flux.write(fbuf, || lalloc(ctx)).await?;
+            Ok(UpsertSplitResult2::Single(pg_idx))
+        }
+        UpsertSplitResult2::Split(left, split, right) => {
+            let can_insert = remaining_bytes(fbuf.as_ref())
+                > in_pg_size_of::<PgIdxDisk>() + in_pg_len(&split) + in_pg_size_of::<SlotDisk>();
+            if can_insert {
+                insert_at_inner(fbuf.as_mut(), search_idx, left, &split, right);
+                let pg_idx = flux.write(fbuf, || lalloc(ctx)).await?;
+                Ok(UpsertSplitResult2::Single(pg_idx))
+            } else {
+                if fbuf.as_ref().header().kind == BNodeKind::Root {
+                    root_to_inner(fbuf.as_mut());
+                }
+                // self.btree_split_inner(dirty, left, split, right, fbuf)
+                //     .await
+                todo!("finish")
+            }
+        }
+    }
+}
+
+async fn remove_at_leaf<'a, 'b, B: BlockIo>(
+    pg: &mut [u8],
+    idx: InPgIdx,
+    ctx: &mut LallocCtx<'a, 'b, B>,
+) -> Result<()> {
+    let value = get_value_leaf(pg, idx);
+    match value {
+        LeafValueGetResult::Btree {
+            pg_idx_1: _,
+            pg_idx_2: _,
+        } => {
+            todo!("this is going to suck to implement")
+        }
+        LeafValueGetResult::ValueEmbedded { loc: _, len: _ } => {
+            // no-op
+        }
+        LeafValueGetResult::ValueLinkedList { mut pg_idx, len } => loop {
+            // self.flux.free(dirty, pg_idx);
+            // TODO: reimplement free in lalloc or something
+
+            if len < ctx.meta.page_size() {
+                break;
+            }
+
+            let pg = ctx.bio.read(pg_idx).await?;
+            let next_idx = pg.as_ref().len() - size_of::<PgIdxDisk>() - size_of::<ChecksumDisk>();
+            pg_idx = from_bytes::<PgIdxDisk>(&pg.as_ref()[next_idx..]).get();
+        },
+    }
+    bnode::remove_at_leaf(pg, idx);
+
+    Ok(())
 }
 
 impl<'a, B: BlockIo> Txn<'a, B> {
@@ -234,12 +307,12 @@ impl<'a, B: BlockIo> Txn<'a, B> {
             .btree_upsert_inner(dirty, key, LeafValue::Value(value), root)
             .await?
         {
-            InsertResult::Single(mut page_buf) => {
+            UpsertSplitResult::Single(mut page_buf) => {
                 let header = from_bytes_mut::<BNodeRootHeader>(page_buf.as_mut());
                 header.version.set(header.version.get() + 1);
                 Ok(page_buf)
             }
-            InsertResult::Split(left, split, right) => {
+            UpsertSplitResult::Split(left, split, right) => {
                 let mut pg_buf = self.flux.buf();
                 let header = from_bytes_mut::<BNodeRootHeader>(pg_buf.as_mut());
                 header.init();
@@ -258,7 +331,7 @@ impl<'a, B: BlockIo> Txn<'a, B> {
         key: &[u8],
         value: LeafValue<'_>,
         mut pg: FluxBuf<B>,
-    ) -> Result<InsertResult<B>> {
+    ) -> Result<UpsertSplitResult<B>> {
         let header = from_bytes::<BNodeHeader>(pg.as_ref());
         if header.kind == BNodeKind::Leaf {
             self.btree_upsert_leaf(dirty, key, value, pg).await
@@ -277,20 +350,20 @@ impl<'a, B: BlockIo> Txn<'a, B> {
             let insert = Box::pin(self.btree_upsert_inner(dirty, key, value, child_pg)).await?;
 
             match insert {
-                InsertResult::Single(child_pg) => {
+                UpsertSplitResult::Single(child_pg) => {
                     let (mut ctx, flux) = self.to_lalloc_ctx_and_flux(dirty);
                     let child_pg_idx = flux.write(child_pg, || lalloc(&mut ctx)).await?;
                     write_page_ptr(pg.as_mut(), search, child_pg_idx);
-                    Ok(InsertResult::Single(pg))
+                    Ok(UpsertSplitResult::Single(pg))
                 }
-                InsertResult::Split(left, split, right) => {
+                UpsertSplitResult::Split(left, split, right) => {
                     let can_insert = remaining_bytes(pg.as_ref())
                         > in_pg_size_of::<PgIdxDisk>()
                             + in_pg_len(&split)
                             + in_pg_size_of::<SlotDisk>();
                     if can_insert {
                         insert_at_inner(pg.as_mut(), search, left, &split, right);
-                        Ok(InsertResult::Single(pg))
+                        Ok(UpsertSplitResult::Single(pg))
                     } else {
                         if pg.as_ref().header().kind == BNodeKind::Root {
                             root_to_inner(pg.as_mut());
@@ -309,7 +382,7 @@ impl<'a, B: BlockIo> Txn<'a, B> {
         split: Box<[u8]>,
         right_idx: u64,
         pg: FluxBuf<B>,
-    ) -> Result<InsertResult<B>> {
+    ) -> Result<UpsertSplitResult<B>> {
         let mut left = pg;
         let mut right = self.flux.buf();
 
@@ -348,7 +421,7 @@ impl<'a, B: BlockIo> Txn<'a, B> {
         let ret_left_idx = flux.write(left, || lalloc(&mut ctx)).await?;
         let ret_right_idx = flux.write(right, || lalloc(&mut ctx)).await?;
 
-        Ok(InsertResult::Split(ret_left_idx, key, ret_right_idx))
+        Ok(UpsertSplitResult::Split(ret_left_idx, key, ret_right_idx))
     }
 
     async fn btree_upsert_leaf(
@@ -357,7 +430,7 @@ impl<'a, B: BlockIo> Txn<'a, B> {
         key: &[u8],
         value: LeafValue<'_>,
         mut pg: FluxBuf<B>,
-    ) -> Result<InsertResult<B>> {
+    ) -> Result<UpsertSplitResult<B>> {
         let encoded_value = value.encode(self).await?;
 
         let can_insert = remaining_bytes(pg.as_ref())
@@ -371,7 +444,7 @@ impl<'a, B: BlockIo> Txn<'a, B> {
                 self.btree_leaf_remove_at(dirty, pg.as_mut(), idx).await?;
             }
             insert_at_leaf(pg.as_mut(), search.idx(), key, &encoded_value);
-            Ok(InsertResult::Single(pg))
+            Ok(UpsertSplitResult::Single(pg))
         } else {
             let mut left = pg;
             let mut right = self.flux.buf();
@@ -409,7 +482,7 @@ impl<'a, B: BlockIo> Txn<'a, B> {
             let left_idx = flux.write(left, || lalloc(&mut ctx)).await?;
             let right_idx = flux.write(right, || lalloc(&mut ctx)).await?;
 
-            Ok(InsertResult::Split(left_idx, key, right_idx))
+            Ok(UpsertSplitResult::Split(left_idx, key, right_idx))
         }
     }
 
@@ -444,7 +517,7 @@ impl<'a, B: BlockIo> Txn<'a, B> {
                 pg_idx = from_bytes::<PgIdxDisk>(&pg.as_ref()[next_idx..]).get();
             },
         }
-        remove_at_leaf(buf, idx);
+        bnode::remove_at_leaf(buf, idx);
         Ok(())
     }
 
