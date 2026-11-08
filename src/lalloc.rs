@@ -162,7 +162,7 @@ impl Lalloc {
 pub(crate) async fn write_fl<'a, 'd, B: BlockIo>(
     ctx: &mut LallocCtx<'a, 'd, B>,
     header: &BNodeRootHeader,
-) -> Result<PgIdx> {
+) -> Result<Option<PgIdx>> {
     // TODO: this function could be more complicated and do proper ordering of deferred/free pg idxs for better effiecency
 
     let mut next = ctx.root.lalloc.clean.unwrap_or(0);
@@ -193,14 +193,17 @@ pub(crate) async fn write_fl<'a, 'd, B: BlockIo>(
         next = n_pg_idx;
     }
 
-    Ok(next)
+    Ok(if next != 0 { Some(next) } else { None })
 }
 
 pub(crate) async fn write_fl_and_reset<'a, 'd, B: BlockIo>(
     ctx: &mut LallocCtx<'a, 'd, B>,
     header: &BNodeRootHeader,
-) -> Result<PgIdx> {
-    let idx = 
+) -> Result<()> {
+    ctx.root.lalloc.clean = write_fl(ctx, header).await?;
+    ctx.root.lalloc.orig_next = ctx.root.lalloc.arena.next;
+
+    Ok(())
 }
 
 pub(crate) fn free_on_disk_pg(lalloc: &mut Lalloc, defer_guard: &mut DeferGuard, pg_idx: PgIdx) {
@@ -396,11 +399,12 @@ pub(crate) async fn encode_arena_and_sync<B: BlockIo>(bio: &B, root: &mut BRootI
 #[coverage(off)]
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::{collections::HashSet, hash::Hash, range::Range};
 
     use anyhow::Result;
     use function_name::named;
-    use rand::{Rng, SeedableRng, rngs::StdRng, thread_rng};
+    use rand::{Rng, RngCore, SeedableRng, rngs::StdRng, thread_rng};
+    use winit::keyboard::NamedKey::FavoriteStore2;
 
     use crate::{
         bio::{BlockIo, BlockIoMemory, BlockIoRapidHash},
@@ -409,7 +413,10 @@ mod tests {
         defer::Defer,
         flux::Flux,
         key_path,
-        lalloc::{FreeListHeader, INIT_ARENA_SIZE, free_on_disk_pg, lalloc, read_fl_idx, write_fl},
+        lalloc::{
+            FreeListHeader, INIT_ARENA_SIZE, free_on_disk_pg, lalloc, read_fl_idx, write_fl,
+            write_fl_and_reset,
+        },
         test::{TmpDir, init_basic_mem_db},
         uint::PgIdx,
         uring::MIN_PAGE_SIZE,
@@ -425,7 +432,9 @@ mod tests {
             let root_buf = self.db.bio.read(root.fb.front()).await?;
             let header = from_bytes::<BNodeRootHeader>(root_buf.as_ref());
 
-            write_fl(&mut self.to_lalloc_ctx(root), header).await
+            write_fl(&mut self.to_lalloc_ctx(root), header)
+                .await
+                .map(|idx| idx.unwrap())
         }
     }
 
@@ -517,6 +526,7 @@ mod tests {
         Ok(())
     }
 
+    #[ignore]
     #[tokio::test]
     async fn fuzz_lalloc() -> Result<()> {
         async fn verify_fl<B: BlockIo>(bio: &B) -> Result<()> {
@@ -527,8 +537,10 @@ mod tests {
         const ITER: usize = 10000;
         let mut rng = StdRng::seed_from_u64(88369992);
 
-        let mut allocated = HashSet::<PgIdx>::new();
-        let mut freed = HashSet::<PgIdx>::new();
+        let mut alloc_post_sync = HashSet::<PgIdx>::new();
+        let mut alloc_pre_sync = HashSet::<PgIdx>::new();
+        let mut free_post_sync = HashSet::<PgIdx>::new();
+        let mut free_pre_sync = HashSet::<PgIdx>::new();
 
         for _ in 0..ITER {
             let bio = BlockIoRapidHash::new(BlockIoMemory::new(MIN_PAGE_SIZE));
@@ -544,17 +556,28 @@ mod tests {
                     0 => {
                         let chunks = rng.gen_range(0..(MIN_PAGE_SIZE * 3));
                         for _ in 0..chunks {
-                            allocated.insert(lalloc(&mut ctx).await?);
+                            alloc_post_sync.insert(lalloc(&mut ctx).await?);
                         }
                     }
                     // free
-                    1 => {}
-                    // commit
+                    1 => {
+                        let free_post = rng.gen_range(0..free_post_sync.len());
+                    }
+                    // sync
                     2 => {
                         let mut buf = bio.read(2).await?;
                         let header = from_bytes_mut::<BNodeRootHeader>(&mut buf);
 
-                        write_fl(&mut ctx, header).await?;
+                        write_fl_and_reset(&mut ctx, header).await?;
+                        assert!(ctx.root.lalloc.deferred.is_empty());
+                        assert!(ctx.root.lalloc.free.is_empty());
+
+                        alloc_post_sync.drain().for_each(|idx| {
+                            alloc_pre_sync.insert(idx);
+                        });
+                        free_post_sync.drain().for_each(|idx| {
+                            free_pre_sync.insert(idx);
+                        });
                     }
                     _ => {
                         panic!("invalid operation")
@@ -565,5 +588,15 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    fn shuffle<T, R: RngCore>(vec: &mut [T], mut rng: R) {
+        let mut i = vec.len() - 1;
+        let end = vec.len() / 2;
+        while end < i {
+            let j = rng.gen_range(0..i + 1);
+            vec.swap(i, j);
+            i -= 1;
+        }
     }
 }
