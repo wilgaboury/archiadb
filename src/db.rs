@@ -100,21 +100,21 @@ impl Db<BlockIoDefault> {
     }
 }
 
-pub(crate) async fn init_db_root(meta: &MetaHandler, fio: &BlockIoDefault) -> Result<()> {
+pub(crate) async fn init_db_root<B: BlockIo>(meta: &MetaHandler, bio: &B) -> Result<()> {
     let front_idx = 2;
     let back_idx = 3;
-    fio.alloc(4).await?;
+    bio.alloc(4).await?;
 
-    let mut front = fio.buf();
-    let mut back = fio.buf();
+    let mut front = bio.buf();
+    let mut back = bio.buf();
     from_bytes_mut::<BNodeRootHeader>(front.as_mut()).init();
     from_bytes_mut::<BNodeRootHeader>(back.as_mut()).init();
-    fio.write(front_idx, front).await?;
-    fio.write(back_idx, back).await?;
+    bio.write(front_idx, front).await?;
+    bio.write(back_idx, back).await?;
 
-    fio.sync().await?;
+    bio.sync().await?;
 
-    meta.mutate_async(fio, |meta| {
+    meta.mutate_async(bio, |meta| {
         meta.set_len(4);
     })
     .await?;

@@ -127,6 +127,11 @@ impl Lalloc {
         self.free.push(pg_idx);
     }
 
+    pub(crate) fn free_on_disk_pg(&mut self, defer_guard: &mut DeferGuard, pg_idx: PgIdx) {
+        self.deferred.push(pg_idx);
+        defer_guard.free(pg_idx);
+    }
+
     pub(crate) fn pages_to_fl_encode_arena(&self, pg_size: PgIdx) -> PgIdx {
         let idxs_per = idxs_per_fl_page(pg_size);
         let idxs = self.arena.len - self.orig_next;
@@ -189,6 +194,13 @@ pub(crate) async fn write_fl<'a, 'd, B: BlockIo>(
     }
 
     Ok(next)
+}
+
+pub(crate) async fn write_fl_and_reset<'a, 'd, B: BlockIo>(
+    ctx: &mut LallocCtx<'a, 'd, B>,
+    header: &BNodeRootHeader,
+) -> Result<PgIdx> {
+    let idx = 
 }
 
 pub(crate) fn free_on_disk_pg(lalloc: &mut Lalloc, defer_guard: &mut DeferGuard, pg_idx: PgIdx) {
@@ -384,18 +396,24 @@ pub(crate) async fn encode_arena_and_sync<B: BlockIo>(bio: &B, root: &mut BRootI
 #[coverage(off)]
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use anyhow::Result;
     use function_name::named;
+    use rand::{Rng, SeedableRng, rngs::StdRng, thread_rng};
 
     use crate::{
-        bio::BlockIo,
+        bio::{BlockIo, BlockIoMemory, BlockIoRapidHash},
         bnode::BNodeRootHeader,
         db::{BRootInfo, Txn},
+        defer::Defer,
+        flux::Flux,
         key_path,
         lalloc::{FreeListHeader, INIT_ARENA_SIZE, free_on_disk_pg, lalloc, read_fl_idx, write_fl},
-        test::TmpDir,
+        test::{TmpDir, init_basic_mem_db},
         uint::PgIdx,
-        util::from_bytes,
+        uring::MIN_PAGE_SIZE,
+        util::{from_bytes, from_bytes_mut},
     };
 
     impl<'a, B: BlockIo> Txn<'a, B> {
@@ -496,6 +514,56 @@ mod tests {
     #[named]
     #[tokio::test]
     async fn test_long_fl() -> Result<()> {
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fuzz_lalloc() -> Result<()> {
+        async fn verify_fl<B: BlockIo>(bio: &B) -> Result<()> {
+            Ok(())
+        }
+
+        const OPS: usize = 100;
+        const ITER: usize = 10000;
+        let mut rng = StdRng::seed_from_u64(88369992);
+
+        let mut allocated = HashSet::<PgIdx>::new();
+        let mut freed = HashSet::<PgIdx>::new();
+
+        for _ in 0..ITER {
+            let bio = BlockIoRapidHash::new(BlockIoMemory::new(MIN_PAGE_SIZE));
+            let defer = Defer::new();
+            let mut test_ctx = init_basic_mem_db(&bio, 0, &defer).await?;
+            let mut flux = Flux::new(bio.clone());
+            let mut ctx = test_ctx.ctx();
+
+            for _ in 0..OPS {
+                let op = rng.gen_range(0..3);
+                match op {
+                    // allocate
+                    0 => {
+                        let chunks = rng.gen_range(0..(MIN_PAGE_SIZE * 3));
+                        for _ in 0..chunks {
+                            allocated.insert(lalloc(&mut ctx).await?);
+                        }
+                    }
+                    // free
+                    1 => {}
+                    // commit
+                    2 => {
+                        let mut buf = bio.read(2).await?;
+                        let header = from_bytes_mut::<BNodeRootHeader>(&mut buf);
+
+                        write_fl(&mut ctx, header).await?;
+                    }
+                    _ => {
+                        panic!("invalid operation")
+                    }
+                }
+                verify_fl(&bio).await?;
+            }
+        }
+
         Ok(())
     }
 }

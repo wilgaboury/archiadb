@@ -10,14 +10,17 @@ use anyhow::Result;
 
 use crate::{
     bio::{BlockIo, BlockIoDefault, BlockIoRapidHash},
+    bnode::BNodeRootHeader,
     db::{BRootInfo, Db},
-    defer::DeferGuard,
+    defer::{Defer, DeferGuard},
     file::DbFile,
+    flux::Flux,
     galloc::Galloc,
-    lalloc::LallocCtx,
-    meta::MetaHandler,
+    lalloc::{Arena, LallocCtx},
+    meta::{Meta, MetaHandler},
+    uint::PgIdx,
     uring::BlockIoUring,
-    util::{ChecksumDisk, from_bytes_mut},
+    util::{ChecksumDisk, FrontBack, from_bytes_mut},
 };
 
 pub(crate) const DEFAULT_FILE_PATH: &str = "test.db";
@@ -189,4 +192,53 @@ impl<'d, B: BlockIo> TestLallocCtx<'d, B> {
             root: &mut self.root,
         }
     }
+}
+
+pub(crate) async fn init_basic_mem_db<'a, B: BlockIo>(
+    bio: &B,
+    len: PgIdx,
+    defer: &'a Defer,
+) -> Result<TestLallocCtx<'a, B>> {
+    bio.alloc(4 + len).await?;
+    let arena = if len > 0 {
+        Arena::new(4, len)
+    } else {
+        Arena::new(0, 0)
+    };
+
+    {
+        let mut buf1 = bio.buf();
+        let meta1 = from_bytes_mut::<Meta>(buf1.as_mut());
+        meta1.init(bio.page_size());
+        meta1.len.set(4 + len);
+        bio.write(0, buf1).await?;
+
+        let mut buf2 = bio.buf();
+        let meta2 = from_bytes_mut::<Meta>(buf2.as_mut());
+        meta2.init(bio.page_size());
+        meta2.len.set(4 + len);
+        bio.write(1, buf2).await?;
+    }
+
+    {
+        let mut buf1 = bio.buf();
+        let header1 = from_bytes_mut::<BNodeRootHeader>(buf1.as_mut());
+        header1.init();
+        header1.arena.from(&arena);
+        bio.write(2, buf1).await?;
+
+        let mut buf2 = bio.buf();
+        let header2 = from_bytes_mut::<BNodeRootHeader>(buf2.as_mut());
+        header2.init();
+        header2.arena.from(&arena);
+        bio.write(3, buf2).await?;
+    }
+
+    Ok(TestLallocCtx {
+        galloc: Galloc::new(),
+        meta: MetaHandler::from_bio(bio).await?,
+        bio: bio.clone(),
+        defer_guard: defer.begin(),
+        root: BRootInfo::new(FrontBack::new(2, 3), arena.clone()),
+    })
 }

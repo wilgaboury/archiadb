@@ -63,7 +63,7 @@ mod tests {
         galloc::Galloc,
         lalloc::Arena,
         meta::MetaHandler,
-        test::TestLallocCtx,
+        test::{TestLallocCtx, init_basic_mem_db},
         uint::PgIdx,
         uring::MIN_PAGE_SIZE,
         util::{FrontBack, from_bytes_mut},
@@ -80,31 +80,9 @@ mod tests {
 
         for _ in 0..ITERS {
             let bio = BlockIoRapidHash::new(BlockIoMemory::new(MIN_PAGE_SIZE));
-            bio.alloc(BIO_SIZE).await?;
             let defer = Defer::new();
-            let arena = Arena::new(4, BIO_SIZE - 4);
-            let mut test_ctx = TestLallocCtx {
-                galloc: Galloc::new(),
-                meta: MetaHandler::from_bio(&bio).await?,
-                bio: bio.clone(),
-                defer_guard: defer.begin(),
-                root: BRootInfo::new(FrontBack::new(2, 3), arena.clone()),
-            };
+            let mut test_ctx = init_basic_mem_db(&bio, BIO_SIZE, &defer).await?;
             let mut flux = Flux::new(bio.clone());
-
-            {
-                let mut buf1 = bio.buf();
-                let header1 = from_bytes_mut::<BNodeRootHeader>(buf1.as_mut());
-                header1.init();
-                header1.arena.from(&arena);
-                bio.write(2, buf1).await?;
-
-                let mut buf2 = bio.buf();
-                let header2 = from_bytes_mut::<BNodeRootHeader>(buf2.as_mut());
-                header2.init();
-                header2.arena.from(&arena);
-                bio.write(3, buf2).await?;
-            }
 
             let size = rng.gen_range(MIN_VAL_SIZE..=MAX_VAL_SIZE);
             let mut buffer = vec![0u8; size as usize];
