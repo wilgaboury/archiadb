@@ -34,6 +34,10 @@ impl Defer {
     pub fn contains(&self, pg_idx: PgIdx) -> bool {
         self.global.contains(&pg_idx)
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.global.is_empty()
+    }
 }
 
 pub(crate) struct DeferGuard<'txn> {

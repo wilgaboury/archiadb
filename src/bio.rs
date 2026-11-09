@@ -4,9 +4,10 @@ use anyhow::{Result, bail};
 use parking_lot::Mutex;
 
 use crate::{
+    lalloc::FreeListHeader,
     uint::{InPgIdx, PgIdx},
     uring::BlockIoUring,
-    util::{has_valid_checksum, update_checksum},
+    util::{from_bytes, has_valid_checksum, update_checksum},
 };
 
 pub(crate) type BlockIoDefault = BlockIoRapidHash<BlockIoUring>;
@@ -61,10 +62,26 @@ impl BlockIo for BlockIoMemory {
         if end > data.len() as PgIdx {
             return Err(anyhow::anyhow!("Read out of bounds"));
         }
-        Ok(data[start as usize..end as usize].to_vec())
+        let buf = data[start as usize..end as usize].to_vec();
+
+        if pg_idx == 4089 {
+            println!(
+                "reading 4089 fl node with next at: {}",
+                from_bytes::<FreeListHeader>(buf.as_ref()).next.get()
+            )
+        }
+
+        Ok(buf)
     }
 
     async fn write(&self, pg_idx: PgIdx, buf: Self::Buf) -> Result<()> {
+        if pg_idx == 4089 {
+            println!(
+                "writing 4089 fl node with next at: {}",
+                from_bytes::<FreeListHeader>(buf.as_ref()).next.get()
+            )
+        }
+
         let start = pg_idx * self.page_size;
         let end = start + self.page_size;
         let mut data = self.data.lock();

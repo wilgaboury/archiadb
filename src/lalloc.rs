@@ -100,7 +100,6 @@ pub(crate) struct LallocMap {
     map: HashMap<KeyPathBuf, Lalloc>,
 }
 
-// TODO: add allocated field (tracks all allocations in a given txn), replaces flux free conditional
 pub(crate) struct Lalloc {
     arena: Arena,
     orig_next: PgIdx,
@@ -163,7 +162,7 @@ pub(crate) async fn write_fl<'a, 'd, B: BlockIo>(
     ctx: &mut LallocCtx<'a, 'd, B>,
     header: &BNodeRootHeader,
 ) -> Result<Option<PgIdx>> {
-    // TODO: this function could be more complicated and do proper ordering of deferred/free pg idxs for better effiecency
+    // NOTE: this function could be more complicated and do proper ordering of deferred/free pg idxs for better effiecency
 
     let mut next = ctx.root.lalloc.clean.unwrap_or(0);
     loop {
@@ -189,6 +188,7 @@ pub(crate) async fn write_fl<'a, 'd, B: BlockIo>(
             term_fl(buf.as_mut(), i);
         }
 
+        println!("writing fl page: {}", n_pg_idx);
         ctx.bio.write(n_pg_idx, buf).await?;
         next = n_pg_idx;
     }
@@ -380,12 +380,19 @@ pub(crate) async fn encode_arena_and_sync<B: BlockIo>(bio: &B, root: &mut BRootI
             term_fl(fl_buf.as_mut(), i);
         }
 
+        println!(
+            "writing fl node at {} points to {}, actually {}",
+            arena.start + alloc_idx,
+            next,
+            from_bytes::<FreeListHeader>(fl_buf.as_ref()).next.get()
+        );
         next = arena.start + alloc_idx;
         alloc_idx += 1;
         bio.write(next, fl_buf).await?;
     }
 
     header.arena.invalidate();
+    println!("setting free: {}, pg idx: {}", next, root.fb.back());
     header.free.set(next);
     let version = header.version.get() + 1;
     header.version.set(version);
@@ -399,25 +406,23 @@ pub(crate) async fn encode_arena_and_sync<B: BlockIo>(bio: &B, root: &mut BRootI
 #[coverage(off)]
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, hash::Hash, range::Range};
+    use std::{collections::HashSet, hash::Hash};
 
     use anyhow::Result;
     use function_name::named;
-    use rand::{Rng, RngCore, SeedableRng, rngs::StdRng, thread_rng};
-    use winit::keyboard::NamedKey::FavoriteStore2;
+    use rand::{Rng, RngCore, SeedableRng, rngs::StdRng};
 
     use crate::{
         bio::{BlockIo, BlockIoMemory, BlockIoRapidHash},
         bnode::BNodeRootHeader,
         db::{BRootInfo, Txn},
         defer::Defer,
-        flux::Flux,
         key_path,
         lalloc::{
-            FreeListHeader, INIT_ARENA_SIZE, free_on_disk_pg, lalloc, read_fl_idx, write_fl,
-            write_fl_and_reset,
+            FreeListHeader, INIT_ARENA_SIZE, free_on_disk_pg, idxs_per_fl_page, lalloc,
+            read_fl_idx, write_fl, write_fl_and_reset,
         },
-        test::{TmpDir, init_basic_mem_db},
+        test::{self, TmpDir, init_basic_mem_db},
         uint::PgIdx,
         uring::MIN_PAGE_SIZE,
         util::{from_bytes, from_bytes_mut},
@@ -434,7 +439,7 @@ mod tests {
 
             write_fl(&mut self.to_lalloc_ctx(root), header)
                 .await
-                .map(|idx| idx.unwrap())
+                .map(|idx| idx.unwrap_or(0))
         }
     }
 
@@ -529,68 +534,142 @@ mod tests {
     #[ignore]
     #[tokio::test]
     async fn fuzz_lalloc() -> Result<()> {
-        async fn verify_fl<B: BlockIo>(bio: &B) -> Result<()> {
-            Ok(())
-        }
-
-        const OPS: usize = 100;
-        const ITER: usize = 10000;
+        const OPS: usize = 10;
+        const ITER: usize = 1;
         let mut rng = StdRng::seed_from_u64(88369992);
 
-        let mut alloc_post_sync = HashSet::<PgIdx>::new();
-        let mut alloc_pre_sync = HashSet::<PgIdx>::new();
-        let mut free_post_sync = HashSet::<PgIdx>::new();
-        let mut free_pre_sync = HashSet::<PgIdx>::new();
+        let mut alloc_before_sync = HashSet::<PgIdx>::new();
+        let mut alloc_after_sync = HashSet::<PgIdx>::new();
+        let mut free_before_sync = HashSet::<PgIdx>::new();
+        let mut free_after_sync = HashSet::<PgIdx>::new();
 
-        for _ in 0..ITER {
+        for iter in 0..ITER {
             let bio = BlockIoRapidHash::new(BlockIoMemory::new(MIN_PAGE_SIZE));
             let defer = Defer::new();
             let mut test_ctx = init_basic_mem_db(&bio, 0, &defer).await?;
-            let mut flux = Flux::new(bio.clone());
-            let mut ctx = test_ctx.ctx();
 
-            for _ in 0..OPS {
+            for op_i in 0..OPS {
                 let op = rng.gen_range(0..3);
                 match op {
                     // allocate
                     0 => {
                         let chunks = rng.gen_range(0..(MIN_PAGE_SIZE * 3));
+                        let mut ctx = test_ctx.ctx();
                         for _ in 0..chunks {
-                            alloc_post_sync.insert(lalloc(&mut ctx).await?);
+                            let v = lalloc(&mut ctx).await?;
+                            alloc_after_sync.insert(v);
+                            free_after_sync.remove(&v);
+                            free_before_sync.remove(&v);
                         }
+                        println!("finished alloc")
                     }
                     // free
                     1 => {
-                        let free_post = rng.gen_range(0..free_post_sync.len());
+                        let mut ctx = test_ctx.ctx();
+
+                        if !alloc_before_sync.is_empty() {
+                            let mut alloc_before_sync_rand =
+                                alloc_before_sync.iter().map(|i| *i).collect::<Vec<_>>();
+                            shuffle(&mut alloc_before_sync_rand, &mut rng);
+                            let end = rng.gen_range(0..alloc_before_sync_rand.len());
+                            for v in alloc_before_sync_rand[0..end].iter() {
+                                alloc_before_sync.remove(v);
+                                free_before_sync.insert(*v);
+                                ctx.root.lalloc.free_on_disk_pg(&mut ctx.defer_guard, *v);
+                            }
+                        }
+
+                        if !alloc_after_sync.is_empty() {
+                            let mut alloc_after_sync_rand =
+                                alloc_after_sync.iter().map(|i| *i).collect::<Vec<_>>();
+
+                            shuffle(&mut alloc_after_sync_rand, &mut rng);
+                            let end = rng.gen_range(0..alloc_after_sync_rand.len());
+
+                            for v in alloc_after_sync_rand[0..end].iter() {
+                                alloc_after_sync.remove(v);
+                                free_after_sync.insert(*v);
+                                ctx.root.lalloc.free_in_mem_page(*v);
+                            }
+                        }
+                        println!("finish free");
                     }
                     // sync
                     2 => {
                         let mut buf = bio.read(2).await?;
                         let header = from_bytes_mut::<BNodeRootHeader>(&mut buf);
 
-                        write_fl_and_reset(&mut ctx, header).await?;
-                        assert!(ctx.root.lalloc.deferred.is_empty());
-                        assert!(ctx.root.lalloc.free.is_empty());
+                        {
+                            let mut ctx = test_ctx.ctx();
 
-                        alloc_post_sync.drain().for_each(|idx| {
-                            alloc_pre_sync.insert(idx);
+                            write_fl_and_reset(&mut ctx, header).await?;
+                            assert!(ctx.root.lalloc.deferred.is_empty());
+                            assert!(ctx.root.lalloc.free.is_empty());
+                        }
+
+                        alloc_after_sync.drain().for_each(|idx| {
+                            alloc_before_sync.insert(idx);
                         });
-                        free_post_sync.drain().for_each(|idx| {
-                            free_pre_sync.insert(idx);
+
+                        free_after_sync.drain().for_each(|idx| {
+                            free_before_sync.insert(idx);
                         });
+
+                        drop(std::mem::replace(&mut test_ctx.defer_guard, defer.begin()));
+                        assert!(defer.is_empty());
+
+                        println!("finish sync")
                     }
                     _ => {
                         panic!("invalid operation")
                     }
                 }
-                verify_fl(&bio).await?;
+
+                // verify fl
+                {
+                    let ctx = test_ctx.ctx();
+                    let idxs_per = idxs_per_fl_page(MIN_PAGE_SIZE);
+                    let buf = bio.read(ctx.root.fb.front()).await?;
+                    let header = from_bytes::<BNodeRootHeader>(&buf);
+                    let mut cur = header.free.get();
+
+                    println!(
+                        "iter: {}, op: {}, alloced: {}",
+                        iter,
+                        op_i,
+                        free_before_sync.len()
+                    );
+                    let mut should_empty = free_before_sync.clone();
+                    while cur != 0 {
+                        println!("cur: {}", cur);
+                        let buf = bio.read(cur).await?;
+                        cur = from_bytes::<FreeListHeader>(buf.as_ref()).next.get();
+                        for i in 0..idxs_per {
+                            let idx = read_fl_idx(&buf, i);
+                            if idx == 0 {
+                                break;
+                            }
+                            should_empty.remove(&idx);
+                        }
+                    }
+                    println!(
+                        "should_empty size: {}, per: {}",
+                        should_empty.len(),
+                        idxs_per_fl_page(MIN_PAGE_SIZE)
+                    );
+                    assert!(should_empty.is_empty());
+                }
             }
         }
 
         Ok(())
     }
 
-    fn shuffle<T, R: RngCore>(vec: &mut [T], mut rng: R) {
+    fn shuffle<T, R: RngCore>(vec: &mut [T], rng: &mut R) {
+        if vec.is_empty() {
+            return;
+        }
+
         let mut i = vec.len() - 1;
         let end = vec.len() / 2;
         while end < i {
