@@ -154,7 +154,13 @@ impl Lalloc {
     }
 
     pub(crate) fn pop_deferred_then_free(&mut self) -> Option<PgIdx> {
-        self.deferred.pop().or_else(|| self.free.pop())
+        let ret = self.deferred.pop().or_else(|| self.free.pop());
+        if let Some(v) = ret {
+            if v == 8195 {
+                println!("popping: {:?}", ret);
+            }
+        }
+        ret
     }
 }
 
@@ -201,6 +207,7 @@ pub(crate) async fn write_fl_and_reset<'a, 'd, B: BlockIo>(
     header: &BNodeRootHeader,
 ) -> Result<()> {
     ctx.root.lalloc.clean = write_fl(ctx, header).await?;
+    println!("wrote fl starting at {:?}", ctx.root.lalloc.clean);
     ctx.root.lalloc.orig_next = ctx.root.lalloc.arena.next;
 
     Ok(())
@@ -414,7 +421,7 @@ mod tests {
 
     use crate::{
         bio::{BlockIo, BlockIoMemory, BlockIoRapidHash},
-        bnode::BNodeRootHeader,
+        bnode::{BNodeHeader, BNodeRootHeader},
         db::{BRootInfo, Txn},
         defer::Defer,
         key_path,
@@ -425,7 +432,7 @@ mod tests {
         test::{self, TmpDir, init_basic_mem_db},
         uint::PgIdx,
         uring::MIN_PAGE_SIZE,
-        util::{from_bytes, from_bytes_mut},
+        util::{from_bytes, from_bytes_mut, order_front_back},
     };
 
     impl<'a, B: BlockIo> Txn<'a, B> {
@@ -544,37 +551,50 @@ mod tests {
         let mut free_after_sync = HashSet::<PgIdx>::new();
 
         for iter in 0..ITER {
+            println!("iter: {}", iter);
+
             let bio = BlockIoRapidHash::new(BlockIoMemory::new(MIN_PAGE_SIZE));
             let defer = Defer::new();
             let mut test_ctx = init_basic_mem_db(&bio, 0, &defer).await?;
 
-            for op_i in 0..OPS {
+            for op_iter in 0..OPS {
                 let op = rng.gen_range(0..3);
                 match op {
                     // allocate
                     0 => {
+                        println!("operation {}: alloc", op_iter);
+
                         let chunks = rng.gen_range(0..(MIN_PAGE_SIZE * 3));
                         let mut ctx = test_ctx.ctx();
                         for _ in 0..chunks {
                             let v = lalloc(&mut ctx).await?;
+                            if v == 8195 {
+                                println!("8195 allocated");
+                            }
                             alloc_after_sync.insert(v);
                             free_after_sync.remove(&v);
                             free_before_sync.remove(&v);
                         }
-                        println!("finished alloc")
                     }
                     // free
                     1 => {
+                        println!("operation {}: free", op_iter);
+
                         let mut ctx = test_ctx.ctx();
 
                         if !alloc_before_sync.is_empty() {
                             let mut alloc_before_sync_rand =
                                 alloc_before_sync.iter().map(|i| *i).collect::<Vec<_>>();
+                            alloc_before_sync_rand.sort();
                             shuffle(&mut alloc_before_sync_rand, &mut rng);
                             let end = rng.gen_range(0..alloc_before_sync_rand.len());
                             for v in alloc_before_sync_rand[0..end].iter() {
                                 alloc_before_sync.remove(v);
-                                free_before_sync.insert(*v);
+                                free_after_sync.insert(*v);
+
+                                if *v == 8195 {
+                                    println!("8195 freed on disk");
+                                }
                                 ctx.root.lalloc.free_on_disk_pg(&mut ctx.defer_guard, *v);
                             }
                         }
@@ -582,27 +602,40 @@ mod tests {
                         if !alloc_after_sync.is_empty() {
                             let mut alloc_after_sync_rand =
                                 alloc_after_sync.iter().map(|i| *i).collect::<Vec<_>>();
-
+                            alloc_after_sync_rand.sort();
                             shuffle(&mut alloc_after_sync_rand, &mut rng);
                             let end = rng.gen_range(0..alloc_after_sync_rand.len());
 
                             for v in alloc_after_sync_rand[0..end].iter() {
                                 alloc_after_sync.remove(v);
                                 free_after_sync.insert(*v);
+
+                                if *v == 8195 {
+                                    println!("8195 freed in mem");
+                                }
                                 ctx.root.lalloc.free_in_mem_page(*v);
                             }
                         }
-                        println!("finish free");
                     }
                     // sync
                     2 => {
-                        let mut buf = bio.read(2).await?;
+                        println!("operation {}: sync", op_iter);
+
+                        let mut buf = bio.read(test_ctx.root.fb.front()).await?;
+
                         let header = from_bytes_mut::<BNodeRootHeader>(&mut buf);
 
                         {
                             let mut ctx = test_ctx.ctx();
 
                             write_fl_and_reset(&mut ctx, header).await?;
+
+                            header.arena.from(&ctx.root.lalloc.arena);
+                            header.free.set(ctx.root.lalloc.clean.unwrap_or(0));
+                            header.version.set(header.version.get() + 1);
+                            bio.write(ctx.root.fb.back(), buf).await?;
+                            ctx.root.fb.flip();
+
                             assert!(ctx.root.lalloc.deferred.is_empty());
                             assert!(ctx.root.lalloc.free.is_empty());
                         }
@@ -617,13 +650,18 @@ mod tests {
 
                         drop(std::mem::replace(&mut test_ctx.defer_guard, defer.begin()));
                         assert!(defer.is_empty());
-
-                        println!("finish sync")
                     }
                     _ => {
                         panic!("invalid operation")
                     }
                 }
+
+                assert!(alloc_before_sync.intersection(&alloc_after_sync).count() == 0);
+                assert!(alloc_before_sync.intersection(&free_before_sync).count() == 0);
+                assert!(alloc_before_sync.intersection(&free_after_sync).count() == 0);
+                assert!(alloc_after_sync.intersection(&free_before_sync).count() == 0);
+                assert!(alloc_after_sync.intersection(&free_after_sync).count() == 0);
+                assert!(free_before_sync.intersection(&free_after_sync).count() == 0);
 
                 // verify fl
                 {
@@ -632,16 +670,11 @@ mod tests {
                     let buf = bio.read(ctx.root.fb.front()).await?;
                     let header = from_bytes::<BNodeRootHeader>(&buf);
                     let mut cur = header.free.get();
+                    println!("verifying fl starting at {:?}", ctx.root.lalloc.clean);
 
-                    println!(
-                        "iter: {}, op: {}, alloced: {}",
-                        iter,
-                        op_i,
-                        free_before_sync.len()
-                    );
                     let mut should_empty = free_before_sync.clone();
                     while cur != 0 {
-                        println!("cur: {}", cur);
+                        println!("verifying fl page: {}", cur);
                         let buf = bio.read(cur).await?;
                         cur = from_bytes::<FreeListHeader>(buf.as_ref()).next.get();
                         for i in 0..idxs_per {
@@ -657,7 +690,14 @@ mod tests {
                         should_empty.len(),
                         idxs_per_fl_page(MIN_PAGE_SIZE)
                     );
-                    assert!(should_empty.is_empty());
+
+                    let mut should_empty_debug = should_empty.iter().collect::<Vec<_>>();
+                    should_empty_debug.sort();
+                    assert!(
+                        should_empty.is_empty(),
+                        "contents: {:?}",
+                        should_empty_debug
+                    );
                 }
             }
         }

@@ -64,13 +64,6 @@ impl BlockIo for BlockIoMemory {
         }
         let buf = data[start as usize..end as usize].to_vec();
 
-        if pg_idx == 4089 {
-            println!(
-                "reading 4089 fl node with next at: {}",
-                from_bytes::<FreeListHeader>(buf.as_ref()).next.get()
-            )
-        }
-
         Ok(buf)
     }
 
