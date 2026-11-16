@@ -4,29 +4,32 @@ use anyhow::{Result, bail};
 use parking_lot::Mutex;
 
 use crate::{
-    lalloc::FreeListHeader,
     uint::{InPgIdx, PgIdx},
     uring::BlockIoUring,
-    util::{from_bytes, has_valid_checksum, update_checksum},
+    util::{has_valid_checksum, update_checksum},
 };
 
 pub(crate) type BlockIoDefault = BlockIoRapidHash<BlockIoUring>;
 
-pub(crate) trait BlockIo: Clone {
+pub trait BlockIo: Clone + Send + Sync {
     type Buf: AsMut<[u8]> + AsRef<[u8]> + Send + Debug;
 
     fn page_size(&self) -> InPgIdx;
     fn buf(&self) -> Self::Buf;
-    async fn read(&self, pg_idx: PgIdx) -> Result<Self::Buf>;
-    async fn read_unchecked(&self, pg_idx: PgIdx) -> Result<Self::Buf> {
-        self.read(pg_idx).await
+    fn read(&self, pg_idx: PgIdx) -> impl Future<Output = Result<Self::Buf>> + Send;
+    fn read_unchecked(&self, pg_idx: PgIdx) -> impl Future<Output = Result<Self::Buf>> + Send {
+        async move { self.read(pg_idx).await }
     }
-    async fn write(&self, pg_idx: PgIdx, buf: Self::Buf) -> Result<()>;
-    async fn write_unchecked(&self, pg_idx: PgIdx, buf: Self::Buf) -> Result<()> {
-        self.write(pg_idx, buf).await
+    fn write(&self, pg_idx: PgIdx, buf: Self::Buf) -> impl Future<Output = Result<()>> + Send;
+    fn write_unchecked(
+        &self,
+        pg_idx: PgIdx,
+        buf: Self::Buf,
+    ) -> impl Future<Output = Result<()>> + Send {
+        async move { self.write(pg_idx, buf).await }
     }
-    async fn alloc(&self, size: PgIdx) -> Result<()>;
-    async fn sync(&self) -> Result<()>;
+    fn alloc(&self, size: PgIdx) -> impl Future<Output = Result<()>> + Send;
+    fn sync(&self) -> impl Future<Output = Result<()>> + Send;
 }
 
 #[derive(Clone)]
