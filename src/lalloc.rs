@@ -4,21 +4,21 @@ use anyhow::Result;
 
 use crate::{
     bio::BlockIo,
-    bnode::BNodeRootHeader,
+    bnode::{BNodeRootHeader, in_pg_size_of},
     db::BRootInfo,
     defer::DeferGuard,
     galloc::{Galloc, GallocCtx, galloc},
     key::KeyPathBuf,
     meta::MetaHandler,
     uint::{InPgIdx, PgIdx, PgIdxDisk},
-    util::{from_bytes, from_bytes_mut},
+    util::{ChecksumDisk, from_bytes, from_bytes_mut},
 };
 
 const INIT_ARENA_SIZE: PgIdx = 8;
 const MAX_ARENA_EXP: u64 = 18;
 
 // Page format for free list node
-// header, idxs, 0
+// header, idxs, 0, checksum
 // null terminated, or terminated by max idxs in page
 // this keeps iteration simple and is space efficent
 
@@ -29,14 +29,15 @@ pub(crate) struct FreeListHeader {
 
 pub(crate) fn read_fl_idx(buf: &[u8], idx: InPgIdx) -> PgIdx {
     from_bytes::<PgIdxDisk>(
-        &buf[size_of::<FreeListHeader>() + (idx as usize * size_of::<PgIdxDisk>())..],
+        &buf[(in_pg_size_of::<FreeListHeader>() + (idx * in_pg_size_of::<PgIdxDisk>())) as usize..],
     )
     .get()
 }
 
 pub(crate) fn write_fl_idx(buf: &mut [u8], idx: InPgIdx, pg_idx: PgIdx) {
     from_bytes_mut::<PgIdxDisk>(
-        &mut buf[size_of::<FreeListHeader>() + (idx as usize * size_of::<PgIdxDisk>())..],
+        &mut buf
+            [(in_pg_size_of::<FreeListHeader>() + (idx * in_pg_size_of::<PgIdxDisk>())) as usize..],
     )
     .set(pg_idx)
 }
@@ -45,14 +46,16 @@ pub(crate) fn term_fl(buf: &mut [u8], idx: InPgIdx) {
     let idxs_per = idxs_per_fl_page(buf.len() as u64);
     if idx < idxs_per {
         from_bytes_mut::<PgIdxDisk>(
-            &mut buf[size_of::<FreeListHeader>() + (idx as usize * size_of::<PgIdxDisk>())..],
+            &mut buf[(in_pg_size_of::<FreeListHeader>() + (idx * in_pg_size_of::<PgIdxDisk>()))
+                as usize..],
         )
         .set(0)
     }
 }
 
 pub(crate) fn idxs_per_fl_page(pg_sz: InPgIdx) -> InPgIdx {
-    (pg_sz - size_of::<FreeListHeader>() as InPgIdx) / size_of::<PgIdxDisk>() as InPgIdx
+    (pg_sz - in_pg_size_of::<FreeListHeader>() as InPgIdx - in_pg_size_of::<ChecksumDisk>())
+        / in_pg_size_of::<PgIdxDisk>()
 }
 
 #[derive(Clone, Copy)]
@@ -154,13 +157,7 @@ impl Lalloc {
     }
 
     pub(crate) fn pop_deferred_then_free(&mut self) -> Option<PgIdx> {
-        let ret = self.deferred.pop().or_else(|| self.free.pop());
-        if let Some(v) = ret {
-            if v == 8195 {
-                println!("popping: {:?}", ret);
-            }
-        }
-        ret
+        self.deferred.pop().or_else(|| self.free.pop())
     }
 }
 
@@ -171,10 +168,7 @@ pub(crate) async fn write_fl<'a, 'd, B: BlockIo>(
     // NOTE: this function could be more complicated and do proper ordering of deferred/free pg idxs for better effiecency
 
     let mut next = ctx.root.lalloc.clean.unwrap_or(0);
-    loop {
-        let maybe_load = ctx.root.lalloc.pop_deferred_then_free();
-        let mut free_idx = if let Some(v) = maybe_load { v } else { break };
-
+    while !ctx.root.lalloc.deferred.is_empty() || !ctx.root.lalloc.free.is_empty() {
         let n_pg_idx = lalloc_from_dirty_or_arena(ctx, header).await?;
         let mut buf = ctx.bio.buf();
         from_bytes_mut::<FreeListHeader>(buf.as_mut())
@@ -183,18 +177,16 @@ pub(crate) async fn write_fl<'a, 'd, B: BlockIo>(
 
         let mut i = 0;
         let idxs_per = idxs_per_fl_page(ctx.bio.page_size());
-        while i < idxs_per {
+        while i < idxs_per
+            && (!ctx.root.lalloc.deferred.is_empty() || !ctx.root.lalloc.free.is_empty())
+        {
+            let free_idx = ctx.root.lalloc.pop_deferred_then_free().unwrap();
             write_fl_idx(buf.as_mut(), i, free_idx);
-
             i += 1;
-            let maybe_load = ctx.root.lalloc.pop_deferred_then_free();
-            free_idx = if let Some(v) = maybe_load { v } else { break };
         }
         if i < idxs_per {
             term_fl(buf.as_mut(), i);
         }
-
-        println!("writing fl page: {}", n_pg_idx);
         ctx.bio.write(n_pg_idx, buf).await?;
         next = n_pg_idx;
     }
@@ -207,7 +199,6 @@ pub(crate) async fn write_fl_and_reset<'a, 'd, B: BlockIo>(
     header: &BNodeRootHeader,
 ) -> Result<()> {
     ctx.root.lalloc.clean = write_fl(ctx, header).await?;
-    println!("wrote fl starting at {:?}", ctx.root.lalloc.clean);
     ctx.root.lalloc.orig_next = ctx.root.lalloc.arena.next;
 
     Ok(())
@@ -387,19 +378,12 @@ pub(crate) async fn encode_arena_and_sync<B: BlockIo>(bio: &B, root: &mut BRootI
             term_fl(fl_buf.as_mut(), i);
         }
 
-        println!(
-            "writing fl node at {} points to {}, actually {}",
-            arena.start + alloc_idx,
-            next,
-            from_bytes::<FreeListHeader>(fl_buf.as_ref()).next.get()
-        );
         next = arena.start + alloc_idx;
         alloc_idx += 1;
         bio.write(next, fl_buf).await?;
     }
 
     header.arena.invalidate();
-    println!("setting free: {}, pg idx: {}", next, root.fb.back());
     header.free.set(next);
     let version = header.version.get() + 1;
     header.version.set(version);
@@ -413,7 +397,7 @@ pub(crate) async fn encode_arena_and_sync<B: BlockIo>(bio: &B, root: &mut BRootI
 #[coverage(off)]
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, hash::Hash};
+    use std::collections::HashSet;
 
     use anyhow::Result;
     use function_name::named;
@@ -421,7 +405,7 @@ mod tests {
 
     use crate::{
         bio::{BlockIo, BlockIoMemory, BlockIoRapidHash},
-        bnode::{BNodeHeader, BNodeRootHeader},
+        bnode::BNodeRootHeader,
         db::{BRootInfo, Txn},
         defer::Defer,
         key_path,
@@ -429,10 +413,10 @@ mod tests {
             FreeListHeader, INIT_ARENA_SIZE, free_on_disk_pg, idxs_per_fl_page, lalloc,
             read_fl_idx, write_fl, write_fl_and_reset,
         },
-        test::{self, TmpDir, init_basic_mem_db},
+        test::{TmpDir, init_basic_mem_db},
         uint::PgIdx,
         uring::MIN_PAGE_SIZE,
-        util::{from_bytes, from_bytes_mut, order_front_back},
+        util::{from_bytes, from_bytes_mut},
     };
 
     impl<'a, B: BlockIo> Txn<'a, B> {
@@ -538,39 +522,35 @@ mod tests {
         Ok(())
     }
 
-    #[ignore]
     #[tokio::test]
     async fn fuzz_lalloc() -> Result<()> {
-        const OPS: usize = 10;
-        const ITER: usize = 1;
+        const OPS: usize = 20;
+        const ITER: usize = 5;
         let mut rng = StdRng::seed_from_u64(88369992);
-
-        let mut alloc_before_sync = HashSet::<PgIdx>::new();
-        let mut alloc_after_sync = HashSet::<PgIdx>::new();
-        let mut free_before_sync = HashSet::<PgIdx>::new();
-        let mut free_after_sync = HashSet::<PgIdx>::new();
 
         for iter in 0..ITER {
             println!("iter: {}", iter);
+
+            let mut alloc_before_sync = HashSet::<PgIdx>::new();
+            let mut alloc_after_sync = HashSet::<PgIdx>::new();
+            let mut free_before_sync = HashSet::<PgIdx>::new();
+            let mut free_after_sync = HashSet::<PgIdx>::new();
 
             let bio = BlockIoRapidHash::new(BlockIoMemory::new(MIN_PAGE_SIZE));
             let defer = Defer::new();
             let mut test_ctx = init_basic_mem_db(&bio, 0, &defer).await?;
 
-            for op_iter in 0..OPS {
+            for _op_iter in 0..OPS {
                 let op = rng.gen_range(0..3);
                 match op {
                     // allocate
                     0 => {
-                        println!("operation {}: alloc", op_iter);
+                        // println!("operation {}: alloc", op_iter);
 
                         let chunks = rng.gen_range(0..(MIN_PAGE_SIZE * 3));
                         let mut ctx = test_ctx.ctx();
                         for _ in 0..chunks {
                             let v = lalloc(&mut ctx).await?;
-                            if v == 8195 {
-                                println!("8195 allocated");
-                            }
                             alloc_after_sync.insert(v);
                             free_after_sync.remove(&v);
                             free_before_sync.remove(&v);
@@ -578,7 +558,7 @@ mod tests {
                     }
                     // free
                     1 => {
-                        println!("operation {}: free", op_iter);
+                        // println!("operation {}: free", op_iter);
 
                         let mut ctx = test_ctx.ctx();
 
@@ -591,10 +571,6 @@ mod tests {
                             for v in alloc_before_sync_rand[0..end].iter() {
                                 alloc_before_sync.remove(v);
                                 free_after_sync.insert(*v);
-
-                                if *v == 8195 {
-                                    println!("8195 freed on disk");
-                                }
                                 ctx.root.lalloc.free_on_disk_pg(&mut ctx.defer_guard, *v);
                             }
                         }
@@ -609,17 +585,13 @@ mod tests {
                             for v in alloc_after_sync_rand[0..end].iter() {
                                 alloc_after_sync.remove(v);
                                 free_after_sync.insert(*v);
-
-                                if *v == 8195 {
-                                    println!("8195 freed in mem");
-                                }
                                 ctx.root.lalloc.free_in_mem_page(*v);
                             }
                         }
                     }
                     // sync
                     2 => {
-                        println!("operation {}: sync", op_iter);
+                        // println!("operation {}: sync", op_iter);
 
                         let mut buf = bio.read(test_ctx.root.fb.front()).await?;
 
@@ -656,7 +628,11 @@ mod tests {
                     }
                 }
 
-                assert!(alloc_before_sync.intersection(&alloc_after_sync).count() == 0);
+                assert!(
+                    alloc_before_sync.intersection(&alloc_after_sync).count() == 0,
+                    "{:?}",
+                    alloc_before_sync.intersection(&alloc_after_sync)
+                );
                 assert!(alloc_before_sync.intersection(&free_before_sync).count() == 0);
                 assert!(alloc_before_sync.intersection(&free_after_sync).count() == 0);
                 assert!(alloc_after_sync.intersection(&free_before_sync).count() == 0);
@@ -670,27 +646,23 @@ mod tests {
                     let buf = bio.read(ctx.root.fb.front()).await?;
                     let header = from_bytes::<BNodeRootHeader>(&buf);
                     let mut cur = header.free.get();
-                    println!("verifying fl starting at {:?}", ctx.root.lalloc.clean);
 
                     let mut should_empty = free_before_sync.clone();
                     while cur != 0 {
-                        println!("verifying fl page: {}", cur);
+                        // println!("verifying fl page: {}", cur);
+                        should_empty.remove(&cur);
                         let buf = bio.read(cur).await?;
                         cur = from_bytes::<FreeListHeader>(buf.as_ref()).next.get();
+
                         for i in 0..idxs_per {
                             let idx = read_fl_idx(&buf, i);
+
                             if idx == 0 {
                                 break;
                             }
                             should_empty.remove(&idx);
                         }
                     }
-                    println!(
-                        "should_empty size: {}, per: {}",
-                        should_empty.len(),
-                        idxs_per_fl_page(MIN_PAGE_SIZE)
-                    );
-
                     let mut should_empty_debug = should_empty.iter().collect::<Vec<_>>();
                     should_empty_debug.sort();
                     assert!(

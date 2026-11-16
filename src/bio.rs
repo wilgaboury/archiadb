@@ -68,13 +68,6 @@ impl BlockIo for BlockIoMemory {
     }
 
     async fn write(&self, pg_idx: PgIdx, buf: Self::Buf) -> Result<()> {
-        if pg_idx == 4089 {
-            println!(
-                "writing 4089 fl node with next at: {}",
-                from_bytes::<FreeListHeader>(buf.as_ref()).next.get()
-            )
-        }
-
         let start = pg_idx * self.page_size;
         let end = start + self.page_size;
         let mut data = self.data.lock();
