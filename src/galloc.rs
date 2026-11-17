@@ -28,21 +28,22 @@ pub(crate) struct GallocCtx<'a, B: BlockIo> {
     pub(crate) meta: &'a MetaHandler,
     pub(crate) bio: &'a B,
     pub(crate) fb: &'a mut FrontBack,
+    pub(crate) root_buf: &'a mut [u8],
 }
 
 pub(crate) async fn galloc<'a, B: BlockIo>(ctx: GallocCtx<'a, B>, len: PgIdx) -> Result<Arena> {
     let _gaurd = ctx.galloc.lock.lock().await;
-    galloc_no_lock(ctx.meta, ctx.bio, ctx.fb, len).await
+    galloc_no_lock(ctx.meta, ctx.bio, ctx.fb, ctx.root_buf.as_mut(), len).await
 }
 
 pub(crate) async fn galloc_no_lock<B: BlockIo>(
     meta: &MetaHandler,
     bio: &B,
     fb: &mut FrontBack,
+    root_buf: &mut [u8],
     len: PgIdx,
 ) -> Result<Arena> {
-    let mut root = bio.read(fb.front()).await?;
-    let btree = from_bytes_mut::<BNodeRootHeader>(root.as_mut());
+    let btree = from_bytes_mut::<BNodeRootHeader>(root_buf);
     let start = meta.len();
     let flen = meta.len() + len;
 
@@ -59,7 +60,9 @@ pub(crate) async fn galloc_no_lock<B: BlockIo>(
     btree.arena.start.set(start);
     btree.arena.len.set(len);
     btree.arena.next.set(0);
-    bio.write(fb.back(), root).await?;
+    let mut tmp_buf = bio.buf();
+    tmp_buf.as_mut().copy_from_slice(root_buf.as_ref());
+    bio.write(fb.back(), tmp_buf).await?;
     bio.sync().await?;
     fb.flip();
 
@@ -85,7 +88,15 @@ pub(crate) async fn galloc_recover<B: BlockIo>(meta: &MetaHandler, bio: &B) -> R
         })
         .await;
     if front_idx != 0 && back_idx != 0 {
-        galloc_no_lock(meta, bio, &mut FrontBack::new(front_idx, back_idx), alen).await?;
+        let mut root_buf = bio.read(front_idx).await?;
+        galloc_no_lock(
+            meta,
+            bio,
+            &mut FrontBack::new(front_idx, back_idx),
+            root_buf.as_mut(),
+            alen,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -100,12 +111,17 @@ mod tests {
     use super::*;
 
     impl<B: BlockIo> DbInner<B> {
-        pub(crate) fn to_galloc_ctx<'a>(&'a self, fb: &'a mut FrontBack) -> GallocCtx<'a, B> {
+        pub(crate) fn to_galloc_ctx<'a>(
+            &'a self,
+            fb: &'a mut FrontBack,
+            root_buf: &'a mut [u8],
+        ) -> GallocCtx<'a, B> {
             GallocCtx {
                 galloc: &self.galloc,
                 meta: &self.meta,
                 bio: &self.bio,
                 fb,
+                root_buf,
             }
         }
     }
@@ -117,7 +133,8 @@ mod tests {
         let db = tmp.db().await?;
 
         let mut fb = FrontBack::from_roots(&db.inner.bio, 2, 3).await?.0;
-        let ctx = db.inner.to_galloc_ctx(&mut fb);
+        let mut root_buf = db.inner.bio.read(2).await?;
+        let ctx = db.inner.to_galloc_ctx(&mut fb, root_buf.as_mut());
 
         assert_eq!(4, db.inner.meta.len());
 

@@ -178,7 +178,7 @@ pub(crate) struct TestLallocCtx<'d, B: BlockIo> {
     pub(crate) meta: MetaHandler,
     pub(crate) bio: B,
     pub(crate) defer_guard: DeferGuard<'d>,
-    pub(crate) root: BRootInfo,
+    pub(crate) root: BRootInfo<B>,
 }
 
 impl<'d, B: BlockIo> TestLallocCtx<'d, B> {
@@ -233,11 +233,13 @@ pub(crate) async fn init_basic_mem_db<'a, B: BlockIo>(
         bio.write(3, buf2).await?;
     }
 
+    let root_buf = bio.read(2).await?;
+
     Ok(TestLallocCtx {
         galloc: Galloc::new(),
         meta: MetaHandler::from_bio(bio).await?,
         bio: bio.clone(),
         defer_guard: defer.begin(),
-        root: BRootInfo::new(FrontBack::new(2, 3), arena.clone()),
+        root: BRootInfo::new(FrontBack::new(2, 3), root_buf, arena.clone()),
     })
 }

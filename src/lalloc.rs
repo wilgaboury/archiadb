@@ -126,6 +126,7 @@ impl Lalloc {
     }
 
     pub(crate) fn free_in_mem_page(&mut self, pg_idx: PgIdx) {
+        println!("freeing in mem {}", pg_idx);
         self.free.push(pg_idx);
     }
 
@@ -163,13 +164,12 @@ impl Lalloc {
 
 pub(crate) async fn write_fl<'a, 'd, B: BlockIo>(
     ctx: &mut LallocCtx<'a, 'd, B>,
-    header: &BNodeRootHeader,
 ) -> Result<Option<PgIdx>> {
     // NOTE: this function could be more complicated and do proper ordering of deferred/free pg idxs for better effiecency
 
     let mut next = ctx.root.lalloc.clean.unwrap_or(0);
     while !ctx.root.lalloc.deferred.is_empty() || !ctx.root.lalloc.free.is_empty() {
-        let n_pg_idx = lalloc_from_dirty_or_arena(ctx, header).await?;
+        let n_pg_idx = lalloc_from_dirty_or_arena(ctx).await?;
         let mut buf = ctx.bio.buf();
         from_bytes_mut::<FreeListHeader>(buf.as_mut())
             .next
@@ -196,9 +196,8 @@ pub(crate) async fn write_fl<'a, 'd, B: BlockIo>(
 
 pub(crate) async fn write_fl_and_reset<'a, 'd, B: BlockIo>(
     ctx: &mut LallocCtx<'a, 'd, B>,
-    header: &BNodeRootHeader,
 ) -> Result<()> {
-    ctx.root.lalloc.clean = write_fl(ctx, header).await?;
+    ctx.root.lalloc.clean = write_fl(ctx).await?;
     ctx.root.lalloc.orig_next = ctx.root.lalloc.arena.next;
 
     Ok(())
@@ -214,7 +213,7 @@ pub(crate) struct LallocCtx<'a, 'd, B: BlockIo> {
     pub(crate) meta: &'a MetaHandler,
     pub(crate) bio: &'a B,
     pub(crate) defer_guard: &'a mut DeferGuard<'d>,
-    pub(crate) root: &'a mut BRootInfo,
+    pub(crate) root: &'a mut BRootInfo<B>,
 }
 
 impl<'a, 'd, B: BlockIo> LallocCtx<'a, 'd, B> {
@@ -224,14 +223,13 @@ impl<'a, 'd, B: BlockIo> LallocCtx<'a, 'd, B> {
             meta: self.meta,
             bio: self.bio,
             fb: &mut self.root.fb,
+            root_buf: self.root.buf.as_mut(),
         }
     }
 }
 
 pub(crate) async fn lalloc<'a, 'd, B: BlockIo>(ctx: &mut LallocCtx<'a, 'd, B>) -> Result<PgIdx> {
-    let buf = ctx.bio.read(ctx.root.fb.front()).await?;
-    let header = from_bytes::<BNodeRootHeader>(buf.as_ref());
-
+    let header: &mut BNodeRootHeader = from_bytes_mut::<BNodeRootHeader>(ctx.root.buf.as_mut());
     if should_init_arena(header) {
         // I'm not even sure what I meant by comment below
         // unlikely case, but post arena encode crash + fl depletion could leave inlavid arena with large len. use that len for galloc not init.
@@ -242,16 +240,23 @@ pub(crate) async fn lalloc<'a, 'd, B: BlockIo>(ctx: &mut LallocCtx<'a, 'd, B>) -
         };
         ctx.root.lalloc.arena = arena;
         ctx.root.lalloc.orig_next = ctx.root.lalloc.arena.next;
-        return Ok(ctx.root.lalloc.arena.pop().unwrap());
-    }
-
-    if let Some(free) =
-        find_free_idx_and_consume_fl(ctx.defer_guard, ctx.bio, header, &mut ctx.root.lalloc).await?
-    {
+        let free = ctx.root.lalloc.arena.pop().unwrap();
+        println!("lallocing: {}", free);
         return Ok(free);
     }
 
-    lalloc_from_arena_or_galloc(ctx, header).await
+    if let Some(free) =
+        find_free_idx_and_consume_fl(ctx.defer_guard, ctx.bio, &mut ctx.root.lalloc).await?
+    {
+        println!("lallocing: {}", free);
+        return Ok(free);
+    }
+
+    {
+        let free = lalloc_from_arena_or_galloc(ctx).await?;
+        println!("lallocing: {}", free);
+        Ok(free)
+    }
 }
 
 pub(crate) fn should_init_arena(root: &BNodeRootHeader) -> bool {
@@ -261,10 +266,9 @@ pub(crate) fn should_init_arena(root: &BNodeRootHeader) -> bool {
 pub(crate) async fn find_free_idx_and_consume_fl<B: BlockIo>(
     defer_guard: &mut DeferGuard<'_>,
     fio: &B,
-    header: &BNodeRootHeader,
     lalloc: &mut Lalloc,
 ) -> Result<Option<PgIdx>> {
-    let mut clean = lalloc.clean_or(header);
+    let mut clean = lalloc.clean.unwrap_or(0);
     loop {
         if let Some(free) = lalloc.free.pop() {
             return Ok(Some(free));
@@ -302,6 +306,7 @@ pub(crate) async fn load_fl_node<B: BlockIo>(
         if defer_guard.defer.contains(free_pg_idx) {
             lalloc.deferred.push(free_pg_idx);
         } else {
+            println!("pushing to free from disk {}", free_pg_idx);
             lalloc.free.push(free_pg_idx);
         }
     }
@@ -310,18 +315,16 @@ pub(crate) async fn load_fl_node<B: BlockIo>(
 
 pub(crate) async fn lalloc_from_dirty_or_arena<'a, 'd, B: BlockIo>(
     ctx: &mut LallocCtx<'a, 'd, B>,
-    header: &BNodeRootHeader,
 ) -> Result<PgIdx> {
     if let Some(free) = ctx.root.lalloc.free.pop() {
         Ok(free)
     } else {
-        lalloc_from_arena_or_galloc(ctx, header).await
+        lalloc_from_arena_or_galloc(ctx).await
     }
 }
 
 pub(crate) async fn lalloc_from_arena_or_galloc<'a, 'd, B: BlockIo>(
     ctx: &mut LallocCtx<'a, 'd, B>,
-    header: &BNodeRootHeader,
 ) -> Result<PgIdx> {
     if let Some(free) = ctx
         .root
@@ -331,7 +334,11 @@ pub(crate) async fn lalloc_from_arena_or_galloc<'a, 'd, B: BlockIo>(
         Ok(free)
     } else {
         encode_arena_and_sync(ctx.bio, ctx.root).await?;
-        let next_len = next_arena_len(header.arena.len.get());
+        let next_len = {
+            let header: &mut BNodeRootHeader =
+                from_bytes_mut::<BNodeRootHeader>(ctx.root.buf.as_mut());
+            next_arena_len(header.arena.len.get())
+        };
         ctx.root.lalloc.arena = galloc(ctx.to_galloc_ctx(), next_len).await?;
         ctx.root.lalloc.orig_next = ctx.root.lalloc.arena.next;
         Ok(ctx.root.lalloc.arena.pop().unwrap())
@@ -347,14 +354,16 @@ pub(crate) fn next_arena_len(prev: PgIdx) -> PgIdx {
 }
 
 // for simplity this makes no attempt to compact the previous head node
-pub(crate) async fn encode_arena_and_sync<B: BlockIo>(bio: &B, root: &mut BRootInfo) -> Result<()> {
+pub(crate) async fn encode_arena_and_sync<B: BlockIo>(
+    bio: &B,
+    root: &mut BRootInfo<B>,
+) -> Result<()> {
     let to_encode = root.lalloc.pages_to_fl_encode_arena(bio.page_size());
     let left = root.lalloc.arena.len - root.lalloc.arena.next;
     assert!(left == to_encode);
 
     let idxs_per = idxs_per_fl_page(bio.page_size());
-    let mut root_buf = bio.read(root.fb.front()).await?;
-    let header = from_bytes_mut::<BNodeRootHeader>(root_buf.as_mut());
+    let header = from_bytes_mut::<BNodeRootHeader>(root.buf.as_mut());
 
     let arena = &root.lalloc.arena;
     let mut encode_idx = root.lalloc.orig_next;
@@ -387,9 +396,6 @@ pub(crate) async fn encode_arena_and_sync<B: BlockIo>(bio: &B, root: &mut BRootI
     header.free.set(next);
     let version = header.version.get() + 1;
     header.version.set(version);
-    bio.write(root.fb.back(), root_buf).await?;
-    bio.sync().await?;
-    root.fb.flip();
 
     Ok(())
 }
@@ -420,15 +426,15 @@ mod tests {
     };
 
     impl<'a, B: BlockIo> Txn<'a, B> {
-        pub(crate) async fn lalloc<'b>(&'b mut self, root: &'b mut BRootInfo) -> Result<PgIdx> {
+        pub(crate) async fn lalloc<'b>(&'b mut self, root: &'b mut BRootInfo<B>) -> Result<PgIdx> {
             lalloc(&mut self.to_lalloc_ctx(root)).await
         }
 
-        pub(crate) async fn write_fl<'b>(&'b mut self, root: &'b mut BRootInfo) -> Result<PgIdx> {
-            let root_buf = self.db.bio.read(root.fb.front()).await?;
-            let header = from_bytes::<BNodeRootHeader>(root_buf.as_ref());
-
-            write_fl(&mut self.to_lalloc_ctx(root), header)
+        pub(crate) async fn write_fl<'b>(
+            &'b mut self,
+            root: &'b mut BRootInfo<B>,
+        ) -> Result<PgIdx> {
+            write_fl(&mut self.to_lalloc_ctx(root))
                 .await
                 .map(|idx| idx.unwrap_or(0))
         }
@@ -461,8 +467,8 @@ mod tests {
         let start_version = header.version.get();
         assert_eq!(12, txn.lalloc(&mut root).await?);
 
-        assert_eq!(3, root.fb.front());
-        assert_eq!(2, root.fb.back());
+        assert_eq!(2, root.fb.front());
+        assert_eq!(3, root.fb.back());
         let root_buf = bio.read(root.fb.front()).await?;
         let root = from_bytes::<BNodeRootHeader>(root_buf.as_ref());
         assert_eq!(11, root.free.get());
@@ -593,20 +599,21 @@ mod tests {
                     2 => {
                         // println!("operation {}: sync", op_iter);
 
-                        let mut buf = bio.read(test_ctx.root.fb.front()).await?;
-
-                        let header = from_bytes_mut::<BNodeRootHeader>(&mut buf);
-
                         {
                             let mut ctx = test_ctx.ctx();
 
-                            write_fl_and_reset(&mut ctx, header).await?;
+                            write_fl_and_reset(&mut ctx).await?;
 
+                            let header = from_bytes_mut::<BNodeRootHeader>(ctx.root.buf.as_mut());
                             header.arena.from(&ctx.root.lalloc.arena);
                             header.free.set(ctx.root.lalloc.clean.unwrap_or(0));
                             header.version.set(header.version.get() + 1);
-                            bio.write(ctx.root.fb.back(), buf).await?;
-                            ctx.root.fb.flip();
+                            {
+                                let mut tmp = bio.buf();
+                                tmp.copy_from_slice(&ctx.root.buf);
+                                bio.write(ctx.root.fb.back(), tmp).await?;
+                                ctx.root.fb.flip();
+                            }
 
                             assert!(ctx.root.lalloc.deferred.is_empty());
                             assert!(ctx.root.lalloc.free.is_empty());

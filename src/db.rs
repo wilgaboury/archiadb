@@ -9,7 +9,7 @@ use crate::{
     bnode::BNodeRootHeader,
     defer::{Defer, DeferGuard},
     file::DbFile,
-    flux::Flux,
+    flux::{Flux, FluxBuf},
     galloc::{Galloc, galloc_recover},
     karc::Karc,
     key::{KeyPath, KeyPathBuf},
@@ -164,15 +164,17 @@ impl<'a, B: BlockIo> TxnBuilder<'a, B> {
     }
 }
 
-pub(crate) struct BRootInfo {
+pub(crate) struct BRootInfo<B: BlockIo> {
     pub(crate) fb: FrontBack,
+    pub(crate) buf: B::Buf,
     pub(crate) lalloc: Lalloc,
 }
 
-impl BRootInfo {
-    pub fn new(fb: FrontBack, arena: Arena) -> Self {
+impl<B: BlockIo> BRootInfo<B> {
+    pub fn new(fb: FrontBack, buf: B::Buf, arena: Arena) -> Self {
         Self {
             fb,
+            buf,
             lalloc: Lalloc::new(arena),
         }
     }
@@ -186,11 +188,14 @@ pub struct Txn<'a, B: BlockIo> {
     pub(crate) free: Vec<u64>,
     pub(crate) ops: KeyTrie<LockType>,
     pub(crate) flux: Flux<B>,
-    pub(crate) roots: HashMap<KeyPathBuf, BRootInfo>,
+    pub(crate) roots: HashMap<KeyPathBuf, BRootInfo<B>>,
 }
 
 impl<'a, B: BlockIo> Txn<'a, B> {
-    pub(crate) fn to_lalloc_ctx<'b>(&'b mut self, root: &'b mut BRootInfo) -> LallocCtx<'b, 'a, B> {
+    pub(crate) fn to_lalloc_ctx<'b>(
+        &'b mut self,
+        root: &'b mut BRootInfo<B>,
+    ) -> LallocCtx<'b, 'a, B> {
         LallocCtx {
             galloc: &self.db.galloc,
             meta: &self.db.meta,
@@ -202,7 +207,7 @@ impl<'a, B: BlockIo> Txn<'a, B> {
 
     pub(crate) fn to_lalloc_ctx_and_flux<'b>(
         &'b mut self,
-        root: &'b mut BRootInfo,
+        root: &'b mut BRootInfo<B>,
     ) -> (LallocCtx<'b, 'a, B>, &'b mut Flux<B>) {
         (
             LallocCtx {
@@ -216,24 +221,22 @@ impl<'a, B: BlockIo> Txn<'a, B> {
         )
     }
 
-    pub(crate) async fn create_root_root_info(&self) -> Result<BRootInfo> {
+    pub(crate) async fn create_root_root_info(&mut self) -> Result<BRootInfo<B>> {
         self.create_root_info(key_path![], self.db.meta.root1(), self.db.meta.root2())
             .await
     }
 
     pub(crate) async fn create_root_info(
-        &self,
+        &mut self,
         key: &KeyPath,
         pg_idx_1: PgIdx,
         pg_idx_2: PgIdx,
-    ) -> Result<BRootInfo> {
+    ) -> Result<BRootInfo<B>> {
         let (pg_idx_1, pg1, pg_idx_2, _pg2) =
             read_root_w_retry(self.db, key, pg_idx_1, pg_idx_2, Duration::from_secs(1)).await?;
-        let root = from_bytes::<BNodeRootHeader>(pg1.as_ref());
-        Ok(BRootInfo::new(
-            FrontBack::new(pg_idx_1, pg_idx_2),
-            root.arena.to_mem(),
-        ))
+        let fb = FrontBack::new(pg_idx_1, pg_idx_2);
+        let arena = from_bytes::<BNodeRootHeader>(pg1.as_ref()).arena.to_mem();
+        Ok(BRootInfo::new(fb, self.db.bio.read(pg_idx_1).await?, arena))
     }
 
     pub(crate) async fn traverse_to(&self, key: &KeyPath) -> Result<(PgIdx, PgIdx)> {

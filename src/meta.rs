@@ -184,17 +184,8 @@ impl MetaHandler {
 
     #[cfg(test)]
     pub(crate) async fn from_bio<B: BlockIo>(bio: &B) -> Result<Self> {
-        let mut front = Self::create_buf(bio.page_size());
-        let mut back = Self::create_buf(bio.page_size());
-        update_checksum(&mut front);
-        let mut buf = bio.buf();
-        buf.as_mut().copy_from_slice(&front);
-        bio.write(0, buf).await?;
-        update_checksum(&mut back);
-        let mut buf = bio.buf();
-        buf.as_mut().copy_from_slice(&back);
-        bio.write(1, buf).await?;
-
+        let front = Box::from(bio.read(0).await?.as_ref());
+        let back = Box::from(bio.read(1).await?.as_ref());
         Ok(Self::from_bufs(front, back, true))
     }
 

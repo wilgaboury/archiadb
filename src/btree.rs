@@ -155,13 +155,12 @@ async fn get_path<B: BlockIo>(
 async fn upsert<'a, 'b, B: BlockIo>(
     key: &[u8],
     value: LeafValue<'_>,
-    root_buf: &mut FluxBuf<B>,
     flux: &mut Flux<B>,
     ctx: &mut LallocCtx<'a, 'b, B>,
 ) -> Result<()> {
     // new btree, empty root node
     {
-        let header = from_bytes_mut::<BNodeRootHeader>(root_buf.as_mut());
+        let header = from_bytes_mut::<BNodeRootHeader>(ctx.root.buf.as_mut());
         if header.node.len() == 0 {
             let mut buf = flux.buf();
             let header = from_bytes_mut::<BNodeHeader>(buf.as_mut());
@@ -170,7 +169,7 @@ async fn upsert<'a, 'b, B: BlockIo>(
             let ret = upsert_leaf(buf, key, value, ctx, flux).await?;
             match ret {
                 PrevUpsertSplitResult::Single(child) => {
-                    insert_init_at_inner(root_buf.as_mut(), child);
+                    insert_init_at_inner(ctx.root.buf.as_mut(), child);
                 }
                 _ => {
                     // no-op - new empty node, should never split
@@ -181,20 +180,20 @@ async fn upsert<'a, 'b, B: BlockIo>(
         }
     }
 
-    let (root_search, mut path) = get_path(key, root_buf.as_ref(), flux).await?;
+    let (root_search, mut path) = get_path(key, ctx.root.buf.as_ref(), flux).await?;
 
     let (_, leaf_buf) = path.pop().unwrap();
     let mut split = upsert_leaf(leaf_buf, key, value, ctx, flux).await?;
 
     while !path.is_empty() {
         let (search, mut buf) = path.pop().unwrap();
-        split = upsert_inner(split, search, &mut buf, flux, ctx)
+        split = upsert_inner(split, search, buf.as_mut(), flux, ctx)
             .await?
             .write(buf, flux, ctx)
             .await?
     }
 
-    upsert_inner(split, root_search, root_buf, flux, ctx).await?;
+    upsert_root(split, root_search, flux, ctx).await?;
 
     Ok(())
 }
@@ -260,45 +259,42 @@ async fn upsert_leaf<'a, 'b, B: BlockIo>(
     }
 }
 
-// TODO: need to handle root as well
 async fn upsert_inner<'a, 'b, B: BlockIo>(
     split: PrevUpsertSplitResult,
     search: SearchResult,
-    fbuf: &mut FluxBuf<B>,
+    buf: &mut [u8],
     flux: &mut Flux<B>,
     ctx: &mut LallocCtx<'a, 'b, B>,
 ) -> Result<UpsertSplitResult2> {
-    let _header = from_bytes::<BNodeHeader>(fbuf.as_ref());
-
     let search_idx = search.pg_idx();
 
     match split {
         PrevUpsertSplitResult::Single(pg_idx) => {
-            write_page_ptr(fbuf.as_mut(), search_idx, pg_idx);
+            write_page_ptr(buf, search_idx, pg_idx);
             Ok(UpsertSplitResult2::Single)
         }
         PrevUpsertSplitResult::Split(left, split, right) => {
-            let can_insert = remaining_bytes(fbuf.as_ref())
+            let can_insert = remaining_bytes(buf)
                 > in_pg_size_of::<PgIdxDisk>() + in_pg_len(&split) + in_pg_size_of::<SlotDisk>();
             if can_insert {
-                insert_at_inner(fbuf.as_mut(), search_idx, left, &split, right);
+                insert_at_inner(buf, search_idx, left, &split, right);
                 Ok(UpsertSplitResult2::Single)
             } else {
-                if fbuf.as_ref().header().kind == BNodeKind::Root {
+                if buf.header().kind == BNodeKind::Root {
                     let mut target = flux.buf();
-                    target.as_mut().copy_from_slice(fbuf.as_mut());
+                    target.as_mut().copy_from_slice(buf);
                     root_to_inner(target.as_mut());
 
-                    let ret = upsert_split_inner(&mut target, left, split, right, flux, ctx)
+                    let ret = upsert_split_inner(target.as_mut(), left, split, right, flux, ctx)
                         .await?
                         .write(target, flux, ctx)
                         .await?;
 
                     match ret {
                         PrevUpsertSplitResult::Split(left, split, right) => {
-                            let header = from_bytes_mut::<BNodeRootHeader>(fbuf.as_mut());
+                            let header = from_bytes_mut::<BNodeRootHeader>(buf);
                             header.node.len.set(0);
-                            insert_at_inner(fbuf.as_mut(), 0, left, &split, right);
+                            insert_at_inner(buf, 0, left, &split, right);
                         }
                         _ => {
                             // no-op, should never get here
@@ -307,7 +303,57 @@ async fn upsert_inner<'a, 'b, B: BlockIo>(
 
                     Ok(UpsertSplitResult2::Single)
                 } else {
-                    upsert_split_inner(fbuf, left, split, right, flux, ctx).await
+                    upsert_split_inner(buf, left, split, right, flux, ctx).await
+                }
+            }
+        }
+    }
+}
+
+async fn upsert_root<'a, 'b, B: BlockIo>(
+    split: PrevUpsertSplitResult,
+    search: SearchResult,
+    flux: &mut Flux<B>,
+    ctx: &mut LallocCtx<'a, 'b, B>,
+) -> Result<UpsertSplitResult2> {
+    let search_idx = search.pg_idx();
+
+    match split {
+        PrevUpsertSplitResult::Single(pg_idx) => {
+            write_page_ptr(ctx.root.buf.as_mut(), search_idx, pg_idx);
+            Ok(UpsertSplitResult2::Single)
+        }
+        PrevUpsertSplitResult::Split(left, split, right) => {
+            let can_insert = remaining_bytes(ctx.root.buf.as_ref())
+                > in_pg_size_of::<PgIdxDisk>() + in_pg_len(&split) + in_pg_size_of::<SlotDisk>();
+            if can_insert {
+                insert_at_inner(ctx.root.buf.as_mut(), search_idx, left, &split, right);
+                Ok(UpsertSplitResult2::Single)
+            } else {
+                if ctx.root.buf.as_ref().header().kind == BNodeKind::Root {
+                    let mut target = flux.buf();
+                    target.as_mut().copy_from_slice(ctx.root.buf.as_ref());
+                    root_to_inner(target.as_mut());
+
+                    let ret = upsert_split_inner(target.as_mut(), left, split, right, flux, ctx)
+                        .await?
+                        .write(target, flux, ctx)
+                        .await?;
+
+                    match ret {
+                        PrevUpsertSplitResult::Split(left, split, right) => {
+                            let header = from_bytes_mut::<BNodeRootHeader>(ctx.root.buf.as_mut());
+                            header.node.len.set(0);
+                            insert_at_inner(ctx.root.buf.as_mut(), 0, left, &split, right);
+                        }
+                        _ => {
+                            // no-op, should never get here
+                        }
+                    }
+
+                    Ok(UpsertSplitResult2::Single)
+                } else {
+                    upsert_split_root(left, split, right, flux, ctx).await
                 }
             }
         }
@@ -315,7 +361,7 @@ async fn upsert_inner<'a, 'b, B: BlockIo>(
 }
 
 async fn upsert_split_inner<'a, 'b, B: BlockIo>(
-    left: &mut FluxBuf<B>,
+    left: &mut [u8],
     left_idx: u64,
     split: Box<[u8]>,
     right_idx: u64,
@@ -341,14 +387,58 @@ async fn upsert_split_inner<'a, 'b, B: BlockIo>(
         let insert = if split.as_ref().cmp(get_key_inner(right.as_ref(), 0)) == Ordering::Less {
             left
         } else {
-            &mut right
+            right.as_mut()
         };
 
         let search = search_inner(insert.as_ref(), &split);
         match search {
             SearchResult::Exact(_) => bail!("exact match value should never be promoted"),
             SearchResult::Insert(idx) => {
-                insert_at_inner(insert.as_mut(), idx, left_idx, &split, right_idx);
+                insert_at_inner(insert, idx, left_idx, &split, right_idx);
+            }
+        }
+    }
+
+    let key = get_key_leaf(right.as_ref(), 0).to_vec().into_boxed_slice();
+    let ret_right_idx = flux.write(right, || lalloc(ctx)).await?;
+
+    Ok(UpsertSplitResult2::SplitMut(key, ret_right_idx))
+}
+
+async fn upsert_split_root<'a, 'b, B: BlockIo>(
+    left_idx: u64,
+    split: Box<[u8]>,
+    right_idx: u64,
+    flux: &mut Flux<B>,
+    ctx: &mut LallocCtx<'a, 'b, B>,
+) -> Result<UpsertSplitResult2> {
+    let mut right = flux.buf();
+
+    right.as_mut().header_mut().init(BNodeKind::Inner);
+
+    let len = ctx.root.buf.as_ref().header().len() - 1; // children
+    let mid = len / 2;
+    // move slots [mid .. len-1] and their [ptr|key] blobs to right
+    for idx in mid..len {
+        let key = get_key_inner(ctx.root.buf.as_ref(), idx);
+        let left_ptr = get_page_ptr(ctx.root.buf.as_ref(), idx);
+        let right_ptr = get_page_ptr(ctx.root.buf.as_ref(), idx + 1);
+        insert_at_inner(right.as_mut(), idx - mid, left_ptr, key, right_ptr);
+    }
+    ctx.root.buf.as_mut().header_mut().set_len(mid as u64);
+
+    {
+        let insert = if split.as_ref().cmp(get_key_inner(right.as_ref(), 0)) == Ordering::Less {
+            ctx.root.buf.as_mut()
+        } else {
+            right.as_mut()
+        };
+
+        let search = search_inner(insert.as_ref(), &split);
+        match search {
+            SearchResult::Exact(_) => bail!("exact match value should never be promoted"),
+            SearchResult::Insert(idx) => {
+                insert_at_inner(insert, idx, left_idx, &split, right_idx);
             }
         }
     }
@@ -402,7 +492,7 @@ async fn remove_at_leaf<'a, 'b, B: BlockIo>(
 impl<'a, B: BlockIo> Txn<'a, B> {
     async fn btree_upsert(
         &mut self,
-        dirty: &mut BRootInfo,
+        dirty: &mut BRootInfo<B>,
         key: &[u8],
         value: &[u8],
         root: FluxBuf<B>,
@@ -431,7 +521,7 @@ impl<'a, B: BlockIo> Txn<'a, B> {
 
     async fn btree_upsert_inner(
         &mut self,
-        dirty: &mut BRootInfo,
+        dirty: &mut BRootInfo<B>,
         key: &[u8],
         value: LeafValue<'_>,
         mut pg: FluxBuf<B>,
@@ -481,7 +571,7 @@ impl<'a, B: BlockIo> Txn<'a, B> {
 
     async fn btree_split_inner(
         &mut self,
-        dirty: &mut BRootInfo,
+        dirty: &mut BRootInfo<B>,
         left_idx: u64,
         split: Box<[u8]>,
         right_idx: u64,
@@ -530,7 +620,7 @@ impl<'a, B: BlockIo> Txn<'a, B> {
 
     async fn btree_upsert_leaf(
         &mut self,
-        dirty: &mut BRootInfo,
+        dirty: &mut BRootInfo<B>,
         key: &[u8],
         value: LeafValue<'_>,
         mut pg: FluxBuf<B>,
@@ -592,7 +682,7 @@ impl<'a, B: BlockIo> Txn<'a, B> {
 
     async fn btree_leaf_remove_at(
         &mut self,
-        _dirty: &mut BRootInfo,
+        _dirty: &mut BRootInfo<B>,
         buf: &mut [u8],
         idx: InPgIdx,
     ) -> Result<()> {
@@ -888,7 +978,6 @@ mod tests {
         let defer = Defer::new();
         let mut test_ctx = init_basic_mem_db(&bio, 0, &defer).await?;
         let mut flux = Flux::new(bio.clone());
-        let mut root = flux.read(2).await?;
 
         let mut rng = StdRng::seed_from_u64(192347928);
 
@@ -899,16 +988,9 @@ mod tests {
             for i in 0..10000 {
                 let key = random_alphanumeric_bytes(&mut rng);
                 let value = random_alphanumeric_bytes(&mut rng);
-                upsert(
-                    &key,
-                    LeafValue::Value(&value),
-                    &mut root,
-                    &mut flux,
-                    &mut ctx,
-                )
-                .await?;
+                upsert(&key, LeafValue::Value(&value), &mut flux, &mut ctx).await?;
 
-                if let Some(ret) = get(&key, root.as_ref(), &mut flux).await? {
+                if let Some(ret) = get(&key, ctx.root.buf.as_ref(), &mut flux).await? {
                     if let BtreeGetResult::ValueEmbedded { buf, loc, len } = ret {
                         assert_eq!(&value, &buf.as_ref()[loc..loc + len]);
                     } else {
@@ -919,7 +1001,7 @@ mod tests {
                 }
 
                 {
-                    let header = from_bytes::<BNodeRootHeader>(root.as_ref());
+                    let header = from_bytes::<BNodeRootHeader>(ctx.root.buf.as_ref());
                     assert!(header.node.kind() == BNodeKind::Root);
                     assert!(header.node.len() > 0);
                 }
@@ -930,7 +1012,9 @@ mod tests {
 
         for (key, value) in map {
             if let BtreeGetResult::ValueEmbedded { buf, loc, len } =
-                get(&key, root.as_ref(), &mut flux).await?.unwrap()
+                get(&key, test_ctx.root.buf.as_ref(), &mut flux)
+                    .await?
+                    .unwrap()
             {
                 assert_eq!(&value, &buf.as_ref()[loc..loc + len])
             } else {
