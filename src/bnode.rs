@@ -445,9 +445,10 @@ pub(crate) fn get_key_inner(buf: &[u8], idx: InPgIdx) -> &[u8] {
             - (size_of::<ChecksumDisk>() as InPgIdx))
             - key_idx
     } else {
-        let _test = read_slot(buf, idx - 1);
-        let test2 = (read_slot(buf, idx - 1) - (size_of::<PgIdxDisk>() as InPgIdx)) - key_idx;
-        test2
+        let test = read_slot(buf, idx - 1);
+        let test2 = test - (size_of::<PgIdxDisk>() as InPgIdx);
+        let test3 = test2 - key_idx;
+        test3
     };
 
     let start = key_idx as usize;

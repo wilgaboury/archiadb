@@ -526,7 +526,7 @@ mod tests {
     async fn fuzz_lalloc() -> Result<()> {
         const OPS: usize = 20;
         const ITER: usize = 5;
-        let mut rng = StdRng::seed_from_u64(88369992);
+        let mut rng = StdRng::seed_from_u64(73734852);
 
         for iter in 0..ITER {
             println!("iter: {}", iter);
