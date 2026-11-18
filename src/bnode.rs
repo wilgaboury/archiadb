@@ -69,6 +69,7 @@ pub(crate) enum LeafValueKind {
     ValueLinkedList,
 }
 
+#[derive(Debug)]
 #[repr(C, packed)]
 pub(crate) struct BNodeHeader {
     pub(crate) kind: BNodeKind,
@@ -201,7 +202,7 @@ pub(crate) fn remaining_bytes(buf: &[u8]) -> InPgIdx {
             } else if slots_len == 1 {
                 in_pg_size_of::<ChecksumDisk>() + in_pg_size_of::<PgIdxDisk>()
             } else {
-                in_pg_len(buf) - (in_pg_size_of::<PgIdxDisk>() + read_slot(buf, slots_len - 1))
+                in_pg_len(buf) - (read_slot(buf, slots_len - 1) - in_pg_size_of::<PgIdxDisk>())
             }
         }
         BNodeKind::Leaf => {
@@ -213,8 +214,8 @@ pub(crate) fn remaining_bytes(buf: &[u8]) -> InPgIdx {
         }
     };
 
-    (buf.len() as InPgIdx)
-        - (header.kind.header_size() + slots_len * (size_of::<SlotDisk>() as InPgIdx) + tail_size)
+    in_pg_len(buf)
+        - (header.kind.header_size() + slots_len * in_pg_size_of::<SlotDisk>() + tail_size)
 }
 
 pub(crate) fn root_to_inner(buf: &mut [u8]) {
@@ -420,7 +421,6 @@ pub(crate) fn get_page_ptr(buf: &[u8], idx: InPgIdx) -> PgIdx {
     } else {
         read_slot(buf, idx - 1) - (size_of::<PgIdxDisk>() as InPgIdx)
     };
-
     let start = loc as usize;
     let end = (loc + size_of::<PgIdxDisk>() as InPgIdx) as usize;
     from_bytes::<PgIdxDisk>(&buf[start..end]).get()
@@ -657,6 +657,7 @@ pub(crate) fn get_value_leaf(buf: &[u8], idx: InPgIdx) -> LeafValueGetResult {
     }
 }
 
+#[derive(Debug)]
 pub(crate) enum SearchResult {
     Exact(InPgIdx),
     Insert(InPgIdx),

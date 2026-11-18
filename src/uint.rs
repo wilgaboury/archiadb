@@ -82,6 +82,7 @@ impl U32 {
     }
 }
 
+#[derive(Copy, Clone)]
 #[repr(C, packed)]
 pub(crate) struct U24([u8; 3]);
 
@@ -104,6 +105,11 @@ impl U24 {
     }
 }
 
+impl std::fmt::Debug for U24 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("0").field(&self.get()).finish()
+    }
+}
 #[repr(C, packed)]
 pub(crate) struct U16(u16);
 

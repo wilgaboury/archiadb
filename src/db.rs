@@ -9,7 +9,7 @@ use crate::{
     bnode::BNodeRootHeader,
     defer::{Defer, DeferGuard},
     file::DbFile,
-    flux::{Flux, FluxBuf},
+    flux::Flux,
     galloc::{Galloc, galloc_recover},
     karc::Karc,
     key::{KeyPath, KeyPathBuf},
