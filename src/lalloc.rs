@@ -241,20 +241,17 @@ pub(crate) async fn lalloc<'a, 'd, B: BlockIo>(ctx: &mut LallocCtx<'a, 'd, B>) -
         ctx.root.lalloc.arena = arena;
         ctx.root.lalloc.orig_next = ctx.root.lalloc.arena.next;
         let free = ctx.root.lalloc.arena.pop().unwrap();
-        println!("lallocing: {}", free);
         return Ok(free);
     }
 
     if let Some(free) =
         find_free_idx_and_consume_fl(ctx.defer_guard, ctx.bio, &mut ctx.root.lalloc).await?
     {
-        println!("lallocing: {}", free);
         return Ok(free);
     }
 
     {
         let free = lalloc_from_arena_or_galloc(ctx).await?;
-        println!("lallocing: {}", free);
         Ok(free)
     }
 }

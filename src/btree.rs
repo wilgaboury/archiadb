@@ -973,7 +973,7 @@ mod tests {
                             panic!("value should be emdedded")
                         }
                     } else {
-                        panic!("expected to find value");
+                        panic!("expected to find key: {}", str::from_utf8(key)?);
                     }
                 }
             }
