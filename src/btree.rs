@@ -283,7 +283,7 @@ async fn upsert_inner<'a, 'b, B: BlockIo>(
                 insert_at_inner(buf, search_idx, left, &split, right);
                 Ok(UpsertSplitResult2::Single)
             } else {
-                upsert_split_inner(buf, left, split, right, flux, ctx).await
+                upsert_split_inner(buf, search_idx, left, split, right, flux, ctx).await
             }
         }
     }
@@ -311,10 +311,11 @@ async fn upsert_root<'a, 'b, B: BlockIo>(
                 target.as_mut().copy_from_slice(ctx.root.buf.as_ref());
                 root_to_inner(target.as_mut());
 
-                let ret = upsert_split_inner(target.as_mut(), left, split, right, flux, ctx)
-                    .await?
-                    .write(target, flux, ctx)
-                    .await?;
+                let ret =
+                    upsert_split_inner(target.as_mut(), search_idx, left, split, right, flux, ctx)
+                        .await?
+                        .write(target, flux, ctx)
+                        .await?;
 
                 match ret {
                     PrevUpsertSplitResult::Split(left, split, right) => {
@@ -335,6 +336,7 @@ async fn upsert_root<'a, 'b, B: BlockIo>(
 
 async fn upsert_split_inner<'a, 'b, B: BlockIo>(
     left: &mut [u8],
+    search_idx: InPgIdx,
     left_idx: u64,
     split: Box<[u8]>,
     right_idx: u64,
@@ -357,6 +359,8 @@ async fn upsert_split_inner<'a, 'b, B: BlockIo>(
     left.as_mut().header_mut().set_len(mid as u64);
 
     {
+        // TODO: the bug here is that it just splits and stupidly inserts, needs to actually replace the search pg idx from the path
+
         let insert = if split.as_ref().cmp(get_key_inner(right.as_ref(), 0)) == Ordering::Less {
             left
         } else {
