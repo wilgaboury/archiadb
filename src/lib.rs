@@ -6,6 +6,7 @@ pub mod bll;
 pub mod bnode;
 pub mod btree;
 pub mod db;
+pub mod debug;
 pub mod defer;
 pub mod file;
 pub mod flux;

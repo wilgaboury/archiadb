@@ -1,6 +1,7 @@
 use std::{cmp, collections::HashMap};
 
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     bio::BlockIo,
@@ -58,7 +59,7 @@ pub(crate) fn idxs_per_fl_page(pg_sz: InPgIdx) -> InPgIdx {
         / in_pg_size_of::<PgIdxDisk>()
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub(crate) struct Arena {
     pub(crate) start: PgIdx,
     pub(crate) len: PgIdx,

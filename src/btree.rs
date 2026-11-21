@@ -7,8 +7,8 @@ use crate::{
     bnode::{
         self, BNodeBuf, BNodeHeader, BNodeKind, BNodeRootHeader, LeafValue, LeafValueGetResult,
         SearchResult, SlotDisk, get_key_inner, get_key_leaf, get_page_ptr, get_value_leaf,
-        in_pg_len, in_pg_size_of, insert_at_inner, insert_at_leaf, insert_init_at_inner, read_slot,
-        remaining_bytes, root_to_inner, search_inner, search_leaf, slots_len, write_page_ptr,
+        in_pg_len, in_pg_size_of, insert_at_inner, insert_at_leaf, insert_init_at_inner,
+        remaining_bytes, root_to_inner, search_inner, search_leaf, write_page_ptr,
     },
     db::{BRootInfo, Txn},
     flux::{Flux, FluxBuf},
@@ -184,7 +184,7 @@ async fn upsert<'a, 'b, B: BlockIo>(
 
     let (root_search, mut path) = get_path(key, ctx.root.buf.as_ref(), flux).await?;
 
-    let (leaf_search, leaf_buf) = path.pop().unwrap();
+    let (_leaf_search, leaf_buf) = path.pop().unwrap();
 
     let mut split = upsert_leaf(leaf_buf, key, value, ctx, flux).await?;
 
@@ -747,7 +747,7 @@ mod tests {
         flux::Flux,
         test::init_basic_mem_db,
         uring::MIN_PAGE_SIZE,
-        util::{from_bytes, from_bytes_mut},
+        util::from_bytes_mut,
     };
 
     async fn build_basic_three_level_tree() -> Result<BlockIoMemory> {
@@ -958,14 +958,14 @@ mod tests {
 
         {
             let mut ctx = test_ctx.ctx();
-            for i in 0..10000 {
+            for _i in 0..10000 {
                 let key = random_alphanumeric_bytes(&mut rng);
                 let value = random_alphanumeric_bytes(&mut rng);
                 upsert(&key, LeafValue::Value(&value), &mut flux, &mut ctx).await?;
 
                 map.insert(key, value);
 
-                for (key, value) in map.iter() {
+                for (_i, (key, value)) in map.iter().enumerate() {
                     if let Some(found) = get(&key, ctx.root.buf.as_ref(), &mut flux).await? {
                         if let BtreeGetResult::ValueEmbedded { buf, loc, len } = found {
                             assert_eq!(value, &buf.as_ref()[loc..loc + len])

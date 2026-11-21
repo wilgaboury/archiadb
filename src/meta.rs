@@ -5,6 +5,7 @@ use std::{
 };
 
 use anyhow::{Result, anyhow, bail};
+use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::{
@@ -21,7 +22,7 @@ pub(crate) const MAGIC: MagicType = 0xa90e3b4b1b0833499933888e3933af0d; // Rando
 pub(crate) const NUM_HEADER_PAGES: u64 = 2;
 
 #[repr(u16)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum FmtVer {
     V1 = 0,
 }

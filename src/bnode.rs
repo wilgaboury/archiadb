@@ -1,4 +1,5 @@
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     bio::BlockIo,
@@ -34,7 +35,7 @@ const MAX_KEY_SIZE: usize = 256;
 /// - checksum: u64
 
 #[repr(u8)]
-#[derive(PartialEq, Eq, Debug, Clone, Copy)]
+#[derive(PartialEq, Eq, Debug, Clone, Copy, Serialize, Deserialize)]
 pub(crate) enum BNodeKind {
     Root = 0,
     Inner,

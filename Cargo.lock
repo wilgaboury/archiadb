@@ -79,6 +79,8 @@ dependencies = [
  "rand",
  "rapidhash",
  "rustix 1.1.4",
+ "serde",
+ "serde_json",
  "thiserror 2.0.20",
  "tokio",
  "winit",
@@ -688,6 +690,12 @@ dependencies = [
  "cfg-if",
  "libc",
 ]
+
+[[package]]
+name = "itoa"
+version = "1.0.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3bd1574e617a9a6c1f8f8181bd7e841e1f20e4277607ef28945765188d6284d4"
 
 [[package]]
 name = "jni"
@@ -1437,6 +1445,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
 dependencies = [
  "serde_core",
+ "serde_derive",
 ]
 
 [[package]]
@@ -1457,6 +1466,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.4",
+]
+
+[[package]]
+name = "serde_json"
+version = "1.0.154"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e7e9cc8b1b85264074fbcc02a88680c4096b1e47df8f739dceb03bf482f04bd6"
+dependencies = [
+ "itoa",
+ "memchr",
+ "serde",
+ "serde_core",
+ "zmij",
 ]
 
 [[package]]
@@ -2208,3 +2230,9 @@ dependencies = [
  "quote",
  "syn 2.0.119",
 ]
+
+[[package]]
+name = "zmij"
+version = "1.0.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
