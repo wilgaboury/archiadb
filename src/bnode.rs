@@ -66,8 +66,8 @@ impl BNodeKind {
 #[derive(PartialEq, Eq, Debug, Clone)]
 pub(crate) enum LeafValueKind {
     Btree = 0,
-    ValueEmbedded, // len, value
-    ValueLinkedList,
+    Embedded, // len, value
+    LinkedList,
 }
 
 #[derive(Debug)]
@@ -461,8 +461,8 @@ pub(crate) fn get_key_leaf(buf: &[u8], idx: InPgIdx) -> &[u8] {
     let val_key_idx = read_slot(buf, idx);
     let val_len = 1 + match LeafValueKind::from(buf[val_key_idx as usize]) {
         LeafValueKind::Btree => 2 * (size_of::<PgIdxDisk>() as InPgIdx),
-        LeafValueKind::ValueEmbedded => 1 + (buf[(val_key_idx + 1) as usize] as InPgIdx),
-        LeafValueKind::ValueLinkedList => {
+        LeafValueKind::Embedded => 1 + (buf[(val_key_idx + 1) as usize] as InPgIdx),
+        LeafValueKind::LinkedList => {
             (size_of::<PgIdxDisk>() as InPgIdx) + (size_of::<LinkedListLenDisk>() as InPgIdx)
         }
     };
@@ -543,8 +543,8 @@ impl LeafValueEncoded<'_> {
     pub(crate) fn kind(&self) -> LeafValueKind {
         match self {
             LeafValueEncoded::Btree { .. } => LeafValueKind::Btree,
-            LeafValueEncoded::ValueEmbedded(_) => LeafValueKind::ValueEmbedded,
-            LeafValueEncoded::ValueLinkedList { .. } => LeafValueKind::ValueLinkedList,
+            LeafValueEncoded::ValueEmbedded(_) => LeafValueKind::Embedded,
+            LeafValueEncoded::ValueLinkedList { .. } => LeafValueKind::LinkedList,
         }
     }
 
@@ -582,8 +582,8 @@ impl From<u8> for LeafValueKind {
     fn from(value: u8) -> Self {
         match value {
             0 => LeafValueKind::Btree,
-            1 => LeafValueKind::ValueEmbedded,
-            2 => LeafValueKind::ValueLinkedList,
+            1 => LeafValueKind::Embedded,
+            2 => LeafValueKind::LinkedList,
             _ => panic!("invalid discriminant"),
         }
     }
@@ -639,7 +639,7 @@ pub(crate) fn get_value_leaf(buf: &[u8], idx: InPgIdx) -> LeafValueGetResult {
             let pg_idx_2 = from_bytes::<PgIdxDisk>(&buf[b_idx_2 as usize..]).get();
             LeafValueGetResult::Btree { pg_idx_1, pg_idx_2 }
         }
-        LeafValueKind::ValueEmbedded => {
+        LeafValueKind::Embedded => {
             let len_idx = val_key_idx + 1;
             let len = buf[(val_key_idx + 1) as usize] as usize;
             let value_idx = (len_idx + 1) as usize;
@@ -648,7 +648,7 @@ pub(crate) fn get_value_leaf(buf: &[u8], idx: InPgIdx) -> LeafValueGetResult {
                 len,
             }
         }
-        LeafValueKind::ValueLinkedList => {
+        LeafValueKind::LinkedList => {
             let b_idx_1 = val_key_idx + 1;
             let b_idx_2 = b_idx_1 + in_pg_size_of::<PgIdxDisk>();
             let pg_idx = from_bytes::<PgIdxDisk>(&buf[b_idx_1 as usize..]).get();

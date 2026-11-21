@@ -743,6 +743,7 @@ mod tests {
         bio::{BlockIo, BlockIoMemory, BlockIoRapidHash},
         bnode::{self, BNodeHeader, BNodeKind, BNodeRootHeader, LeafValue, LeafValueEncoded},
         btree::{BtreeGetResult, get, upsert},
+        debug::dumb_log_btree,
         defer::Defer,
         flux::Flux,
         test::init_basic_mem_db,
@@ -962,8 +963,9 @@ mod tests {
                 let key = random_alphanumeric_bytes(&mut rng);
                 let value = random_alphanumeric_bytes(&mut rng);
                 upsert(&key, LeafValue::Value(&value), &mut flux, &mut ctx).await?;
-
                 map.insert(key, value);
+
+                dumb_log_btree("./tdat/tree_log.txt", &ctx.root.buf, &mut flux).await;
 
                 for (_i, (key, value)) in map.iter().enumerate() {
                     if let Some(found) = get(&key, ctx.root.buf.as_ref(), &mut flux).await? {
