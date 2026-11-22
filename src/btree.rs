@@ -347,21 +347,27 @@ async fn upsert_split_inner<'a, 'b, B: BlockIo>(
 
     right.as_mut().header_mut().init(BNodeKind::Inner);
 
-    let len = left.as_ref().header().len() - 1; // children
-    let mid = len / 2;
-    // move slots [mid .. len-1] and their [ptr|key] blobs to right
-    for idx in mid..len {
+    let keys_len = left.as_ref().header().len() - 1; // children
+    let mid_key_idx = keys_len / 2;
+    for idx in (mid_key_idx + 1)..keys_len {
         let key = get_key_inner(left.as_ref(), idx);
         let left_ptr = get_page_ptr(left.as_ref(), idx);
         let right_ptr = get_page_ptr(left.as_ref(), idx + 1);
-        insert_at_inner(right.as_mut(), idx - mid, left_ptr, key, right_ptr);
+        insert_at_inner(
+            right.as_mut(),
+            idx - (mid_key_idx + 1),
+            left_ptr,
+            key,
+            right_ptr,
+        );
     }
-    left.as_mut().header_mut().set_len(mid as u64);
+    let key = get_key_inner(left.as_ref(), mid_key_idx)
+        .to_vec()
+        .into_boxed_slice();
+    left.as_mut().header_mut().set_len(mid_key_idx + 1);
 
     {
-        // TODO: the bug here is that it just splits and stupidly inserts, needs to actually replace the search pg idx from the path
-
-        let insert = if split.as_ref().cmp(get_key_inner(right.as_ref(), 0)) == Ordering::Less {
+        let insert = if split.as_ref().cmp(&key) == Ordering::Less {
             left
         } else {
             right.as_mut()
@@ -376,7 +382,6 @@ async fn upsert_split_inner<'a, 'b, B: BlockIo>(
         }
     }
 
-    let key = get_key_inner(right.as_ref(), 0).to_vec().into_boxed_slice();
     let ret_right_idx = flux.write(right, || lalloc(ctx)).await?;
 
     Ok(UpsertSplitResult2::SplitMut(key, ret_right_idx))
@@ -393,16 +398,24 @@ async fn upsert_split_root<'a, 'b, B: BlockIo>(
 
     right.as_mut().header_mut().init(BNodeKind::Inner);
 
-    let len = ctx.root.buf.as_ref().header().len() - 1; // children
-    let mid = len / 2;
-    // move slots [mid .. len-1] and their [ptr|key] blobs to right
-    for idx in mid..len {
+    let keys_len = ctx.root.buf.as_ref().header().len() - 1; // children
+    let mid_key_idx = keys_len / 2;
+    for idx in (mid_key_idx + 1)..keys_len {
         let key = get_key_inner(ctx.root.buf.as_ref(), idx);
         let left_ptr = get_page_ptr(ctx.root.buf.as_ref(), idx);
         let right_ptr = get_page_ptr(ctx.root.buf.as_ref(), idx + 1);
-        insert_at_inner(right.as_mut(), idx - mid, left_ptr, key, right_ptr);
+        insert_at_inner(
+            right.as_mut(),
+            idx - (mid_key_idx + 1),
+            left_ptr,
+            key,
+            right_ptr,
+        );
     }
-    ctx.root.buf.as_mut().header_mut().set_len(mid as u64);
+    let key = get_key_inner(ctx.root.buf.as_ref(), mid_key_idx)
+        .to_vec()
+        .into_boxed_slice();
+    ctx.root.buf.as_mut().header_mut().set_len(mid_key_idx);
 
     {
         let insert = if split.as_ref().cmp(get_key_inner(right.as_ref(), 0)) == Ordering::Less {
@@ -420,7 +433,6 @@ async fn upsert_split_root<'a, 'b, B: BlockIo>(
         }
     }
 
-    let key = get_key_leaf(right.as_ref(), 0).to_vec().into_boxed_slice();
     let ret_right_idx = flux.write(right, || lalloc(ctx)).await?;
 
     Ok(UpsertSplitResult2::SplitMut(key, ret_right_idx))
@@ -963,24 +975,39 @@ mod tests {
 
         {
             let mut ctx = test_ctx.ctx();
-            for _i in 0..10000 {
+            for i in 0..10000 {
                 let key = random_alphanumeric_bytes(&mut rng);
                 let value = random_alphanumeric_bytes(&mut rng);
                 upsert(&key, LeafValue::Value(&value), &mut flux, &mut ctx).await?;
                 map.insert(key, value);
 
-                dumb_log_btree("./tdat/tree_log.txt", &ctx.root.buf, &mut flux).await;
+                if i >= 9399 {
+                    dumb_log_btree("./tdat/tree_log.txt", &ctx.root.buf, &mut flux).await;
 
-                for (_i, (key, value)) in map.iter().enumerate() {
-                    if let Some(found) = get(&key, ctx.root.buf.as_ref(), &mut flux).await? {
-                        if let BtreeGetResult::ValueEmbedded { buf, loc, len } = found {
-                            assert_eq!(value, &buf.as_ref()[loc..loc + len])
+                    for (_i, (key, value)) in map.iter().enumerate() {
+                        if let Some(found) = get(&key, ctx.root.buf.as_ref(), &mut flux).await? {
+                            if let BtreeGetResult::ValueEmbedded { buf, loc, len } = found {
+                                assert_eq!(value, &buf.as_ref()[loc..loc + len])
+                            } else {
+                                panic!("value should be emdedded")
+                            }
                         } else {
-                            panic!("value should be emdedded")
+                            panic!("expected to find key: {}", str::from_utf8(key)?);
                         }
-                    } else {
-                        panic!("expected to find key: {}", str::from_utf8(key)?);
                     }
+                }
+                println!("{} passed", i);
+            }
+
+            for (_i, (key, value)) in map.iter().enumerate() {
+                if let Some(found) = get(&key, ctx.root.buf.as_ref(), &mut flux).await? {
+                    if let BtreeGetResult::ValueEmbedded { buf, loc, len } = found {
+                        assert_eq!(value, &buf.as_ref()[loc..loc + len])
+                    } else {
+                        panic!("value should be emdedded")
+                    }
+                } else {
+                    panic!("expected to find key: {}", str::from_utf8(key)?);
                 }
             }
         }
