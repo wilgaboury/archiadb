@@ -6,7 +6,6 @@ use crate::{
     bll,
     btree::BtreeGetResult,
     const_assert,
-    db::Txn,
     flux::{Flux, FluxBuf},
     lalloc::{Arena, LallocCtx},
     uint::{InPgIdx, InPgIdxDisk, PgIdx, PgIdxDisk, U24, U64},
@@ -518,27 +517,6 @@ pub(crate) async fn encode_value<'v, 'a, 'b, B: BlockIo>(
     })
 }
 
-impl<'a> LeafValue<'a> {
-    pub async fn encode<B: BlockIo>(self, txn: &mut Txn<'_, B>) -> Result<LeafValueEncoded<'a>> {
-        Ok(match self {
-            LeafValue::Btree { pg_idx_1, pg_idx_2 } => {
-                LeafValueEncoded::Btree { pg_idx_1, pg_idx_2 }
-            }
-            LeafValue::Value(v) => {
-                if v.len() < 256 {
-                    LeafValueEncoded::ValueEmbedded(v)
-                } else {
-                    let pg_idx = txn.create_value_linked_list(v).await?;
-                    LeafValueEncoded::ValueLinkedList {
-                        pg_idx,
-                        len: v.len() as u64,
-                    }
-                }
-            }
-        })
-    }
-}
-
 impl LeafValueEncoded<'_> {
     pub(crate) fn kind(&self) -> LeafValueKind {
         match self {
@@ -725,7 +703,6 @@ pub(crate) fn search_leaf(buf: &[u8], target: &[u8]) -> SearchResult {
 mod tests {
 
     use anyhow::Result;
-    use function_name::named;
 
     use crate::{
         bnode::{
@@ -733,7 +710,6 @@ mod tests {
             get_key_leaf, get_page_ptr, get_value_leaf, insert_at_inner, insert_at_leaf,
             insert_init_inner, remove_at_leaf,
         },
-        test::TmpDir,
         util::{from_bytes, from_bytes_mut},
     };
 
@@ -799,21 +775,6 @@ mod tests {
         assert_eq!(4, get_page_ptr(&node, 1));
         assert_eq!(b"b", get_key_inner(&node, 1));
         assert_eq!(5, get_page_ptr(&node, 2));
-    }
-
-    #[named]
-    #[tokio::test]
-    async fn test_linked_list() -> Result<()> {
-        let dir = TmpDir::new(function_name!())?;
-        let db = dir.db().await?;
-        let mut txn = db.txn().begin().await;
-        let value_len = txn.db.meta.page_size() as usize * 2.5 as usize;
-        let value = vec![1u8; value_len];
-        let mut value_test = vec![0u8; value_len];
-        let pg_idx = txn.create_value_linked_list(&value).await?;
-        txn.read_value_linked_list(pg_idx, &mut value_test).await?;
-        assert_eq!(value, value_test);
-        Ok(())
     }
 
     #[tokio::test]
