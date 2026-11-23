@@ -367,19 +367,18 @@ async fn upsert_split_inner<'a, 'b, B: BlockIo>(
     left.as_mut().header_mut().set_len(mid_key_idx + 1);
 
     {
-        let insert = if split.as_ref().cmp(&key) == Ordering::Less {
-            left
+        let left_len = mid_key_idx + 1;
+        if search_idx < left_len {
+            insert_at_inner(left, search_idx, left_idx, &split, right_idx);
         } else {
-            right.as_mut()
+            insert_at_inner(
+                right.as_mut(),
+                search_idx - left_len,
+                left_idx,
+                &split,
+                right_idx,
+            );
         };
-
-        let search = search_inner(insert.as_ref(), &split);
-        match search {
-            SearchResult::Exact(_) => bail!("exact match value should never be promoted"),
-            SearchResult::Insert(idx) => {
-                insert_at_inner(insert, idx, left_idx, &split, right_idx);
-            }
-        }
     }
 
     let ret_right_idx = flux.write(right, || lalloc(ctx)).await?;
@@ -388,6 +387,7 @@ async fn upsert_split_inner<'a, 'b, B: BlockIo>(
 }
 
 async fn upsert_split_root<'a, 'b, B: BlockIo>(
+    search_idx: InPgIdx,
     left_idx: u64,
     split: Box<[u8]>,
     right_idx: u64,
@@ -418,19 +418,24 @@ async fn upsert_split_root<'a, 'b, B: BlockIo>(
     ctx.root.buf.as_mut().header_mut().set_len(mid_key_idx);
 
     {
-        let insert = if split.as_ref().cmp(get_key_inner(right.as_ref(), 0)) == Ordering::Less {
-            ctx.root.buf.as_mut()
+        let left_len = mid_key_idx + 1;
+        if search_idx < left_len {
+            insert_at_inner(
+                ctx.root.buf.as_mut(),
+                search_idx,
+                left_idx,
+                &split,
+                right_idx,
+            );
         } else {
-            right.as_mut()
+            insert_at_inner(
+                right.as_mut(),
+                search_idx - left_len,
+                left_idx,
+                &split,
+                right_idx,
+            );
         };
-
-        let search = search_inner(insert.as_ref(), &split);
-        match search {
-            SearchResult::Exact(_) => bail!("exact match value should never be promoted"),
-            SearchResult::Insert(idx) => {
-                insert_at_inner(insert, idx, left_idx, &split, right_idx);
-            }
-        }
     }
 
     let ret_right_idx = flux.write(right, || lalloc(ctx)).await?;
@@ -961,7 +966,6 @@ mod tests {
         Ok(())
     }
 
-    #[ignore]
     #[tokio::test]
     async fn upsert_simple_fuzz() -> Result<()> {
         let bio = BlockIoRapidHash::new(BlockIoMemory::new(MIN_PAGE_SIZE));
@@ -975,28 +979,28 @@ mod tests {
 
         {
             let mut ctx = test_ctx.ctx();
-            for i in 0..10000 {
+            for _i in 0..20000 {
                 let key = random_alphanumeric_bytes(&mut rng);
                 let value = random_alphanumeric_bytes(&mut rng);
                 upsert(&key, LeafValue::Value(&value), &mut flux, &mut ctx).await?;
                 map.insert(key, value);
 
-                if i >= 9399 {
-                    dumb_log_btree("./tdat/tree_log.txt", &ctx.root.buf, &mut flux).await;
+                // if i >= 9399 {
+                //     dumb_log_btree("./tdat/tree_log.txt", &ctx.root.buf, &mut flux).await;
 
-                    for (_i, (key, value)) in map.iter().enumerate() {
-                        if let Some(found) = get(&key, ctx.root.buf.as_ref(), &mut flux).await? {
-                            if let BtreeGetResult::ValueEmbedded { buf, loc, len } = found {
-                                assert_eq!(value, &buf.as_ref()[loc..loc + len])
-                            } else {
-                                panic!("value should be emdedded")
-                            }
-                        } else {
-                            panic!("expected to find key: {}", str::from_utf8(key)?);
-                        }
-                    }
-                }
-                println!("{} passed", i);
+                //     for (_i, (key, value)) in map.iter().enumerate() {
+                //         if let Some(found) = get(&key, ctx.root.buf.as_ref(), &mut flux).await? {
+                //             if let BtreeGetResult::ValueEmbedded { buf, loc, len } = found {
+                //                 assert_eq!(value, &buf.as_ref()[loc..loc + len])
+                //             } else {
+                //                 panic!("value should be emdedded")
+                //             }
+                //         } else {
+                //             panic!("expected to find key: {}", str::from_utf8(key)?);
+                //         }
+                //     }
+                // }
+                // println!("{} passed", i);
             }
 
             for (_i, (key, value)) in map.iter().enumerate() {
