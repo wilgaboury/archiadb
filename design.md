@@ -20,8 +20,8 @@ struct DB(Map);
 type Map = BTreeMap<Key, Value>;
 type Key = Box<[u8]>;
 enum Value {
-    Data(Box<[u8]>),
-    Map(Map)
+   Data(Box<[u8]>),
+   Map(Map)
 }
 ```
 
@@ -77,37 +77,55 @@ While typical transactions can be either read or write, they are always strictly
 
 ## IO Layer
 
-ArchiaDB's file IO layer, referred to as FIO, is specifically designed around the io_uring Linux API. Fundamentally, it is responsible for opening a single file and implementing a few notable operations: get page buffer, read page, write page, and commit changes. As may be already obvious, all IO is done via fixed sized blocks which are referred to as pages. ArchiaDB attempts to choose a page size equal to the filesystem block size, but in some cases may choose a multiple of it; regardless, page size does not change for a database file after creation.
+ArchiaDB's transaction processing and persistent data structures are built atop a minimal IO layer API, referred to as BIO (for block input/output). The following is a simplified trait definition:
 
-In order to stay agnostic of async runtime, FIO runs its own background thread for request processing. Each FIO request (read, write, commit) creates a custom future object, then submits the future's waker and operation specific data to a unbounded lock-free queue. The background thread polls this queue, automatically sleeping when there is no work to do, and translates each operation into io_uring requests that are batched, submitted, and reaped, finally the waker is called to notify the async runtime when a given operation is finished.
 
-One notable optimization is that commit operations, which are translated to fsync requests, are temporally batched such that there is only ever one inflight fsync at any given time. This means that IO code throughout the database can make liberal use of commit while only having to be concerned with latency but not magnitude of calls.
+```rust
+trait BlockIo {
+    type Buf: AsMut<[u8]> + AsRef<[u8]>;
 
-Another optimization is use of DMA and pools for zero-copy buffers. FIO registers a fixed number of DMA buffers with io_uring on initialization. A portion of these buffers, equal to the size of the completion queue, are reserved for heap buffer copying, and the rest are used as a zero-copy pool. Page buffers are needed whenever client code requests one for use in a write request or when the background thread needs one for returning read results. First, FIO attempts to hand out what is effectively a pointer to a buffer in the zero-copy pool. However, because client code can hold onto these buffers for indeterminate amounts of time, FIO will fallback to a regular heap allocated buffer when none are available. These heap buffers then have their contents copied into/out of the reserved buffer range. This system ensures that the kernel is always operating on a fixed set of registered buffers, uses zero-copy when possible, and also never blocks CPU-bound work.
+    fn page_size(&self) -> InPgIdx;
+    fn buf(&self) -> Self::Buf;
+    async fn read(&self, pg_idx: PgIdx) -> Result<Self::Buf>;
+    async fn write(&self, pg_idx: PgIdx, buf: Self::Buf) -> Result<()>;
+    // extend the size of a file
+    async fn alloc(&self, size: PgIdx) -> Result<()>;
+    // ensure all previous writes are durable
+    async fn sync(&self) -> Result<()>;
+}
+```
+
+As may be already obvious, all IO is done via fixed sized blocks which are referred to as pages. ArchiaDB attempts to choose a page size equal to the filesystem block size, but in some cases may choose a multiple of it; regardless, page size does not change for a database file after creation.
+
+The default implementation on Linux uses io_uring. In order to stay agnostic of async runtime, BIO runs its own background thread for request processing. Each BIO function creates a custom future object, then submits the future's waker and operation specific data to an unbounded lock-free queue. The background thread polls this queue, automatically sleeping when there is no work to do, and translates each operation into io_uring requests that are batched, submitted, and reaped, finally the waker is called to notify the async runtime when a given operation is finished.
+
+One notable optimization is that sync function calls, which are translated to a fsync requests, are temporally batched such that there is only ever one inflight fsync at any given time. This means that code throughout the database and across parallel tasks execution can liberally call sync without its latency ever being much higher than a stand alone fsync call.
+
+Another optimization is use of DMA and pools for zero-copy buffers. BIO registers a fixed number of DMA buffers with io_uring on initialization. A portion of these buffers, equal to the size of the completion queue, are reserved for heap buffer copying, and the rest are used as a zero-copy pool. Page buffers are needed whenever client code requests one for use in a write request or when the background thread needs one for returning read results. First, BIO attempts to hand out what is effectively a pointer to a buffer in the zero-copy pool. However, because client code can hold onto these buffers for indeterminate amounts of time, BIO will fallback to a regular heap allocated buffer when none are available. These heap buffers then have their contents copied into/out of the reserved buffer range. This system ensures that the kernel is always operating on a fixed set of registered buffers, uses zero-copy when possible, and also never blocks CPU-bound work.
 
 ## Page Allocation
 
 ### Local Allocation
 
-Each B+tree in ArchiaDB maintains its own local allocation system that consists of two components: a list of arenas and a list of free pages.
+Each B+tree in ArchiaDB maintains its own local allocation system that consists of an arena and free list.
 
-Arenas are simple bump allocators, where each one points to a chunk of pages. The free list is simply a list of free page indexes. The most interesting thing about this system is the data is encoded and stored as an on-disk linked list of pages. This linked list is also COW and a pointer is stored in the double buffered B+tree root header. Modifications always are performed starting from the head, so regardless of free list length, write transaction overhead is proportional to the amount of allocation work done.
+The arena is just a simple bump allocator. Each arena points to a contiguous chunk of pages and maintains a pointer separating the allocated section from the free section. The free list is a linked list of pages where each page is itself packed with free page indexes. The most interesting thing about this system is that the linked list is also COW and a pointer to the head is stored in the double buffered B+tree root header. Modifications always are performed starting from the head, so write transaction overhead is proportional to the amount of allocation work done, not the length of the list.
 
 ### Global Allocation
 
-When new B+tree roots are first created or when one runs out of pages in their local allocator, a new arena is created for it by the global allocator which bumps the size of the file. The procedure works like so:
+When B+tree roots are first created or when one runs out of pages in their local allocator, a new arena is allocated for it by the global allocator which bumps the size of the file. The procedure works like so:
 
 1. acquire global alloc lock
 2. falloc, extend file to create new arena
-3. write new file length and B+tree root indexes to meta page
+3. write new file length and global alloc target B+tree to database meta page
 4. fsync
 5. write arena information to B+tree root page
 6. fsync
-7. wipe btree root indexes from meta page
+7. wipe global alloc target B+tree from meta page
 8. fsync
 9. release lock
 
-This dance with the last page data is important for crash recovery, since this process is not committed atomically. A crash that occurs after extending the file but before the new arena has been committed to the B+tree is at risk of leaking a chunk of the file. On startup, if a crash is detected, the recovery process reads the last page. If the checksum is valid and a partial global alloc indicated, it checks the root that it points to and checks that it knows about the arena. If not, the root is updated to complete the allocation.
+These steps and multiple fsyncs are important for crash recovery, since a mutation to both the file size contained in the meta page and the arena data in the B+tree root page cannot be committed atomically. A crash that occurs after extending the file but before the new arena has been written to the B+tree is at risk of leaking a chunk of the file. On startup, this case can be trivially detected by checking if there is a target B+treein the meta page and the global allocation process finished.
 
 ## File Format
 

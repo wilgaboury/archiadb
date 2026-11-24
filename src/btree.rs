@@ -1,5 +1,3 @@
-use std::cmp::Ordering;
-
 use anyhow::{Ok, Result, bail};
 
 use crate::{
@@ -167,7 +165,7 @@ async fn upsert<'a, 'b, B: BlockIo>(
             let header = from_bytes_mut::<BNodeHeader>(buf.as_mut());
             header.init(BNodeKind::Leaf);
 
-            let ret = upsert_leaf(buf, key, value, ctx, flux).await?;
+            let ret = upsert_leaf(SearchResult::Insert(0), buf, key, value, ctx, flux).await?;
             match ret {
                 PrevUpsertSplitResult::Single(child) => {
                     insert_init_at_inner(ctx.root.buf.as_mut(), child);
@@ -183,9 +181,9 @@ async fn upsert<'a, 'b, B: BlockIo>(
 
     let (root_search, mut path) = get_path(key, ctx.root.buf.as_ref(), flux).await?;
 
-    let (_leaf_search, leaf_buf) = path.pop().unwrap();
+    let (leaf_search, leaf_buf) = path.pop().unwrap();
 
-    let mut split = upsert_leaf(leaf_buf, key, value, ctx, flux).await?;
+    let mut split = upsert_leaf(leaf_search, leaf_buf, key, value, ctx, flux).await?;
 
     while !path.is_empty() {
         let (search, mut buf) = path.pop().unwrap();
@@ -201,6 +199,7 @@ async fn upsert<'a, 'b, B: BlockIo>(
 }
 
 async fn upsert_leaf<'a, 'b, B: BlockIo>(
+    search: SearchResult,
     mut fbuf: FluxBuf<B>,
     key: &[u8],
     value: LeafValue<'_>,
@@ -212,11 +211,9 @@ async fn upsert_leaf<'a, 'b, B: BlockIo>(
     let can_insert =
         remaining_bytes(fbuf.as_ref()) > in_pg_len(key) + value.len() + in_pg_size_of::<SlotDisk>();
     if can_insert {
-        let search = search_leaf(fbuf.as_ref(), key);
         if let SearchResult::Exact(idx) = search
             && fbuf.as_ref().header().len() > 0
         {
-            // ignoring underflow during upsert because it's less complicated
             remove_at_leaf(fbuf.as_mut(), idx, flux, ctx).await?;
         }
         insert_at_leaf(fbuf.as_mut(), search.idx(), key, &value);
@@ -238,18 +235,18 @@ async fn upsert_leaf<'a, 'b, B: BlockIo>(
         left.as_mut().header_mut().set_len(start as u64);
 
         {
-            let insert = if key.cmp(get_key_leaf(right.as_ref(), 0)) == Ordering::Less {
-                &mut left
+            let tmp_idx = search.idx();
+            let (idx, insert) = if tmp_idx < start {
+                (tmp_idx, &mut left)
             } else {
-                &mut right
+                (tmp_idx - start, &mut right)
             };
 
-            let search = search_leaf(insert.as_ref(), key);
-            if let SearchResult::Exact(idx) = search {
-                // ignoring underflow during upsert because it's less complicated
+            if let SearchResult::Exact(_) = search {
                 remove_at_leaf(insert.as_mut(), idx, flux, ctx).await?;
             }
-            insert_at_leaf(insert.as_mut(), search.idx(), key, &value);
+
+            insert_at_leaf(insert.as_mut(), idx, key, &value);
         }
 
         let key = get_key_leaf(right.as_ref(), 0).to_vec().into_boxed_slice();
@@ -708,25 +705,27 @@ mod tests {
 
         {
             let mut ctx = test_ctx.ctx();
-            for _i in 0..20000 {
+            for _i in 0..10000 {
                 let key = random_alphanumeric_bytes(&mut rng);
                 let value = random_alphanumeric_bytes(&mut rng);
+
                 upsert(&key, LeafValue::Value(&value), &mut flux, &mut ctx).await?;
+
+                if rng.gen_bool(0.5) {
+                    upsert(&key, LeafValue::Value(&value), &mut flux, &mut ctx).await?;
+                }
+
                 map.insert(key, value);
 
-                // if i >= 9399 {
-                //     dumb_log_btree("./tdat/tree_log.txt", &ctx.root.buf, &mut flux).await;
-
-                //     for (_i, (key, value)) in map.iter().enumerate() {
-                //         if let Some(found) = get(&key, ctx.root.buf.as_ref(), &mut flux).await? {
-                //             if let BtreeGetResult::ValueEmbedded { buf, loc, len } = found {
-                //                 assert_eq!(value, &buf.as_ref()[loc..loc + len])
-                //             } else {
-                //                 panic!("value should be emdedded")
-                //             }
+                // for (_i, (key, value)) in map.iter().enumerate() {
+                //     if let Some(found) = get(&key, ctx.root.buf.as_ref(), &mut flux).await? {
+                //         if let BtreeGetResult::ValueEmbedded { buf, loc, len } = found {
+                //             assert_eq!(value, &buf.as_ref()[loc..loc + len])
                 //         } else {
-                //             panic!("expected to find key: {}", str::from_utf8(key)?);
+                //             panic!("value should be emdedded")
                 //         }
+                //     } else {
+                //         panic!("expected to find key: {}", str::from_utf8(key)?);
                 //     }
                 // }
                 // println!("{} passed", i);
