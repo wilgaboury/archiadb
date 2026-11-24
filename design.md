@@ -35,7 +35,7 @@ In order to understand copy on write (COW) B+trees, it is pertinent to briefly e
 
 This technique is widely employed by persistent immutable data structures. For B+trees, in order to modify leaf nodes which contain all the keys and values, node COW is performed recursively until reaching the root. This results in two roots, one pointing to the previous version and one pointing to a new version that contains the applied modification, but is composed of both new and old nodes.
 
-![path-copying](https://upload.wikimedia.org/wikipedia/commons/5/56/Purely_functional_tree_after.svg?utm_source=en.wikipedia.org&utm_campaign=index&utm_content=original)
+![path-copying](./files/path_copy.svg)
 
 ### Double Buffered Root
 
