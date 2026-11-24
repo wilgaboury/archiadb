@@ -162,16 +162,6 @@ struct MetaPage {
 
 ### B+tree Pages
 
-#### Common B+tree Types
-
-```rust
-#[repr(C, packed)]
-struct Key {
-    len: u8,
-    data: [u8; len]
-}
-```
-
 #### Root
 
 ```rust
@@ -181,16 +171,13 @@ struct BTreeNodeRoot {
     len: u24,
     version: u64,
     free: u40,
-
-    // arena
-    start: u40,
-    len: u24,
-    next: u24,
-
-    slots: [u24] // byte offsets into child_pages_and_keys
+    arena_start: u40,
+    arena_len: u24,
+    arena_next: u24,
+    slots: [u24; max(0,len-1)], // byte offsets into child_pages_and_keys
 
     // remaining data grows backwards from end
-    child_pages_and_keys: [(u40, Key)]
+    child_pages_and_keys: [(u40, [u8])],
     first_child_page: u40
 }
 ```
@@ -202,11 +189,10 @@ struct BTreeNodeRoot {
 struct BTreeNodeInner {
     kind: u8
     len: u24,
-   
-    slots: [u24] // byte offsets into child_pages_and_keys
+    slots: [u24; max(0,len-1)], // byte offsets into child_pages_and_keys
 
     // remaining data grows backwards from end
-    child_pages_and_keys: [(u40, Key)]
+    child_pages_and_keys: [(u40, [u8])],
     first_child_page: u40
 }
 ```
@@ -218,7 +204,7 @@ struct BTreeNodeInner {
 struct BTreeNodeLeaf {
     kind: u8
     len: u24,
-    slots: [u24] // byte offsets into values_and_keys
+    slots: [u24; len], // byte offsets into values_and_keys
 
     // remaining data grows backwards from end
     values_and_keys: [(Value, [u8])]
