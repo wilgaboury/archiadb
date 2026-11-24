@@ -36,4 +36,4 @@ The internal workings are outlined in more detail here: [Design Doc](design.md)
 
 ## Design Intentions
 
-ArchiaDB was designed with an eye towards server-side applications that benefit from dead simple database administration, like those intended for self-hosting, and I believe it offers a compelling feature combination for this use case. However, it is quite simple and immature. For high throughput, high uptime applications, LSM-tree based data stores or traditional OLTP DBMS's are likely worth the increase in complexity.
+ArchiaDB aims to provide concurrent transaction processing capabilities on top of a thin persistent map abstraction. For comparison, it is significantly less complex than SQLite, as it forgoes conveniences like joins, foreign keys, or a query language (parser, planner, optimizer, etc). However, database operations utilize strictly serializable ACID transactions which makes writing business logic fairly intuitive and easy. Additionally, each query has less overhead and users have more control over execution.

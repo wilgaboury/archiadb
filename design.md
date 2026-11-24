@@ -133,6 +133,8 @@ These steps and multiple fsyncs are important for crash recovery, since a mutati
 
 There is really only one main assumption that ArchiaDB makes about the underlying storage device: after an fsync operation, all previously written pages are persisted. Unlike other databases/formats, there is no assumption of properties like atomic single byte write or powersafe overwrite, which makes ArchiaDB a very resilient format.
 
+Each page also reserves 64 bits at the end for a checksum. Whenever a page is read from disk this checksum is validated and an error returned if it is not wrong. Currently, ArchiaDB uses rapidhash V3, with preliminary tests showing that updating and validating page checksums results in about 15% lower throughput than non-checksummed page IO.
+
 ### Integer Types and Page Specs
 
 In order to preserve space without sacrificing too much on future proofing, some integers are encoded in unusual sizes. Notably, page indexes use 40 bit integers and in-page indexes use 24 bit integers. Additionally, all integers are encoded in little endian regardless of platform.
@@ -167,7 +169,7 @@ struct MetaPage {
 ```rust
 #[repr(C, packed)]
 struct BTreeNodeRoot {
-    kind: u8
+    kind: u8,
     len: u24,
     version: u64,
     free: u40,
@@ -187,7 +189,7 @@ struct BTreeNodeRoot {
 ```rust
 #[repr(C, packed)]
 struct BTreeNodeInner {
-    kind: u8
+    kind: u8,
     len: u24,
     slots: [u24; max(0,len-1)], // byte offsets into child_pages_and_keys
 
@@ -202,7 +204,7 @@ struct BTreeNodeInner {
 ```rust
 #[repr(C, packed)]
 struct BTreeNodeLeaf {
-    kind: u8
+    kind: u8,
     len: u24,
     slots: [u24; len], // byte offsets into values_and_keys
 
