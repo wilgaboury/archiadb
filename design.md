@@ -125,7 +125,7 @@ When B+tree roots are first created or when one runs out of pages in their local
 8. fsync
 9. release lock
 
-These steps and multiple fsyncs are important for crash recovery, since a mutation to both the file size contained in the meta page and the arena data in the B+tree root page cannot be committed atomically. A crash that occurs after extending the file but before the new arena has been written to the B+tree is at risk of leaking a chunk of the file. On startup, this case can be trivially detected by checking if there is a target B+treein the meta page and the global allocation process finished.
+These steps and multiple fsyncs are important for crash recovery, since a mutation to both the file size contained in the meta page and the arena data in the B+tree root page cannot be committed atomically. A crash that occurs after extending the file but before the new arena has been written to the B+tree is at risk of leaking a chunk of the file. On startup, this case can be trivially detected by checking if there is a target B+tree in the meta page and the global allocation process finished.
 
 ## File Format
 
@@ -133,10 +133,110 @@ These steps and multiple fsyncs are important for crash recovery, since a mutati
 
 There is really only one main assumption that ArchiaDB makes about the underlying storage device: after an fsync operation, all previously written pages are persisted. Unlike other databases/formats, there is no assumption of properties like atomic single byte write or powersafe overwrite, which makes ArchiaDB a very resilient format.
 
-### Metadata
+### Integer Types and Page Specs
 
-The first two pages of each database file contain metadata and are double buffered just like B+tree roots.
+In order to preserve space without sacrificing too much on future proofing, some integers are encoded in unusual sizes. Notably, page indexes use 40 bit integers and in-page indexes use 24 bit integers. Additionally, all integers are encoded in little endian regardless of platform.
 
-### B+tree
+These specs are not valid rust or code accurate. They are flattened pseudo-rust specifications of each page type's disk layout.
 
-### Allocator List
+### Metadata Pages
+
+The first two pages of each database file contain metadata and are double buffered just like B+tree roots. Since ArchiaDB’s minimum page size is 4kb there is a significant amount of unused space available for future fields.
+
+```rust
+#[repr(C, packed)]
+struct MetaPage {
+    magic: u128,
+    fmt_ver: u16,
+    pg_size: u24,
+    root1: u40,
+    root2: u40,
+    version: u64,
+    open: u8,
+    len: u40,
+    galloc_fidx: u40,
+    galloc_bidx: u40,
+    galloc_len: u40,
+}
+```
+
+### B+tree Pages
+
+#### Common B+tree Types
+
+```rust
+#[repr(C, packed)]
+struct Key {
+    len: u8,
+    data: [u8; len]
+}
+```
+
+#### Root
+
+```rust
+#[repr(C, packed)]
+struct BTreeNodeRoot {
+    kind: u8
+    len: u24,
+    version: u64,
+    free: u40,
+
+    // arena
+    start: u40,
+    len: u24,
+    next: u24,
+
+    slots: [u24] // byte offsets into child_pages_and_keys
+
+    // remaining data grows backwards from end
+    child_pages_and_keys: [(u40, Key)]
+    first_child_page: u40
+}
+```
+
+#### Inner
+
+```rust
+#[repr(C, packed)]
+struct BTreeNodeInner {
+    kind: u8
+    len: u24,
+   
+    slots: [u24] // byte offsets into child_pages_and_keys
+
+    // remaining data grows backwards from end
+    child_pages_and_keys: [(u40, Key)]
+    first_child_page: u40
+}
+```
+
+#### Leaf
+
+```rust
+#[repr(C, packed)]
+struct BTreeNodeLeaf {
+    kind: u8
+    len: u24,
+    slots: [u24] // byte offsets into values_and_keys
+
+    // remaining data grows backwards from end
+    values_and_keys: [(Value, [u8])]
+}
+
+#[repr(C, packed)]
+struct enum Value {
+    BTree {
+        pg_idx_1: u40,
+        pg_idx_2: u40
+    },
+    Small {
+        len: u24,
+        data: [u8; len]
+    },
+    Large {
+        pg_idx: u40, // linked list head
+        len: u40 // in bytes
+    }
+}
+```
