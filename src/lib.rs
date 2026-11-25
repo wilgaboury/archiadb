@@ -6,7 +6,6 @@ pub mod bll;
 pub mod bnode;
 pub mod btree;
 pub mod db;
-pub mod debug;
 pub mod defer;
 pub mod file;
 pub mod flux;
@@ -21,6 +20,10 @@ pub mod trie;
 pub mod uint;
 pub mod uring;
 pub mod util;
+
+#[coverage(off)]
+#[cfg(test)]
+mod debug;
 
 #[coverage(off)]
 #[cfg(test)]
