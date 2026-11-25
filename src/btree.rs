@@ -6,7 +6,7 @@ use crate::{
         self, BNodeBuf, BNodeHeader, BNodeKind, BNodeRootHeader, LeafValue, LeafValueGetResult,
         SearchResult, SlotDisk, get_key_inner, get_key_leaf, get_page_ptr, get_value_leaf,
         in_pg_len, in_pg_size_of, insert_at_inner, insert_at_leaf, insert_init_at_inner,
-        remaining_bytes, root_to_inner, search_inner, search_leaf, write_page_ptr,
+        remaining_bytes, remove_at_inner, root_to_inner, search_inner, search_leaf, write_page_ptr,
     },
     flux::{Flux, FluxBuf},
     lalloc::{LallocCtx, lalloc},
@@ -475,6 +475,58 @@ async fn remove_at_leaf<'a, 'b, B: BlockIo>(
         },
     }
     bnode::remove_at_leaf(leaf_buf, idx);
+
+    Ok(())
+}
+
+async fn delete<'a, 'b, B: BlockIo>(
+    key: &[u8],
+    value: LeafValue<'_>,
+    flux: &mut Flux<B>,
+    ctx: &mut LallocCtx<'a, 'b, B>,
+) -> Result<()> {
+    let (root_search, mut path) = get_path(key, ctx.root.buf.as_ref(), flux).await?;
+
+    let (leaf_search, mut leaf_buf) = path.pop().unwrap();
+
+    remove_at_leaf(leaf_buf.as_mut(), leaf_search.idx(), flux, ctx).await?;
+
+    let mut maybe_pg = if leaf_buf.as_ref().header().len() == 0 {
+        leaf_buf.free(flux, ctx);
+        None
+    } else {
+        Some(flux.write(leaf_buf, || lalloc(ctx)).await?)
+    };
+
+    while !path.is_empty() {
+        let (search, mut buf) = path.pop().unwrap();
+
+        if let Some(pg) = maybe_pg {
+            let cur_pg = get_page_ptr(buf.as_ref(), search.pg_idx());
+            if pg != cur_pg {
+                write_page_ptr(buf.as_mut(), search.pg_idx(), pg);
+            }
+
+            return Ok(());
+        } else {
+            remove_at_inner(buf.as_mut(), search.pg_idx());
+            maybe_pg = if buf.as_ref().header().len() == 0 {
+                buf.free(flux, ctx);
+                None
+            } else {
+                Some(flux.write(buf, || lalloc(ctx)).await?)
+            };
+        }
+    }
+
+    if let Some(pg) = maybe_pg {
+        let cur_pg = get_page_ptr(ctx.root.buf.as_ref(), root_search.pg_idx());
+        if pg != cur_pg {
+            write_page_ptr(ctx.root.buf.as_mut(), root_search.pg_idx(), pg);
+        }
+    } else {
+        remove_at_inner(ctx.root.buf.as_mut(), root_search.pg_idx());
+    }
 
     Ok(())
 }

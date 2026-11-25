@@ -303,6 +303,10 @@ pub(crate) fn insert_at_inner(buf: &mut [u8], idx: InPgIdx, left: PgIdx, key: &[
     }
 }
 
+pub(crate) fn remove_at_inner(buf: &mut [u8], idx: InPgIdx) {
+    todo!("implement")
+}
+
 pub(crate) fn insert_at_leaf(buf: &mut [u8], idx: InPgIdx, key: &[u8], value: &LeafValueEncoded) {
     let header = buf.header();
     let slots_idx = header.kind.header_size();
