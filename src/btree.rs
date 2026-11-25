@@ -481,7 +481,7 @@ async fn remove_at_leaf<'a, 'b, B: BlockIo>(
 
 async fn delete<'a, 'b, B: BlockIo>(
     key: &[u8],
-    value: LeafValue<'_>,
+    _value: LeafValue<'_>,
     flux: &mut Flux<B>,
     ctx: &mut LallocCtx<'a, 'b, B>,
 ) -> Result<()> {

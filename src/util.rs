@@ -18,6 +18,7 @@ use crate::{
     db::DbInner,
     key::{KeyPath, KeyPathBuf},
     key_path,
+    meta::Meta,
     uint::{InPgIdx, PgIdx, U64},
     uring::PageBuf,
 };
@@ -121,6 +122,11 @@ pub(crate) fn order_front_back<V, B: AsRef<[u8]>, F: Fn(&B) -> u64>(
 
 pub(crate) fn btree_header_version<P: AsRef<[u8]>>(pg: &P) -> u64 {
     let root = from_bytes::<BNodeRootHeader>(&pg.as_ref());
+    root.version.get()
+}
+
+pub(crate) fn meta_header_version<P: AsRef<[u8]>>(pg: &P) -> u64 {
+    let root = from_bytes::<Meta>(&pg.as_ref());
     root.version.get()
 }
 

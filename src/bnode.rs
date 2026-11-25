@@ -303,7 +303,7 @@ pub(crate) fn insert_at_inner(buf: &mut [u8], idx: InPgIdx, left: PgIdx, key: &[
     }
 }
 
-pub(crate) fn remove_at_inner(buf: &mut [u8], idx: InPgIdx) {
+pub(crate) fn remove_at_inner(_buf: &mut [u8], _idx: InPgIdx) {
     todo!("implement")
 }
 

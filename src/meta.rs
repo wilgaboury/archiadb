@@ -13,7 +13,10 @@ use crate::{
     const_assert,
     uint::{InPgIdxDisk, PgIdx, PgIdxDisk, U16, U64, U128},
     uring::{MAX_PAGE_SIZE, MIN_PAGE_SIZE, choose_page_size},
-    util::{Checksum, from_bytes, from_bytes_mut, order_front_back, update_checksum},
+    util::{
+        Checksum, from_bytes, from_bytes_mut, meta_header_version, order_front_back,
+        update_checksum,
+    },
 };
 
 pub(crate) type MagicType = u128;
@@ -165,10 +168,8 @@ impl MetaHandler {
             let page_size = Self::read_page_size(&file)?;
             let buf1 = Self::read_buf(&file, page_size, 0)?;
             let buf2 = Self::read_buf(&file, page_size, page_size)?;
-            let (is_first, front, _, mut back) = order_front_back(true, buf1, false, buf2, |pg| {
-                let root = from_bytes::<Meta>(&pg.as_ref());
-                root.version.get()
-            })?;
+            let (is_first, front, _, mut back) =
+                order_front_back(true, buf1, false, buf2, meta_header_version)?;
             back.copy_from_slice(&front);
 
             if from_bytes::<Meta>(&front).magic() != MAGIC {
