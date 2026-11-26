@@ -8,6 +8,7 @@ use std::{
 };
 
 use anyhow::Result;
+use rand::{Rng, RngCore};
 
 use crate::{
     bio::{BlockIo, BlockIoDefault, BlockIoRapidHash},
@@ -363,4 +364,15 @@ pub(crate) async fn validate_reachability_btree_node<B: BlockIo>(
     }
 
     Ok(())
+}
+
+pub(crate) fn shuffle<T, R: RngCore>(vec: &mut [T], rng: &mut R) {
+    if vec.is_empty() {
+        return;
+    }
+
+    for i in 0..(vec.len() - 1) {
+        let j = rng.gen_range(i..vec.len());
+        vec.swap(i, j);
+    }
 }

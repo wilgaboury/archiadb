@@ -127,7 +127,6 @@ impl Lalloc {
     }
 
     pub(crate) fn free_in_mem_page(&mut self, pg_idx: PgIdx) {
-        println!("freeing in mem {}", pg_idx);
         self.free.push(pg_idx);
     }
 
@@ -417,7 +416,7 @@ mod tests {
             FreeListHeader, INIT_ARENA_SIZE, free_on_disk_pg, idxs_per_fl_page, lalloc,
             read_fl_idx, write_fl, write_fl_and_reset,
         },
-        test::{TmpDir, init_basic_mem_db},
+        test::{TmpDir, init_basic_mem_db, shuffle},
         uint::PgIdx,
         uring::MIN_PAGE_SIZE,
         util::{from_bytes, from_bytes_mut},
@@ -684,16 +683,5 @@ mod tests {
         }
 
         Ok(())
-    }
-
-    fn shuffle<T, R: RngCore>(vec: &mut [T], rng: &mut R) {
-        if vec.is_empty() {
-            return;
-        }
-
-        for i in 0..(vec.len() - 1) {
-            let j = rng.gen_range(i..vec.len());
-            vec.swap(i, j);
-        }
     }
 }

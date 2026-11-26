@@ -481,7 +481,6 @@ async fn remove_at_leaf<'a, 'b, B: BlockIo>(
 
 async fn delete<'a, 'b, B: BlockIo>(
     key: &[u8],
-    _value: LeafValue<'_>,
     flux: &mut Flux<B>,
     ctx: &mut LallocCtx<'a, 'b, B>,
 ) -> Result<()> {
@@ -542,10 +541,10 @@ mod tests {
     use crate::{
         bio::{BlockIo, BlockIoMemory, BlockIoRapidHash},
         bnode::{self, BNodeHeader, BNodeKind, BNodeRootHeader, LeafValue, LeafValueEncoded},
-        btree::{BtreeGetResult, get, upsert},
+        btree::{BtreeGetResult, delete, get, upsert},
         defer::Defer,
         flux::Flux,
-        test::{init_basic_mem_db, validate_reachability_db},
+        test::{init_basic_mem_db, shuffle, validate_reachability_db},
         uring::MIN_PAGE_SIZE,
         util::from_bytes_mut,
     };
@@ -798,7 +797,6 @@ mod tests {
 
         flux.flush().await?;
         flux.clear();
-
         validate_reachability_db(&bio).await?;
 
         Ok(())
@@ -826,6 +824,41 @@ mod tests {
                 map.insert(key, value);
             }
         }
+
+        let mut keys = map.keys().map(|v| v.clone()).collect::<Vec<_>>();
+        keys.sort();
+        shuffle(&mut keys, &mut rng);
+
+        {
+            let mut ctx = test_ctx.ctx();
+
+            for i in 0..keys.len() / 2 {
+                let key = &keys[i];
+
+                map.remove(key);
+                delete(key, &mut flux, &mut ctx).await?;
+
+                if let Some(_) = get(key, ctx.root.buf.as_ref(), &mut flux).await? {
+                    panic!("expected key to be gone: {}", str::from_utf8(key)?);
+                }
+            }
+
+            for (_i, (key, value)) in map.iter().enumerate() {
+                if let Some(found) = get(&key, ctx.root.buf.as_ref(), &mut flux).await? {
+                    if let BtreeGetResult::ValueEmbedded { buf, loc, len } = found {
+                        assert_eq!(value, &buf.as_ref()[loc..loc + len])
+                    } else {
+                        panic!("value should be emdedded")
+                    }
+                } else {
+                    panic!("expected to find key: {}", str::from_utf8(key)?);
+                }
+            }
+        }
+
+        flux.flush().await?;
+        flux.clear();
+        validate_reachability_db(&bio).await?;
 
         Ok(())
     }
