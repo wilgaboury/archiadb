@@ -545,7 +545,7 @@ mod tests {
         btree::{BtreeGetResult, get, upsert},
         defer::Defer,
         flux::Flux,
-        test::init_basic_mem_db,
+        test::{init_basic_mem_db, validate_reachability_db},
         uring::MIN_PAGE_SIZE,
         util::from_bytes_mut,
     };
@@ -793,6 +793,37 @@ mod tests {
                 } else {
                     panic!("expected to find key: {}", str::from_utf8(key)?);
                 }
+            }
+        }
+
+        flux.flush().await?;
+        flux.clear();
+
+        validate_reachability_db(&bio).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delete_simple_fuzz() -> Result<()> {
+        let bio = BlockIoRapidHash::new(BlockIoMemory::new(MIN_PAGE_SIZE));
+        let defer = Defer::new();
+        let mut test_ctx = init_basic_mem_db(&bio, 0, &defer).await?;
+        let mut flux = Flux::new(bio.clone());
+
+        let mut rng = StdRng::seed_from_u64(9563820);
+
+        let mut map = HashMap::new();
+
+        {
+            let mut ctx = test_ctx.ctx();
+            for _i in 0..10000 {
+                let key = random_alphanumeric_bytes(&mut rng);
+                let value = random_alphanumeric_bytes(&mut rng);
+
+                upsert(&key, LeafValue::Value(&value), &mut flux, &mut ctx).await?;
+
+                map.insert(key, value);
             }
         }
 

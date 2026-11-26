@@ -303,8 +303,55 @@ pub(crate) fn insert_at_inner(buf: &mut [u8], idx: InPgIdx, left: PgIdx, key: &[
     }
 }
 
-pub(crate) fn remove_at_inner(_buf: &mut [u8], _idx: InPgIdx) {
-    todo!("implement")
+pub(crate) fn remove_at_inner(buf: &mut [u8], idx: InPgIdx) {
+    // TODO: this is not implemented right
+
+    let header = buf.header_mut();
+
+    if header.len.get() == 0 {
+        return;
+    } else if idx == header.len.get() - 1 {
+        header.len.set(header.len.get() - 1);
+        return;
+    }
+
+    let slots_idx = header.kind.header_size();
+    let slots_len = slots_len(buf);
+    let slots_remove_idx = slots_idx + (size_of::<SlotDisk>() as InPgIdx) * idx;
+    let slots_end_idx = slots_idx + (size_of::<SlotDisk>() as InPgIdx) * slots_len;
+
+    let key_pg_end = if idx == 0 {
+        in_pg_len(buf) - in_pg_size_of::<ChecksumDisk>()
+    } else {
+        read_slot(buf, idx - 1)
+    };
+    let key_pg_start = read_slot(buf, idx);
+    let key_pg_len = key_pg_end - key_pg_start;
+    let all_pg_key_start = read_slot(buf, slots_len - 1) - in_pg_size_of::<PgIdxDisk>();
+
+    {
+        let src_start = all_pg_key_start as usize;
+        let src_end = key_pg_start as usize;
+        let dst_start = (all_pg_key_start + key_pg_len) as usize;
+        buf.copy_within(src_start..src_end, dst_start);
+    }
+
+    for i in (idx + 1)..slots_len {
+        let slot_value = read_slot(buf, i);
+        write_slot(buf, i, slot_value + key_pg_len);
+    }
+
+    {
+        let src_start = (slots_remove_idx + (size_of::<SlotDisk>() as InPgIdx)) as usize;
+        let src_end = slots_end_idx as usize;
+        let dst_start = slots_remove_idx as usize;
+        buf.copy_within(src_start..src_end, dst_start);
+    }
+
+    {
+        let header = buf.header_mut();
+        header.set_len(header.len() - 1);
+    }
 }
 
 pub(crate) fn insert_at_leaf(buf: &mut [u8], idx: InPgIdx, key: &[u8], value: &LeafValueEncoded) {
@@ -712,8 +759,10 @@ mod tests {
         bnode::{
             BNodeBuf, BNodeHeader, BNodeKind, BNodeRootHeader, LeafValueEncoded, get_key_inner,
             get_key_leaf, get_page_ptr, get_value_leaf, insert_at_inner, insert_at_leaf,
-            insert_init_inner, remove_at_leaf,
+            insert_init_inner, remove_at_inner, remove_at_leaf,
         },
+        debug::BNodeInner,
+        uring::MIN_PAGE_SIZE,
         util::{from_bytes, from_bytes_mut},
     };
 
@@ -779,6 +828,58 @@ mod tests {
         assert_eq!(4, get_page_ptr(&node, 1));
         assert_eq!(b"b", get_key_inner(&node, 1));
         assert_eq!(5, get_page_ptr(&node, 2));
+    }
+
+    #[test]
+    fn inner_node_remove_test() {
+        let mut node = [0u8; MIN_PAGE_SIZE as usize];
+        {
+            let header = from_bytes_mut::<BNodeHeader>(&mut node);
+            header.init(BNodeKind::Inner);
+        }
+
+        insert_init_inner(&mut node, 1);
+        insert_at_inner(&mut node, 0, 1, b"00000", 2);
+        insert_at_inner(&mut node, 1, 2, b"11111", 3);
+        insert_at_inner(&mut node, 2, 3, b"22222", 4);
+        insert_at_inner(&mut node, 3, 4, b"33333", 5);
+        insert_at_inner(&mut node, 4, 5, b"44444", 6);
+        insert_at_inner(&mut node, 5, 6, b"55555", 7);
+
+        let mut debug = BNodeInner::from(&node[..]);
+
+        remove_at_inner(&mut node, 0);
+        debug.remove_at(0);
+        assert_eq!(debug, BNodeInner::from(&node[..]));
+
+        debug.remove_at(5);
+        remove_at_inner(&mut node, 5);
+        assert_eq!(debug, BNodeInner::from(&node[..]));
+
+        debug.remove_at(3);
+        remove_at_inner(&mut node, 3);
+        assert_eq!(debug, BNodeInner::from(&node[..]));
+
+        debug.remove_at(1);
+        remove_at_inner(&mut node, 1);
+        assert_eq!(debug, BNodeInner::from(&node[..]));
+
+        debug.remove_at(1);
+        remove_at_inner(&mut node, 1);
+        assert_eq!(debug, BNodeInner::from(&node[..]));
+
+        debug.remove_at(1);
+        remove_at_inner(&mut node, 1);
+        assert_eq!(debug, BNodeInner::from(&node[..]));
+
+        debug.remove_at(0);
+        remove_at_inner(&mut node, 0);
+        assert_eq!(debug, BNodeInner::from(&node[..]));
+
+        {
+            let header = from_bytes_mut::<BNodeHeader>(&mut node);
+            assert_eq!(header.len.get(), 0);
+        }
     }
 
     #[tokio::test]

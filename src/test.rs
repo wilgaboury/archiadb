@@ -256,6 +256,9 @@ pub(crate) async fn validate_reachability_db<B: BlockIo>(bio: &B) -> Result<()> 
     let meta = from_bytes::<Meta>(meta_buf.as_ref());
 
     let mut idxs = HashSet::new();
+
+    println!("db len: {}", meta.len.get());
+
     for i in 2..meta.len.get() {
         idxs.insert(i);
     }
@@ -327,7 +330,7 @@ pub(crate) async fn validate_reachability_btree_node<B: BlockIo>(
         crate::bnode::BNodeKind::Inner => {
             for i in 0..header.len.get() {
                 let pg_idx = get_page_ptr(buf.as_ref(), i);
-                validate_reachability_btree_node(bio, pg_idx, idxs).await?;
+                Box::pin(validate_reachability_btree_node(bio, pg_idx, idxs)).await?;
             }
         }
         crate::bnode::BNodeKind::Leaf => {

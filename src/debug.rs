@@ -7,12 +7,12 @@ use crate::{
     bio::BlockIo,
     bnode::{
         self, BNodeKind, BNodeRootHeader, get_key_inner, get_key_leaf, get_page_ptr,
-        get_value_leaf, read_slot, slots_len,
+        get_value_leaf, in_pg_len, in_pg_size_of, read_slot, slots_len,
     },
     flux::Flux,
     lalloc::Arena,
     meta::{FmtVer, MagicType},
-    uint::{InPgIdx, PgIdx},
+    uint::{InPgIdx, InPgIdxDisk, PgIdx, PgIdxDisk},
     util::from_bytes,
 };
 
@@ -57,10 +57,10 @@ pub(crate) struct Meta {
     pub(crate) galloc_len: PgIdx,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct BNodeHeader {
-    kind: BNodeKind,
-    len: InPgIdx,
+    pub(crate) kind: BNodeKind,
+    pub(crate) len: InPgIdx,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,17 +72,42 @@ pub(crate) struct BNodeRoot {
     content: BNodeInnerContent,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct BNodeInner {
-    header: BNodeHeader,
-    content: BNodeInnerContent,
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct BNodeInner {
+    pub(crate) header: BNodeHeader,
+    pub(crate) content: BNodeInnerContent,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct BNodeInnerContent {
-    slots: Vec<InPgIdx>,
-    keys: Vec<Box<[u8]>>,
-    pgs: Vec<InPgIdx>,
+impl BNodeInner {
+    pub(crate) fn remove_at(&mut self, idx: InPgIdx) {
+        if self.header.len == 0 {
+            return;
+        } else if idx == self.header.len - 1 {
+            self.header.len -= 1;
+            self.content.slots.pop();
+            self.content.keys.pop();
+            self.content.pgs.pop();
+            return;
+        } else if idx >= self.header.len {
+            panic!("cannot remove past end");
+        }
+
+        self.header.len -= 1;
+        self.content.slots.remove(idx as usize);
+        let removed_key = self.content.keys.remove(idx as usize);
+        self.content.pgs.remove(idx as usize);
+
+        for i in idx as usize..self.content.slots.len() {
+            self.content.slots[i] += in_pg_len(&removed_key) + in_pg_size_of::<PgIdxDisk>();
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct BNodeInnerContent {
+    pub(crate) slots: Vec<InPgIdx>,
+    pub(crate) keys: Vec<Box<[u8]>>,
+    pub(crate) pgs: Vec<InPgIdx>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
