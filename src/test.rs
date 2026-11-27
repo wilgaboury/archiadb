@@ -266,7 +266,7 @@ pub(crate) async fn validate_reachability_db<B: BlockIo>(bio: &B) -> Result<()> 
         should_be_reachable
     );
 
-    let used_and_free = reach
+    let _used_and_free = reach
         .used
         .intersection(&reach.free)
         .map(|v| *v)

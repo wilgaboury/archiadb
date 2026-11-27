@@ -8,6 +8,7 @@ use crate::{
     bnode::{BNodeRootHeader, in_pg_size_of},
     db::BRootInfo,
     defer::DeferGuard,
+    flux::Flux,
     galloc::{Galloc, GallocCtx, galloc},
     key::KeyPathBuf,
     meta::MetaHandler,
@@ -164,6 +165,7 @@ impl Lalloc {
 
 pub(crate) async fn write_fl<'a, 'd, B: BlockIo>(
     ctx: &mut LallocCtx<'a, 'd, B>,
+    flux: &mut Flux<B>,
 ) -> Result<Option<PgIdx>> {
     // NOTE: this function could be more complicated and do proper ordering of deferred/free pg idxs for better effiecency
 
@@ -181,13 +183,15 @@ pub(crate) async fn write_fl<'a, 'd, B: BlockIo>(
             && (!ctx.root.lalloc.deferred.is_empty() || !ctx.root.lalloc.free.is_empty())
         {
             let free_idx = ctx.root.lalloc.pop_deferred_then_free().unwrap();
+            println!("popping onto fl: {}", free_idx);
             write_fl_idx(buf.as_mut(), i, free_idx);
             i += 1;
         }
         if i < idxs_per {
             term_fl(buf.as_mut(), i);
         }
-        ctx.bio.write(n_pg_idx, buf).await?;
+
+        flux.write_at(n_pg_idx, buf);
         next = n_pg_idx;
     }
 
@@ -196,8 +200,13 @@ pub(crate) async fn write_fl<'a, 'd, B: BlockIo>(
 
 pub(crate) async fn write_fl_and_reset<'a, 'd, B: BlockIo>(
     ctx: &mut LallocCtx<'a, 'd, B>,
+    flux: &mut Flux<B>,
 ) -> Result<()> {
-    ctx.root.lalloc.clean = write_fl(ctx).await?;
+    let free = write_fl(ctx, flux).await?;
+    let header = from_bytes_mut::<BNodeRootHeader>(ctx.root.buf.as_mut());
+    header.free.set(free.unwrap_or(0));
+
+    ctx.root.lalloc.clean = free;
     ctx.root.lalloc.orig_next = ctx.root.lalloc.arena.next;
 
     Ok(())
@@ -404,13 +413,13 @@ mod tests {
 
     use anyhow::Result;
     use function_name::named;
-    use rand::{Rng, RngCore, SeedableRng, rngs::StdRng};
+    use rand::{Rng, SeedableRng, rngs::StdRng};
 
     use crate::{
         bio::{BlockIo, BlockIoMemory, BlockIoRapidHash},
         bnode::BNodeRootHeader,
-        db::{BRootInfo, Txn},
         defer::Defer,
+        flux::Flux,
         key_path,
         lalloc::{
             FreeListHeader, INIT_ARENA_SIZE, free_on_disk_pg, idxs_per_fl_page, lalloc,
@@ -422,21 +431,6 @@ mod tests {
         util::{from_bytes, from_bytes_mut},
     };
 
-    impl<'a, B: BlockIo> Txn<'a, B> {
-        pub(crate) async fn lalloc<'b>(&'b mut self, root: &'b mut BRootInfo<B>) -> Result<PgIdx> {
-            lalloc(&mut self.to_lalloc_ctx(root)).await
-        }
-
-        pub(crate) async fn write_fl<'b>(
-            &'b mut self,
-            root: &'b mut BRootInfo<B>,
-        ) -> Result<PgIdx> {
-            write_fl(&mut self.to_lalloc_ctx(root))
-                .await
-                .map(|idx| idx.unwrap_or(0))
-        }
-    }
-
     #[named]
     #[tokio::test]
     async fn test_single_encode_arena() -> Result<()> {
@@ -445,24 +439,26 @@ mod tests {
         let bio = &db.inner.bio;
         let mut txn = db.txn().write(key_path![])?.begin().await;
         let mut root = txn.create_root_root_info().await?;
-        assert_eq!(4, txn.lalloc(&mut root).await?);
+        let mut ctx = txn.to_lalloc_ctx(&mut root);
+
+        assert_eq!(4, lalloc(&mut ctx).await?);
 
         {
-            assert_eq!(3, root.fb.front());
-            assert_eq!(2, root.fb.back());
+            assert_eq!(3, ctx.root.fb.front());
+            assert_eq!(2, ctx.root.fb.back());
         }
 
-        assert_eq!(5, txn.lalloc(&mut root).await?);
-        assert_eq!(6, txn.lalloc(&mut root).await?);
-        assert_eq!(7, txn.lalloc(&mut root).await?);
-        assert_eq!(8, txn.lalloc(&mut root).await?);
-        assert_eq!(9, txn.lalloc(&mut root).await?);
-        assert_eq!(10, txn.lalloc(&mut root).await?);
+        assert_eq!(5, lalloc(&mut ctx).await?);
+        assert_eq!(6, lalloc(&mut ctx).await?);
+        assert_eq!(7, lalloc(&mut ctx).await?);
+        assert_eq!(8, lalloc(&mut ctx).await?);
+        assert_eq!(9, lalloc(&mut ctx).await?);
+        assert_eq!(10, lalloc(&mut ctx).await?);
 
-        let root_buf = bio.read(root.fb.front()).await?;
+        let root_buf = bio.read(ctx.root.fb.front()).await?;
         let header = from_bytes::<BNodeRootHeader>(root_buf.as_ref());
         let start_version = header.version.get();
-        assert_eq!(12, txn.lalloc(&mut root).await?);
+        assert_eq!(12, lalloc(&mut ctx).await?);
 
         assert_eq!(2, root.fb.front());
         assert_eq!(3, root.fb.back());
@@ -497,20 +493,23 @@ mod tests {
         let bio = &db.inner.bio;
         let mut txn = db.txn().write(key_path![])?.begin().await;
         let mut root = txn.create_root_root_info().await?;
+        let (mut ctx, flux) = txn.to_lalloc_ctx_and_flux(&mut root);
 
-        let free = txn.write_fl(&mut root).await?;
-        assert_eq!(0, free);
+        let free = write_fl(&mut ctx, flux).await?;
+        assert_eq!(None, free);
 
-        assert_eq!(4, txn.lalloc(&mut root).await?);
-        assert_eq!(5, txn.lalloc(&mut root).await?);
-        free_on_disk_pg(&mut root.lalloc, &mut txn.defer_guard, 4);
-        free_on_disk_pg(&mut root.lalloc, &mut txn.defer_guard, 5);
+        assert_eq!(4, lalloc(&mut ctx).await?);
+        assert_eq!(5, lalloc(&mut ctx).await?);
 
-        let free = txn.write_fl(&mut root).await?;
-        assert_eq!(6, free);
+        free_on_disk_pg(&mut ctx.root.lalloc, &mut ctx.defer_guard, 4);
+        free_on_disk_pg(&mut ctx.root.lalloc, &mut ctx.defer_guard, 5);
+
+        let free = write_fl(&mut ctx, flux).await?;
+        assert_eq!(Some(6), free);
+        flux.flush().await?;
         bio.sync().await?;
 
-        let fl_buf = bio.read(free).await?;
+        let fl_buf = bio.read(free.unwrap()).await?;
         assert_eq!(0, from_bytes::<FreeListHeader>(fl_buf.as_ref()).next.get());
         assert_eq!(5, read_fl_idx(fl_buf.as_ref(), 0));
         assert_eq!(4, read_fl_idx(fl_buf.as_ref(), 1));
@@ -541,6 +540,7 @@ mod tests {
 
             let bio = BlockIoRapidHash::new(BlockIoMemory::new(MIN_PAGE_SIZE));
             let defer = Defer::new();
+            let mut flux = Flux::new(bio.clone());
             let mut test_ctx = init_basic_mem_db(&bio, 0, &defer).await?;
 
             for _op_iter in 0..OPS {
@@ -599,7 +599,8 @@ mod tests {
                         {
                             let mut ctx = test_ctx.ctx();
 
-                            write_fl_and_reset(&mut ctx).await?;
+                            write_fl_and_reset(&mut ctx, &mut flux).await?;
+                            flux.flush().await?;
 
                             let header = from_bytes_mut::<BNodeRootHeader>(ctx.root.buf.as_mut());
                             header.arena.from(&ctx.root.lalloc.arena);

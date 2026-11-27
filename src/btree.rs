@@ -544,6 +544,7 @@ mod tests {
         btree::{BtreeGetResult, delete, get, upsert},
         defer::Defer,
         flux::Flux,
+        lalloc::write_fl_and_reset,
         test::{init_basic_mem_db, shuffle, validate_reachability_db},
         uring::MIN_PAGE_SIZE,
         util::from_bytes_mut,
@@ -795,8 +796,19 @@ mod tests {
             }
         }
 
-        flux.flush().await?;
-        flux.clear();
+        {
+            let mut ctx = test_ctx.ctx();
+            write_fl_and_reset(&mut ctx, &mut flux).await?;
+            flux.flush().await?;
+            flux.clear();
+
+            let header = from_bytes_mut::<BNodeRootHeader>(&mut ctx.root.buf);
+            header.version.set(header.version.get() + 1);
+            let mut buf = bio.buf();
+            buf.copy_from_slice(&mut ctx.root.buf);
+            bio.write(ctx.root.fb.back(), buf).await?;
+        }
+
         validate_reachability_db(&bio).await?;
 
         Ok(())

@@ -94,11 +94,15 @@ impl<B: BlockIo> Flux<B> {
         } else {
             alloc().await?
         };
+        self.write_at(idx, buf);
+        Ok(idx)
+    }
+
+    pub(crate) fn write_at(&mut self, idx: PgIdx, buf: B::Buf) {
         self.inner
             .borrow_mut()
             .map
             .insert(idx, FluxMapValue::Owned(buf));
-        Ok(idx)
     }
 
     pub(crate) async fn flush(&mut self) -> Result<()> {

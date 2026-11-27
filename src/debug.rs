@@ -12,7 +12,7 @@ use crate::{
     flux::Flux,
     lalloc::Arena,
     meta::{FmtVer, MagicType},
-    uint::{InPgIdx, InPgIdxDisk, PgIdx, PgIdxDisk},
+    uint::{InPgIdx, PgIdx, PgIdxDisk},
     util::from_bytes,
 };
 
