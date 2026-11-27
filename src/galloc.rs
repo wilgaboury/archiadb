@@ -33,7 +33,7 @@ pub(crate) struct GallocCtx<'a, B: BlockIo> {
 
 pub(crate) async fn galloc<'a, B: BlockIo>(ctx: GallocCtx<'a, B>, len: PgIdx) -> Result<Arena> {
     let _gaurd = ctx.galloc.lock.lock().await;
-    galloc_no_lock(ctx.meta, ctx.bio, ctx.fb, ctx.root_buf.as_mut(), len).await
+    galloc_no_lock(ctx.meta, ctx.bio, ctx.fb, ctx.root_buf, len).await
 }
 
 pub(crate) async fn galloc_no_lock<B: BlockIo>(
@@ -63,8 +63,8 @@ pub(crate) async fn galloc_no_lock<B: BlockIo>(
     let mut tmp_buf = bio.buf();
     tmp_buf.as_mut().copy_from_slice(root_buf.as_ref());
     bio.write(fb.back(), tmp_buf).await?;
-    bio.sync().await?;
     fb.flip();
+    bio.sync().await?;
 
     meta.mutate_async(bio, |meta| {
         meta.len.set(flen);

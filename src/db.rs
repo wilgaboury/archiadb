@@ -14,7 +14,7 @@ use crate::{
     karc::Karc,
     key::{KeyPath, KeyPathBuf},
     key_path,
-    lalloc::{Arena, Lalloc, LallocCtx},
+    lalloc::{Lalloc, LallocCtx},
     lock::{Lock, LockGuard, LockType},
     meta::MetaHandler,
     trie::KeyTrie,
@@ -166,15 +166,22 @@ impl<'a, B: BlockIo> TxnBuilder<'a, B> {
 
 pub(crate) struct BRootInfo<B: BlockIo> {
     pub(crate) fb: FrontBack,
-    pub(crate) buf: B::Buf,
+    pub(crate) buf_next: B::Buf,
+    pub(crate) buf_cur: Box<[u8]>,
     pub(crate) lalloc: Lalloc,
 }
 
 impl<B: BlockIo> BRootInfo<B> {
-    pub fn new(fb: FrontBack, buf: B::Buf, arena: Arena) -> Self {
+    pub fn new(fb: FrontBack, cur: B::Buf) -> Self {
+        let mut buf_cur = vec![0; cur.as_ref().len()].into_boxed_slice();
+        buf_cur.copy_from_slice(cur.as_ref());
+
+        let arena = from_bytes::<BNodeRootHeader>(cur.as_ref()).arena.to_mem();
+
         Self {
             fb,
-            buf,
+            buf_next: cur,
+            buf_cur,
             lalloc: Lalloc::new(arena),
         }
     }
@@ -235,8 +242,7 @@ impl<'a, B: BlockIo> Txn<'a, B> {
         let (pg_idx_1, pg1, pg_idx_2, _pg2) =
             read_root_w_retry(self.db, key, pg_idx_1, pg_idx_2, Duration::from_secs(1)).await?;
         let fb = FrontBack::new(pg_idx_1, pg_idx_2);
-        let arena = from_bytes::<BNodeRootHeader>(pg1.as_ref()).arena.to_mem();
-        Ok(BRootInfo::new(fb, self.db.bio.read(pg_idx_1).await?, arena))
+        Ok(BRootInfo::new(fb, pg1))
     }
 
     pub(crate) async fn traverse_to(&self, key: &KeyPath) -> Result<(PgIdx, PgIdx)> {

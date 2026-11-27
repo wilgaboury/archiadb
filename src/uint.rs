@@ -22,6 +22,7 @@ impl U128 {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C, packed)]
 pub(crate) struct U64(u64);
 

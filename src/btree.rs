@@ -155,11 +155,11 @@ async fn upsert<'a, 'b, B: BlockIo>(
     flux: &mut Flux<B>,
     ctx: &mut LallocCtx<'a, 'b, B>,
 ) -> Result<()> {
-    assert!(ctx.root.buf.as_ref().header().kind == BNodeKind::Root);
+    assert!(ctx.root.buf_next.as_ref().header().kind == BNodeKind::Root);
 
     // new btree, empty root node
     {
-        let header = from_bytes_mut::<BNodeRootHeader>(ctx.root.buf.as_mut());
+        let header = from_bytes_mut::<BNodeRootHeader>(ctx.root.buf_next.as_mut());
         if header.node.len() == 0 {
             let mut buf = flux.buf();
             let header = from_bytes_mut::<BNodeHeader>(buf.as_mut());
@@ -168,7 +168,7 @@ async fn upsert<'a, 'b, B: BlockIo>(
             let ret = upsert_leaf(SearchResult::Insert(0), buf, key, value, ctx, flux).await?;
             match ret {
                 PrevUpsertSplitResult::Single(child) => {
-                    insert_init_at_inner(ctx.root.buf.as_mut(), child);
+                    insert_init_at_inner(ctx.root.buf_next.as_mut(), child);
                 }
                 _ => {
                     // no-op - new empty node, should never split
@@ -179,7 +179,7 @@ async fn upsert<'a, 'b, B: BlockIo>(
         }
     }
 
-    let (root_search, mut path) = get_path(key, ctx.root.buf.as_ref(), flux).await?;
+    let (root_search, mut path) = get_path(key, ctx.root.buf_next.as_ref(), flux).await?;
 
     let (leaf_search, leaf_buf) = path.pop().unwrap();
 
@@ -295,16 +295,16 @@ async fn upsert_root<'a, 'b, B: BlockIo>(
 
     match split {
         PrevUpsertSplitResult::Single(pg_idx) => {
-            write_page_ptr(ctx.root.buf.as_mut(), search_idx, pg_idx);
+            write_page_ptr(ctx.root.buf_next.as_mut(), search_idx, pg_idx);
         }
         PrevUpsertSplitResult::Split(left, split, right) => {
-            let can_insert = remaining_bytes(ctx.root.buf.as_ref())
+            let can_insert = remaining_bytes(ctx.root.buf_next.as_ref())
                 > in_pg_size_of::<PgIdxDisk>() + in_pg_len(&split) + in_pg_size_of::<SlotDisk>();
             if can_insert {
-                insert_at_inner(ctx.root.buf.as_mut(), search_idx, left, &split, right);
+                insert_at_inner(ctx.root.buf_next.as_mut(), search_idx, left, &split, right);
             } else {
                 let mut target = flux.buf();
-                target.as_mut().copy_from_slice(ctx.root.buf.as_ref());
+                target.as_mut().copy_from_slice(ctx.root.buf_next.as_ref());
                 root_to_inner(target.as_mut());
 
                 let ret =
@@ -315,9 +315,9 @@ async fn upsert_root<'a, 'b, B: BlockIo>(
 
                 match ret {
                     PrevUpsertSplitResult::Split(left, split, right) => {
-                        let header = from_bytes_mut::<BNodeRootHeader>(ctx.root.buf.as_mut());
+                        let header = from_bytes_mut::<BNodeRootHeader>(ctx.root.buf_next.as_mut());
                         header.node.len.set(0);
-                        insert_at_inner(ctx.root.buf.as_mut(), 0, left, &split, right);
+                        insert_at_inner(ctx.root.buf_next.as_mut(), 0, left, &split, right);
                     }
                     _ => {
                         // no-op, should never get here
@@ -394,12 +394,12 @@ async fn upsert_split_root<'a, 'b, B: BlockIo>(
 
     right.as_mut().header_mut().init(BNodeKind::Inner);
 
-    let keys_len = ctx.root.buf.as_ref().header().len() - 1; // children
+    let keys_len = ctx.root.buf_next.as_ref().header().len() - 1; // children
     let mid_key_idx = keys_len / 2;
     for idx in (mid_key_idx + 1)..keys_len {
-        let key = get_key_inner(ctx.root.buf.as_ref(), idx);
-        let left_ptr = get_page_ptr(ctx.root.buf.as_ref(), idx);
-        let right_ptr = get_page_ptr(ctx.root.buf.as_ref(), idx + 1);
+        let key = get_key_inner(ctx.root.buf_next.as_ref(), idx);
+        let left_ptr = get_page_ptr(ctx.root.buf_next.as_ref(), idx);
+        let right_ptr = get_page_ptr(ctx.root.buf_next.as_ref(), idx + 1);
         insert_at_inner(
             right.as_mut(),
             idx - (mid_key_idx + 1),
@@ -408,16 +408,16 @@ async fn upsert_split_root<'a, 'b, B: BlockIo>(
             right_ptr,
         );
     }
-    let key = get_key_inner(ctx.root.buf.as_ref(), mid_key_idx)
+    let key = get_key_inner(ctx.root.buf_next.as_ref(), mid_key_idx)
         .to_vec()
         .into_boxed_slice();
-    ctx.root.buf.as_mut().header_mut().set_len(mid_key_idx);
+    ctx.root.buf_next.as_mut().header_mut().set_len(mid_key_idx);
 
     {
         let left_len = mid_key_idx + 1;
         if search_idx < left_len {
             insert_at_inner(
-                ctx.root.buf.as_mut(),
+                ctx.root.buf_next.as_mut(),
                 search_idx,
                 left_idx,
                 &split,
@@ -484,7 +484,7 @@ async fn delete<'a, 'b, B: BlockIo>(
     flux: &mut Flux<B>,
     ctx: &mut LallocCtx<'a, 'b, B>,
 ) -> Result<()> {
-    let (root_search, mut path) = get_path(key, ctx.root.buf.as_ref(), flux).await?;
+    let (root_search, mut path) = get_path(key, ctx.root.buf_next.as_ref(), flux).await?;
 
     let (leaf_search, mut leaf_buf) = path.pop().unwrap();
 
@@ -519,12 +519,12 @@ async fn delete<'a, 'b, B: BlockIo>(
     }
 
     if let Some(pg) = maybe_pg {
-        let cur_pg = get_page_ptr(ctx.root.buf.as_ref(), root_search.pg_idx());
+        let cur_pg = get_page_ptr(ctx.root.buf_next.as_ref(), root_search.pg_idx());
         if pg != cur_pg {
-            write_page_ptr(ctx.root.buf.as_mut(), root_search.pg_idx(), pg);
+            write_page_ptr(ctx.root.buf_next.as_mut(), root_search.pg_idx(), pg);
         }
     } else {
-        remove_at_inner(ctx.root.buf.as_mut(), root_search.pg_idx());
+        remove_at_inner(ctx.root.buf_next.as_mut(), root_search.pg_idx());
     }
 
     Ok(())
@@ -544,8 +544,7 @@ mod tests {
         btree::{BtreeGetResult, delete, get, upsert},
         defer::Defer,
         flux::Flux,
-        lalloc::write_fl_and_reset,
-        test::{init_basic_mem_db, shuffle, validate_reachability_db},
+        test::{commit_btree_root, init_basic_mem_db, shuffle, validate_reachability_db},
         uring::MIN_PAGE_SIZE,
         util::from_bytes_mut,
     };
@@ -784,7 +783,7 @@ mod tests {
             }
 
             for (_i, (key, value)) in map.iter().enumerate() {
-                if let Some(found) = get(&key, ctx.root.buf.as_ref(), &mut flux).await? {
+                if let Some(found) = get(&key, ctx.root.buf_next.as_ref(), &mut flux).await? {
                     if let BtreeGetResult::ValueEmbedded { buf, loc, len } = found {
                         assert_eq!(value, &buf.as_ref()[loc..loc + len])
                     } else {
@@ -796,17 +795,11 @@ mod tests {
             }
         }
 
+        validate_reachability_db(&bio).await?;
+
         {
             let mut ctx = test_ctx.ctx();
-            write_fl_and_reset(&mut ctx, &mut flux).await?;
-            flux.flush().await?;
-            flux.clear();
-
-            let header = from_bytes_mut::<BNodeRootHeader>(&mut ctx.root.buf);
-            header.version.set(header.version.get() + 1);
-            let mut buf = bio.buf();
-            buf.copy_from_slice(&mut ctx.root.buf);
-            bio.write(ctx.root.fb.back(), buf).await?;
+            commit_btree_root(&mut ctx, &mut flux).await?;
         }
 
         validate_reachability_db(&bio).await?;
@@ -850,13 +843,13 @@ mod tests {
                 map.remove(key);
                 delete(key, &mut flux, &mut ctx).await?;
 
-                if let Some(_) = get(key, ctx.root.buf.as_ref(), &mut flux).await? {
+                if let Some(_) = get(key, ctx.root.buf_next.as_ref(), &mut flux).await? {
                     panic!("expected key to be gone: {}", str::from_utf8(key)?);
                 }
             }
 
             for (_i, (key, value)) in map.iter().enumerate() {
-                if let Some(found) = get(&key, ctx.root.buf.as_ref(), &mut flux).await? {
+                if let Some(found) = get(&key, ctx.root.buf_next.as_ref(), &mut flux).await? {
                     if let BtreeGetResult::ValueEmbedded { buf, loc, len } = found {
                         assert_eq!(value, &buf.as_ref()[loc..loc + len])
                     } else {
@@ -868,8 +861,11 @@ mod tests {
             }
         }
 
-        flux.flush().await?;
-        flux.clear();
+        validate_reachability_db(&bio).await?;
+        {
+            let mut ctx = test_ctx.ctx();
+            commit_btree_root(&mut ctx, &mut flux).await?;
+        }
         validate_reachability_db(&bio).await?;
 
         Ok(())

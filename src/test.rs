@@ -16,8 +16,9 @@ use crate::{
     db::{BRootInfo, Db},
     defer::{Defer, DeferGuard},
     file::DbFile,
+    flux::Flux,
     galloc::Galloc,
-    lalloc::{Arena, FreeListHeader, LallocCtx, idxs_per_fl_page, read_fl_idx},
+    lalloc::{Arena, FreeListHeader, LallocCtx, idxs_per_fl_page, read_fl_idx, write_fl_and_reset},
     meta::{Meta, MetaHandler},
     uint::{PgIdx, PgIdxDisk},
     uring::BlockIoUring,
@@ -245,7 +246,7 @@ pub(crate) async fn init_basic_mem_db<'a, B: BlockIo>(
         meta: MetaHandler::from_bio(bio).await?,
         bio: bio.clone(),
         defer_guard: defer.begin(),
-        root: BRootInfo::new(FrontBack::new(2, 3), root_buf, arena.clone()),
+        root: BRootInfo::new(FrontBack::new(2, 3), root_buf),
     })
 }
 
@@ -260,23 +261,23 @@ pub(crate) async fn validate_reachability_db<B: BlockIo>(bio: &B) -> Result<()> 
     let all = (0..reach.len).collect::<HashSet<PgIdx>>();
     let mut should_be_reachable = all.difference(&reachable).map(|v| *v).collect::<Vec<_>>();
     should_be_reachable.sort();
+
     assert!(
         should_be_reachable.is_empty(),
         "should be reachable: {:?}",
         should_be_reachable
     );
 
-    let _used_and_free = reach
+    let used_and_free = reach
         .used
         .intersection(&reach.free)
         .map(|v| *v)
         .collect::<Vec<PgIdx>>();
-    // TODO: fix tests that this is failing
-    // assert!(
-    //     used_and_free.is_empty(),
-    //     "in both used and free: {:?}",
-    //     used_and_free
-    // );
+    assert!(
+        used_and_free.is_empty(),
+        "in both used and free: {:?}",
+        used_and_free
+    );
 
     Ok(())
 }
@@ -330,8 +331,12 @@ pub(crate) async fn analyze_reachability_btree_root<B: BlockIo>(
 
     let root = from_bytes::<BNodeRootHeader>(root_buf.as_ref());
 
-    for i in root.arena.next.get()..root.arena.start.get() + root.arena.len.get() {
-        reach.free.insert(i);
+    if root.arena.is_valid() {
+        let start = root.arena.start.get() + root.arena.next.get();
+        let end = root.arena.start.get() + root.arena.len.get();
+        for i in start..end {
+            reach.free.insert(i);
+        }
     }
 
     let mut next = root.free.get();
@@ -343,7 +348,7 @@ pub(crate) async fn analyze_reachability_btree_root<B: BlockIo>(
         for i in 0..idxs_per {
             let fl_idx = read_fl_idx(fl_buf.as_ref(), i);
             if fl_idx != 0 {
-                reach.free.insert(next);
+                reach.free.insert(fl_idx);
             } else {
                 break;
             }
@@ -419,4 +424,31 @@ pub(crate) fn shuffle<T, R: RngCore>(vec: &mut [T], rng: &mut R) {
         let j = rng.gen_range(i..vec.len());
         vec.swap(i, j);
     }
+}
+
+// flushing operations are not safely ordered, for testing only
+pub(crate) async fn commit_btree_root<'a, 'd, B: BlockIo>(
+    ctx: &mut LallocCtx<'a, 'd, B>,
+    flux: &mut Flux<B>,
+) -> Result<()> {
+    write_fl_and_reset(ctx, flux).await?;
+
+    let version = from_bytes::<BNodeRootHeader>(ctx.root.buf_cur.as_ref())
+        .version
+        .get()
+        + 1;
+    from_bytes_mut::<BNodeRootHeader>(ctx.root.buf_next.as_mut())
+        .version
+        .set(version);
+
+    let mut buf = flux.bio.buf();
+    buf.as_mut().copy_from_slice(ctx.root.buf_next.as_ref());
+    flux.write_at(ctx.root.fb.back(), buf);
+    flux.flush().await?;
+    flux.bio.sync().await?;
+    ctx.root.fb.flip();
+    flux.clear();
+    ctx.root.buf_cur.copy_from_slice(ctx.root.buf_next.as_ref());
+
+    Ok(())
 }
