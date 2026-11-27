@@ -382,63 +382,6 @@ async fn upsert_split_inner<'a, 'b, B: BlockIo>(
     Ok(UpsertSplitResult2::SplitMut(key, ret_right_idx))
 }
 
-async fn upsert_split_root<'a, 'b, B: BlockIo>(
-    search_idx: InPgIdx,
-    left_idx: u64,
-    split: Box<[u8]>,
-    right_idx: u64,
-    flux: &mut Flux<B>,
-    ctx: &mut LallocCtx<'a, 'b, B>,
-) -> Result<UpsertSplitResult2> {
-    let mut right = flux.buf();
-
-    right.as_mut().header_mut().init(BNodeKind::Inner);
-
-    let keys_len = ctx.root.buf_next.as_ref().header().len() - 1; // children
-    let mid_key_idx = keys_len / 2;
-    for idx in (mid_key_idx + 1)..keys_len {
-        let key = get_key_inner(ctx.root.buf_next.as_ref(), idx);
-        let left_ptr = get_page_ptr(ctx.root.buf_next.as_ref(), idx);
-        let right_ptr = get_page_ptr(ctx.root.buf_next.as_ref(), idx + 1);
-        insert_at_inner(
-            right.as_mut(),
-            idx - (mid_key_idx + 1),
-            left_ptr,
-            key,
-            right_ptr,
-        );
-    }
-    let key = get_key_inner(ctx.root.buf_next.as_ref(), mid_key_idx)
-        .to_vec()
-        .into_boxed_slice();
-    ctx.root.buf_next.as_mut().header_mut().set_len(mid_key_idx);
-
-    {
-        let left_len = mid_key_idx + 1;
-        if search_idx < left_len {
-            insert_at_inner(
-                ctx.root.buf_next.as_mut(),
-                search_idx,
-                left_idx,
-                &split,
-                right_idx,
-            );
-        } else {
-            insert_at_inner(
-                right.as_mut(),
-                search_idx - left_len,
-                left_idx,
-                &split,
-                right_idx,
-            );
-        };
-    }
-
-    let ret_right_idx = flux.write(right, || lalloc(ctx)).await?;
-
-    Ok(UpsertSplitResult2::SplitMut(key, ret_right_idx))
-}
-
 async fn remove_at_leaf<'a, 'b, B: BlockIo>(
     leaf_buf: &mut [u8],
     idx: InPgIdx,
