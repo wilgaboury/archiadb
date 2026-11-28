@@ -51,7 +51,7 @@ impl<B: BlockIo> Flux<B> {
         FluxBuf::Unalloc(self.bio.buf())
     }
 
-    pub(crate) async fn read(&mut self, pg_idx: u64) -> Result<FluxBuf<B>> {
+    pub(crate) async fn read(&self, pg_idx: u64) -> Result<FluxBuf<B>> {
         let mut inner = self.inner.borrow_mut();
         if let Some(val) = inner.map.get_mut(&pg_idx) {
             match val {

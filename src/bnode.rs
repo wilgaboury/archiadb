@@ -637,15 +637,19 @@ impl LeafValueGetResult {
         }
     }
 
-    pub(crate) fn with_page<B: BlockIo>(&self, buf: FluxBuf<B>) -> BtreeGetResult<B> {
+    #[inline]
+    pub(crate) fn with_page<B: BlockIo>(&self, buf: FluxBuf<B>) -> BtreeGetResult {
         match self {
             LeafValueGetResult::Btree { pg_idx_1, pg_idx_2 } => BtreeGetResult::Btree {
                 pg_idx_1: *pg_idx_1,
                 pg_idx_2: *pg_idx_2,
             },
             LeafValueGetResult::ValueEmbedded { loc, len } => BtreeGetResult::ValueEmbedded {
-                buf,
-                loc: *loc,
+                value_buf: {
+                    let mut vbuf = [0u8; 255];
+                    vbuf[..*len].copy_from_slice(&buf.as_ref()[*loc..*loc + *len]);
+                    vbuf
+                },
                 len: *len,
             },
             LeafValueGetResult::ValueLinkedList { pg_idx, len } => {

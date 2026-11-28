@@ -52,27 +52,39 @@ impl UpsertSplitResult2 {
 }
 
 #[derive(Debug)]
-pub(crate) enum BtreeGetResult<B: BlockIo> {
-    Btree {
-        pg_idx_1: PgIdx,
-        pg_idx_2: PgIdx,
-    },
-    ValueEmbedded {
-        buf: FluxBuf<B>,
-        loc: usize,
-        len: usize,
-    },
-    ValueLinkedList {
-        pg_idx: PgIdx,
-        len: PgIdx,
-    },
+pub(crate) enum BtreeGetResult {
+    Btree { pg_idx_1: PgIdx, pg_idx_2: PgIdx },
+    ValueEmbedded { value_buf: [u8; 255], len: usize },
+    ValueLinkedList { pg_idx: PgIdx, len: PgIdx },
+}
+
+pub(crate) enum ScanDirection {
+    Ascending,
+    Descending,
+}
+
+pub(crate) struct Scan<'a, B: BlockIo> {
+    direction: ScanDirection,
+    root: &'a [u8],
+    root_idx: InPgIdx,
+    state: Vec<(FluxBuf<B>, InPgIdx)>,
+}
+
+impl<'a, B: BlockIo> Iterator for Scan<'a, B> {
+    type Item = BtreeGetResult;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let result = None;
+        result
+    }
 }
 
 async fn get<B: BlockIo>(
     key: &[u8],
     root: &[u8],
-    flux: &mut Flux<B>,
-) -> Result<Option<BtreeGetResult<B>>> {
+    flux: &Flux<B>,
+    ret: &mut Option<BtreeGetResult>,
+) -> Result<()> {
     assert!(root.header().kind == BNodeKind::Root);
 
     let mut cur = {
@@ -91,9 +103,11 @@ async fn get<B: BlockIo>(
                 let search = search_leaf(cur.as_ref(), key);
                 if let SearchResult::Exact(idx) = search {
                     let value = get_value_leaf(cur.as_ref(), idx);
-                    return Ok(Some(value.with_page(cur)));
+                    *ret = Some(value.with_page(cur));
+                    return Ok(());
                 } else {
-                    return Ok(None);
+                    *ret = None;
+                    return Ok(());
                 }
             }
             BNodeKind::Root | BNodeKind::Inner => {
@@ -649,10 +663,17 @@ mod tests {
 
     #[tokio::test]
     async fn get_test() -> Result<()> {
-        fn assert_value<B: BlockIo>(res: Option<BtreeGetResult<B>>, value: &[u8]) {
-            match res {
-                Some(BtreeGetResult::ValueEmbedded { buf, loc, len }) => {
-                    assert_eq!(&buf.as_ref()[loc..loc + len], value)
+        async fn assert_value<B: BlockIo>(key: &[u8], root: &[u8], flux: &Flux<B>, value: &[u8]) {
+            let mut ret = None;
+
+            get(key, root, flux, &mut ret).await.unwrap();
+
+            match ret {
+                Some(BtreeGetResult::ValueEmbedded {
+                    value_buf: vbuf,
+                    len,
+                }) => {
+                    assert_eq!(&vbuf[..len], value)
                 }
                 _ => panic!("expected embedded value"),
             }
@@ -663,18 +684,18 @@ mod tests {
             let root_buf = flux.read(0).await?;
             let root = root_buf.as_ref();
 
-            assert_value(get(b"a", &root, &mut flux).await?, b"00");
-            assert_value(get(b"b", &root, &mut flux).await?, b"01");
-            assert_value(get(b"c", &root, &mut flux).await?, b"02");
-            assert_value(get(b"d", &root, &mut flux).await?, b"03");
-            assert_value(get(b"e", &root, &mut flux).await?, b"04");
-            assert_value(get(b"f", &root, &mut flux).await?, b"05");
-            assert_value(get(b"g", &root, &mut flux).await?, b"06");
-            assert_value(get(b"h", &root, &mut flux).await?, b"07");
-            assert_value(get(b"i", &root, &mut flux).await?, b"08");
-            assert_value(get(b"j", &root, &mut flux).await?, b"09");
-            assert_value(get(b"k", &root, &mut flux).await?, b"10");
-            assert_value(get(b"l", &root, &mut flux).await?, b"11");
+            assert_value(b"a", &root, &mut flux, b"00").await;
+            assert_value(b"b", &root, &mut flux, b"01").await;
+            assert_value(b"c", &root, &mut flux, b"02").await;
+            assert_value(b"d", &root, &mut flux, b"03").await;
+            assert_value(b"e", &root, &mut flux, b"04").await;
+            assert_value(b"f", &root, &mut flux, b"05").await;
+            assert_value(b"g", &root, &mut flux, b"06").await;
+            assert_value(b"h", &root, &mut flux, b"07").await;
+            assert_value(b"i", &root, &mut flux, b"08").await;
+            assert_value(b"j", &root, &mut flux, b"09").await;
+            assert_value(b"k", &root, &mut flux, b"10").await;
+            assert_value(b"l", &root, &mut flux, b"11").await;
 
             Ok(())
         }
@@ -725,10 +746,14 @@ mod tests {
                 // println!("{} passed", i);
             }
 
+            let mut get_result = None;
+
             for (_i, (key, value)) in map.iter().enumerate() {
-                if let Some(found) = get(&key, ctx.root.buf_next.as_ref(), &mut flux).await? {
-                    if let BtreeGetResult::ValueEmbedded { buf, loc, len } = found {
-                        assert_eq!(value, &buf.as_ref()[loc..loc + len])
+                get(&key, ctx.root.buf_next.as_ref(), &mut flux, &mut get_result).await?;
+
+                if let Some(found) = &get_result {
+                    if let BtreeGetResult::ValueEmbedded { value_buf, len } = found {
+                        assert_eq!(value, &value_buf[..*len])
                     } else {
                         panic!("value should be emdedded")
                     }
@@ -739,12 +764,10 @@ mod tests {
         }
 
         validate_reachability_db(&bio).await?;
-
         {
             let mut ctx = test_ctx.ctx();
             commit_btree_root(&mut ctx, &mut flux).await?;
         }
-
         validate_reachability_db(&bio).await?;
 
         Ok(())
@@ -780,21 +803,26 @@ mod tests {
         {
             let mut ctx = test_ctx.ctx();
 
+            let mut get_result = None;
+
             for i in 0..keys.len() / 2 {
                 let key = &keys[i];
 
                 map.remove(key);
                 delete(key, &mut flux, &mut ctx).await?;
+                get(key, ctx.root.buf_next.as_ref(), &mut flux, &mut get_result).await?;
 
-                if let Some(_) = get(key, ctx.root.buf_next.as_ref(), &mut flux).await? {
+                if let Some(_) = &get_result {
                     panic!("expected key to be gone: {}", str::from_utf8(key)?);
                 }
             }
 
             for (_i, (key, value)) in map.iter().enumerate() {
-                if let Some(found) = get(&key, ctx.root.buf_next.as_ref(), &mut flux).await? {
-                    if let BtreeGetResult::ValueEmbedded { buf, loc, len } = found {
-                        assert_eq!(value, &buf.as_ref()[loc..loc + len])
+                get(key, ctx.root.buf_next.as_ref(), &mut flux, &mut get_result).await?;
+
+                if let Some(found) = &get_result {
+                    if let BtreeGetResult::ValueEmbedded { value_buf, len } = found {
+                        assert_eq!(value, &value_buf[..*len])
                     } else {
                         panic!("value should be emdedded")
                     }
