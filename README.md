@@ -16,7 +16,7 @@ LLMs were used sparingly, mostly for research, reference pseudo-code, or code re
 
 ## What is a heirarchical database?
 
-Like other OLTP data stores, the paradigm is defined by how records are organized. For comparison, document databases use a set of collections, relational databases use a graph of tables, and key-value stores don't have any higher level structure. A hierarchical database organizes records into a canonical tree of one to many relationships.
+Like other OLTP data stores, the paradigm is defined by how records are organized. For comparison, document databases use a set of collections, relational databases use a graph of tables, and key-value stores don't have any higher level structure. A hierarchical database organizes records into a canonical tree of one to many relationships. None of these are strictly better than the others, but may be more suited to a given situation based on factors like data access/schema, user experience, and personal taste.
 
 ## Features
 
